@@ -4,9 +4,10 @@
 # This source code is licensed under the BSD 3-Clause license found in the
 # LICENSE file in the root directory of this source tree.
 
+import functools
 import math
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 from torch.utils._python_dispatch import return_and_correct_aliasing
@@ -15,8 +16,8 @@ from torchao.prototype.mx_formats.constants import F4_E2M1_MAX, F8E4M3_MAX
 from torchao.prototype.mx_formats.kernels import (
     f4_unpacked_to_f32,
     f32_to_f4_unpacked,
-    mslk_quantize_nvfp4,
     pack_uint4,
+    triton_quantize_nvfp4,
     unpack_uint4,
 )
 from torchao.prototype.mx_formats.mx_tensor import (
@@ -38,6 +39,54 @@ E4M3_EPS = torch.finfo(torch.float8_e4m3fn).tiny
 
 aten = torch.ops.aten
 
+# Default sign vector for Random Hadamard Transform, duplicated from TransformerEngine.
+# https://xkcd.com/221/
+_DEFAULT_RHT_SIGN_VECTOR: Tuple[int, ...] = (
+    1, 1, 1, -1, 1, -1, -1, -1, -1, -1, -1, 1, -1, 1, -1, -1
+)
+
+# H16: normalized 16x16 Hadamard matrix, duplicated from TransformerEngine.
+_H16_DATA = [
+    [ 1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1],
+    [ 1, -1,  1, -1,  1, -1,  1, -1,  1, -1,  1, -1,  1, -1,  1, -1],
+    [ 1,  1, -1, -1,  1,  1, -1, -1,  1,  1, -1, -1,  1,  1, -1, -1],
+    [ 1, -1, -1,  1,  1, -1, -1,  1,  1, -1, -1,  1,  1, -1, -1,  1],
+    [ 1,  1,  1,  1, -1, -1, -1, -1,  1,  1,  1,  1, -1, -1, -1, -1],
+    [ 1, -1,  1, -1, -1,  1, -1,  1,  1, -1,  1, -1, -1,  1, -1,  1],
+    [ 1,  1, -1, -1, -1, -1,  1,  1,  1,  1, -1, -1, -1, -1,  1,  1],
+    [ 1, -1, -1,  1, -1,  1,  1, -1,  1, -1, -1,  1, -1,  1,  1, -1],
+    [ 1,  1,  1,  1,  1,  1,  1,  1, -1, -1, -1, -1, -1, -1, -1, -1],
+    [ 1, -1,  1, -1,  1, -1,  1, -1, -1,  1, -1,  1, -1,  1, -1,  1],
+    [ 1,  1, -1, -1,  1,  1, -1, -1, -1, -1,  1,  1, -1, -1,  1,  1],
+    [ 1, -1, -1,  1,  1, -1, -1,  1, -1,  1,  1, -1, -1,  1,  1, -1],
+    [ 1,  1,  1,  1, -1, -1, -1, -1, -1, -1, -1, -1,  1,  1,  1,  1],
+    [ 1, -1,  1, -1, -1,  1, -1,  1, -1,  1, -1,  1,  1, -1,  1, -1],
+    [ 1,  1, -1, -1, -1, -1,  1,  1, -1, -1,  1,  1,  1,  1, -1, -1],
+    [ 1, -1, -1,  1, -1,  1,  1, -1, -1,  1,  1, -1,  1, -1, -1,  1],
+]
+
+
+def _validate_sign_vector(v: torch.Tensor) -> None:
+    if v.numel() != 16:
+        raise ValueError(f"rht_sign_vector must have 16 elements, got {v.numel()}")
+    if not torch.all((v == 1) | (v == -1)):
+        raise ValueError("rht_sign_vector must contain only +1 and -1 values")
+
+
+@functools.lru_cache(maxsize=None)
+def _get_rht_matrix(sign_tuple: tuple, device: str) -> torch.Tensor:
+    """Return cached diag(sign) @ H16, cast to bfloat16.
+
+    Cache is keyed on (sign content as tuple, device string) so any ±1 sign
+    vector is supported without a separate dict cache.
+    """
+    dev = torch.device(device)
+    signs = torch.tensor(sign_tuple, dtype=torch.float32, device=dev)
+    H = torch.tensor(_H16_DATA, dtype=torch.float32, device=dev) * (
+        1.0 / math.sqrt(16)
+    )
+    return (torch.diag(signs) @ H).to(torch.bfloat16)
+
 
 @dataclass
 class QuantizeTensorToNVFP4Kwargs(QuantizeTensorKwargs):
@@ -45,6 +94,7 @@ class QuantizeTensorToNVFP4Kwargs(QuantizeTensorKwargs):
     is_swizzled_scales: bool = False
     use_triton_kernel: bool = False
     use_dynamic_per_tensor_scale: bool = False
+    rht_sign_vector: Optional[torch.Tensor] = None
 
 
 class NVFP4Tensor(TorchAOBaseTensor):
@@ -69,7 +119,7 @@ class NVFP4Tensor(TorchAOBaseTensor):
         "block_size",
         "orig_dtype",
     ]
-    optional_tensor_data_names = ["per_tensor_scale", "act_per_tensor_scale"]
+    optional_tensor_data_names = ["per_tensor_scale", "act_per_tensor_scale", "rht_sign_vector"]
     optional_tensor_attribute_names = [
         "is_swizzled_scales",
         "use_triton_kernel",
@@ -87,6 +137,7 @@ class NVFP4Tensor(TorchAOBaseTensor):
         is_swizzled_scales=False,
         use_triton_kernel=False,
         act_quant_kwargs=None,
+        rht_sign_vector=None,
     ):
         # FP4 tensor size handling two paths, contiguous or not
         new_size = qdata.size()
@@ -113,6 +164,7 @@ class NVFP4Tensor(TorchAOBaseTensor):
         self.is_swizzled_scales = is_swizzled_scales
         self.use_triton_kernel = use_triton_kernel
         self.act_quant_kwargs = act_quant_kwargs
+        self.rht_sign_vector = rht_sign_vector
         return self
 
     def __repr__(self):
@@ -130,6 +182,7 @@ class NVFP4Tensor(TorchAOBaseTensor):
         is_swizzled_scales: bool = False,
         use_triton_kernel: bool = False,
         act_quant_kwargs: Optional[QuantizeTensorToNVFP4Kwargs] = None,
+        rht_sign_vector: Optional[torch.Tensor] = None,
     ):
         """Convert high precision tensor to NVFP4 format.
 
@@ -143,10 +196,22 @@ class NVFP4Tensor(TorchAOBaseTensor):
             is_swizzled_scales: If True, store scales in swizzled format for faster matrix multiplication
             use_triton_kernel: If True, use Triton kernel for quantization
             act_quant_kwargs: If specified, config for quantizing the activation
+            rht_sign_vector: Optional ±1 sign vector of length 16 for a Random Hadamard
+                Transform applied before quantization.  If None, no RHT is applied.
+                Pass ``torch.tensor(_DEFAULT_RHT_SIGN_VECTOR)`` to use the TransformerEngine
+                default.  The matrix ``diag(sign) @ H16`` is cached across calls with
+                the same sign vector and device.
 
         Returns:
             NVFP4Tensor: Quantized tensor in NVFP4 format
         """
+        if rht_sign_vector is not None:
+            _validate_sign_vector(rht_sign_vector)
+            rht_matrix = _get_rht_matrix(
+                tuple(rht_sign_vector.tolist()), str(data_hp.device)
+            )
+            data_hp = data_hp @ rht_matrix.T.to(data_hp.dtype)
+
         assert len(data_hp.shape) in (2, 3), "unsupported"
         leading_dims, M, K = data_hp.shape[:-2], data_hp.shape[-2], data_hp.shape[-1]
 
@@ -155,10 +220,7 @@ class NVFP4Tensor(TorchAOBaseTensor):
             assert K % 16 == 0, (
                 f"Triton kernel requires K (dim -1) to be divisible by 16, got {K}"
             )
-            assert per_tensor_scale is not None, (
-                "Triton kernel requires per_tensor_scale"
-            )
-            blockwise_scales, data_lp = mslk_quantize_nvfp4(data_hp, per_tensor_scale)
+            blockwise_scales, data_lp = triton_quantize_nvfp4(data_hp, per_tensor_scale)
         else:
             blockwise_scales, data_lp = nvfp4_quantize(
                 data_hp, block_size, per_tensor_scale
@@ -187,6 +249,7 @@ class NVFP4Tensor(TorchAOBaseTensor):
             is_swizzled_scales,
             use_triton_kernel,
             act_quant_kwargs,
+            rht_sign_vector,
         )
 
     # Do not force the NVFP4Tensor type on the returned tensor
@@ -320,6 +383,7 @@ def nvfp4_to_copy(func, types, args, kwargs):
             tensor.is_swizzled_scales,
             tensor.use_triton_kernel,
             tensor.act_quant_kwargs,
+            tensor.rht_sign_vector,
         )
         return res
 
@@ -351,6 +415,7 @@ def nvfp4_slice(func, types, args, kwargs):
         x.is_swizzled_scales,
         x.use_triton_kernel,
         x.act_quant_kwargs,
+        x.rht_sign_vector,
     )
 
     return return_and_correct_aliasing(func, args, kwargs, result)
@@ -370,6 +435,7 @@ def nvfp4_t(func, types, args, kwargs):
         old.is_swizzled_scales,
         old.use_triton_kernel,
         old.act_quant_kwargs,
+        old.rht_sign_vector,
     )
     return new
 
@@ -392,6 +458,7 @@ def nvfp4_transpose(func, types, args, kwargs):
         old.is_swizzled_scales,
         old.use_triton_kernel,
         old.act_quant_kwargs,
+        old.rht_sign_vector,
     )
     return new
 
@@ -412,6 +479,7 @@ def nvfp4_view_op(func, types, args, kwargs):
         args[0].is_swizzled_scales,
         args[0].use_triton_kernel,
         args[0].act_quant_kwargs,
+        args[0].rht_sign_vector,
     )
 
 
@@ -430,6 +498,7 @@ def nvfp4_select(func, types, args, kwargs):
         old.is_swizzled_scales,
         old.use_triton_kernel,
         old.act_quant_kwargs,
+        old.rht_sign_vector,
     )
     return return_and_correct_aliasing(func, args, kwargs, new)
 
@@ -702,10 +771,10 @@ def nvfp4_quantize(
             scaled_block_scales, min=E4M3_EPS, max=F8E4M3_MAX
         ).to(torch.float8_e4m3fn)
         scaled_block_scales_fp32 = scaled_block_scales_fp8.to(torch.float32)
-        # Multiply by reciprocal of combined scale instead of dividing,
-        # to match the MSLK triton kernel numerics: x * (global_scale / fp8_scale)
-        reciprocal_scale = (1.0 / per_tensor_scale) / scaled_block_scales_fp32
-        data_scaled = data_hp * reciprocal_scale.unsqueeze(-1)
+        # We "temporarily" dequant the scaled_block_scales_fp32 to get the per_tensor_scale
+        # To apply to data
+        total_scale = per_tensor_scale * scaled_block_scales_fp32
+        data_scaled = data_hp / total_scale.unsqueeze(-1)
         out_scales = scaled_block_scales_fp8
 
     data_scaled = torch.clamp(data_scaled, -F4_E2M1_MAX, F4_E2M1_MAX)
