@@ -41,5 +41,11 @@ class KernelPreference(str, Enum):
     2. Debugging kernel numerics issues.
     """
 
+    TE = "te"
+    """Use TransformerEngine quantize kernels as a backend. Enables features
+    not yet available natively in TorchAO (e.g., stochastic rounding, RHT
+    for NVFP4 training). Requires the transformer_engine package.
+    """
+
 
 torch.serialization.add_safe_globals([KernelPreference])
