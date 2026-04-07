@@ -26,6 +26,11 @@ import pytest
 import torch
 
 from torchao.float8.float8_utils import compute_error
+from torchao.prototype.mx_formats.nvfp4_tensor import (
+    NVFP4Tensor,
+    nvfp4_quantize,
+    per_tensor_amax_to_scale,
+)
 from torchao.prototype.mx_formats.utils import to_blocked
 from torchao.utils import is_sm_at_least_100
 
@@ -35,48 +40,10 @@ if is_sm_at_least_100():
     )
     from torchao.prototype.mx_formats.hadamard_utils import get_rht_matrix
 
-_FP8_E4M3_MAX = 448.0
-_FP4_E2M1_MAX = 6.0
-_FP4_MAGNITUDES = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
-
 # M must be ≥ 128 (BLOCK_M minimum). M=32/64/96 excluded.
 _M_VALUES = [128, 160, 256, 512]
 # N must be ≥ 128 (BLOCK_N fixed=128). N=100 excluded.
 _N_VALUES = [128, 200, 256, 384, 512, 1024]
-
-
-def cast_to_fp4x2(x: torch.Tensor) -> torch.Tensor:
-    """Round to nearest FP4 E2M1 and pack two values per byte.
-
-    FP4 E2M1 magnitudes (code 0–7): 0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0
-    Midpoints between adjacent values: 0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0
-
-    Tie-breaking at exact midpoints: round-to-nearest-even, matching PTX
-    cvt.rn.satfinite.e2m1x2.f32 used by TE's CUDA kernel.
-
-    At the three boundaries where the lower code has an odd mantissa bit, ties
-    round UP to the even upper code:
-      0.75 → code 2 (1.0),  1.75 → code 4 (2.0),  3.5 → code 6 (4.0)
-    The remaining four boundaries already round toward zero (lower code is even).
-    """
-    fp4_boundaries = torch.tensor(
-        [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0, float("inf")], device=x.device
-    )
-
-    sign = (x < 0).to(torch.uint8) * 8
-    abs_x = x.abs()
-    idx = torch.bucketize(abs_x, fp4_boundaries)  # 0..7, rounds toward zero
-
-    # Round-to-nearest-even correction: at boundaries where the lower code is odd
-    # (0.75, 1.75, 3.5), increment idx to reach the adjacent even code.
-    rne_up = torch.tensor([0.75, 1.75, 3.5], dtype=abs_x.dtype, device=x.device)
-    at_rne_up = (abs_x.unsqueeze(-1) == rne_up).any(dim=-1)
-    idx = (idx + at_rne_up.to(torch.int64)).clamp(max=7)
-
-    result = (idx.to(torch.uint8) + sign).to(torch.uint8)
-
-    # Pack pairs of FP4 nibbles into bytes: even columns = low nibble
-    return result[:, ::2] + result[:, 1::2] * 16
 
 
 # ---------------------------------------------------------------------------
@@ -94,111 +61,35 @@ def _rht_reference(A: torch.Tensor) -> torch.Tensor:
 def _rht_quantize_reference(
     A: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """RHT + NVFP4 E2M1 columnwise quantization in PyTorch (RTNE, no stochastic rounding).
+    """RHT + NVFP4 E2M1 columnwise quantization via nvfp4_quantize (RTNE).
 
     Returns:
         codes:       (N, M//2) uint8 packed FP4 codes.
         scale_inv:   (N, M//16) float8_e4m3fn per-vector decode scales.
         global_amax: scalar float32.
     """
-    # Keep bf16 for vec_max: the kernel's tl.max(bf16) → bf16, not f32.
-    # Using f32 vec_max causes ~0.2% nibble mismatches at FP4 rounding boundaries.
-    x_t_rht_bf16 = _rht_reference(A)            # (N, M) bfloat16
-    x_t_rht = x_t_rht_bf16.float()              # f32 for arithmetic
-    N, M = x_t_rht.shape
-
-    global_amax = x_t_rht.abs().max().float()
-
-    x_vecs = x_t_rht.view(N, M // 16, 16)
-    vec_max = x_t_rht_bf16.view(N, M // 16, 16).float().abs().amax(dim=-1, keepdim=True)
-
-    _f32_max = torch.tensor(
-        torch.finfo(torch.float32).max, dtype=torch.float32, device=A.device
+    x_t_rht = _rht_reference(A)  # (N, M) bfloat16
+    global_amax = x_t_rht.float().abs().max()
+    scale_inv, codes = nvfp4_quantize(
+        x_t_rht, per_tensor_scale=per_tensor_amax_to_scale(global_amax)
     )
-    if global_amax.item() == 0:
-        global_encode_scale = torch.ones(1, dtype=torch.float32, device=A.device)
-    else:
-        global_encode_scale = torch.minimum(
-            torch.tensor(
-                _FP8_E4M3_MAX * _FP4_E2M1_MAX, dtype=torch.float32, device=A.device
-            )
-            / global_amax,
-            _f32_max,
-        )
-        if global_encode_scale.item() == 0.0:
-            global_encode_scale = torch.ones(1, dtype=torch.float32, device=A.device)
-    global_decode_scale = (
-        torch.ones(1, dtype=torch.float32, device=A.device) / global_encode_scale
-    )
-
-    pvscale = (vec_max / _FP4_E2M1_MAX) * global_encode_scale
-    pvscale = pvscale.clamp(-_FP8_E4M3_MAX, _FP8_E4M3_MAX)
-    pvscale_fp8 = pvscale.to(torch.float8_e4m3fn)
-    scale_inv = pvscale_fp8.squeeze(-1)  # (N, M//16)
-
-    encode_scale = torch.minimum(
-        1.0 / (pvscale_fp8.to(torch.float32) * global_decode_scale),
-        _f32_max,
-    )
-    scaled = (x_vecs * encode_scale).clamp(-_FP4_E2M1_MAX, _FP4_E2M1_MAX).view(N, M)
-    codes = cast_to_fp4x2(scaled)  # (N, M//2) uint8
-
     return codes, scale_inv, global_amax
 
 
 def _rht_quantize_rowwise_reference(
     A: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """NVFP4 E2M1 rowwise quantization of A in PyTorch (RTNE, no RHT applied).
-
-    Mirrors the kernel's rowwise path: quantize raw A, grouping 16 elements along
-    the column (N) dimension.
+    """NVFP4 E2M1 rowwise quantization via nvfp4_quantize (RTNE, no RHT applied).
 
     Returns:
         codes:       (M, N//2) uint8 packed FP4 codes.
         scale_inv:   (M, N//16) float8_e4m3fn per-vector decode scales.
         global_amax: scalar float32 (max(abs(A))).
     """
-    x_bf16 = A  # (M, N) bfloat16
-    x = x_bf16.float()
-    M, N = x.shape
-
-    global_amax = x.abs().max().float()
-
-    x_vecs = x.view(M, N // 16, 16)
-    vec_max = x_bf16.view(M, N // 16, 16).float().abs().amax(dim=-1, keepdim=True)
-
-    _f32_max = torch.tensor(
-        torch.finfo(torch.float32).max, dtype=torch.float32, device=A.device
+    global_amax = A.float().abs().max()
+    scale_inv, codes = nvfp4_quantize(
+        A, per_tensor_scale=per_tensor_amax_to_scale(global_amax)
     )
-    if global_amax.item() == 0:
-        global_encode_scale = torch.ones(1, dtype=torch.float32, device=A.device)
-    else:
-        global_encode_scale = torch.minimum(
-            torch.tensor(
-                _FP8_E4M3_MAX * _FP4_E2M1_MAX, dtype=torch.float32, device=A.device
-            )
-            / global_amax,
-            _f32_max,
-        )
-        if global_encode_scale.item() == 0.0:
-            global_encode_scale = torch.ones(1, dtype=torch.float32, device=A.device)
-    global_decode_scale = (
-        torch.ones(1, dtype=torch.float32, device=A.device) / global_encode_scale
-    )
-
-    pvscale = (vec_max / _FP4_E2M1_MAX) * global_encode_scale
-    pvscale = pvscale.clamp(-_FP8_E4M3_MAX, _FP8_E4M3_MAX)
-    pvscale_fp8 = pvscale.to(torch.float8_e4m3fn)
-    scale_inv = pvscale_fp8.squeeze(-1)  # (M, N//16)
-
-    encode_scale = torch.minimum(
-        1.0 / (pvscale_fp8.to(torch.float32) * global_decode_scale),
-        _f32_max,
-    )
-    scaled = (x_vecs * encode_scale).clamp(-_FP4_E2M1_MAX, _FP4_E2M1_MAX).view(M, N)
-    codes = cast_to_fp4x2(scaled)  # (M, N//2) uint8
-
     return codes, scale_inv, global_amax
 
 
@@ -207,19 +98,11 @@ def _dequantize(
     scales: torch.Tensor,
     global_amax: torch.Tensor,
 ) -> torch.Tensor:
-    """Decode packed FP4 codes back to float32 values."""
-    lo = (codes & 0xF).long()
-    hi = (codes >> 4).long()
-    all_codes = torch.empty(
-        codes.shape[0], codes.shape[1] * 2, dtype=torch.long, device=codes.device
-    )
-    all_codes[:, ::2] = lo
-    all_codes[:, 1::2] = hi
-    mag = _FP4_MAGNITUDES.to(codes.device)[all_codes & 0x7]
-    sign = torch.where((all_codes & 0x8) != 0, -1.0, 1.0)
-    scale_f32 = scales.to(torch.float32).repeat_interleave(16, dim=1)
-    global_decode_scale = float(global_amax) / (_FP8_E4M3_MAX * _FP4_E2M1_MAX)
-    return sign * mag * scale_f32 * global_decode_scale
+    """Decode packed FP4 codes via NVFP4Tensor.dequantize()."""
+    return NVFP4Tensor(
+        codes, scales, 16, torch.bfloat16,
+        per_tensor_scale=per_tensor_amax_to_scale(global_amax),
+    ).dequantize().float()
 
 
 # ---------------------------------------------------------------------------
