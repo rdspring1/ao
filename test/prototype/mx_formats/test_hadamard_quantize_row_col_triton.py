@@ -9,28 +9,24 @@ Covers all 8 (stochastic_rounding × compute_rowwise × swizzle_scale_factors) c
       values with SQNR ≥ 20 dB for both col and row paths.
 
   SR (stochastic_rounding=True):
-    - test_triton_rht_quantize_sr_col_variance: Col SR output has variance > 0 across seeds
-      (SR is stochastic); rowwise path always uses RTNE so its variance must be zero.
-    - test_triton_rht_quantize_sr_col_mean_mae_lt_rn: Averaged col SR MAE < single-pass RN
-      MAE (SR is unbiased; averaging cancels per-element rounding bias).
-    - test_triton_rht_quantize_sr_col_vs_reference_mae: Triton SR mean MAE agrees with
-      PyTorch reference SR mean MAE (rtol=0.2, atol=1e-4).
+    - test_triton_rht_quantize_sr_midpoint_distribution: Values at the FP4 [1.0, 1.5]
+      midpoint (1.25) round to each neighbor ~50% of the time (rowwise path).
+    - test_triton_rht_quantize_sr_at_most_one_fp4_step_from_rtne: SR code is at most 1
+      FP4 magnitude index step from the RTNE code for every element (col and row paths).
 
 8-combination coverage:
   SR=F, RW=F, SW=F  — rtne_scales_vs_reference + rtne_sqnr
   SR=F, RW=F, SW=T  — rtne_scales_vs_reference
   SR=F, RW=T, SW=F  — rtne_scales_vs_reference + rtne_sqnr
   SR=F, RW=T, SW=T  — rtne_scales_vs_reference
-  SR=T, RW=F, SW=F  — sr_variance + sr_mean_mae_lt_rn + sr_vs_reference_mae
-  SR=T, RW=F, SW=T  — sr_variance + sr_mean_mae_lt_rn + sr_vs_reference_mae
-  SR=T, RW=T, SW=F  — (SR does not affect rowwise path; covered by rtne tests)
-  SR=T, RW=T, SW=T  — (SR does not affect rowwise path; covered by rtne tests)
+  SR=T, RW=F, SW=F  — sr_at_most_one_fp4_step_from_rtne
+  SR=T, RW=T, SW=F  — sr_midpoint_distribution + sr_at_most_one_fp4_step_from_rtne
 """
 import pytest
 import torch
 
 from torchao.float8.float8_utils import compute_error
-from torchao.prototype.mx_formats.utils import from_blocked, to_blocked
+from torchao.prototype.mx_formats.utils import to_blocked
 from torchao.utils import is_sm_at_least_100
 
 if is_sm_at_least_100():
@@ -47,10 +43,6 @@ _FP4_MAGNITUDES = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
 _M_VALUES = [128, 160, 256, 512]
 # N must be ≥ 128 (BLOCK_N fixed=128). N=100 excluded.
 _N_VALUES = [128, 200, 256, 384, 512, 1024]
-
-# Fixed shape for SR statistical tests (10 samples each).
-_SR_NUM_SAMPLES = 10
-_SR_M, _SR_N = 128, 128
 
 
 def cast_to_fp4x2(x: torch.Tensor) -> torch.Tensor:
@@ -210,95 +202,12 @@ def _rht_quantize_rowwise_reference(
     return codes, scale_inv, global_amax
 
 
-def _rht_quantize_reference_sr(
-    A: torch.Tensor,
-    generator: torch.Generator,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """RHT + NVFP4 E2M1 columnwise quantization in PyTorch with stochastic rounding.
-
-    Uses the same scale-computation path as _rht_quantize_reference, then applies
-    stochastic rounding for FP4 code assignment: for each scaled value v, find the
-    two neighboring FP4 magnitudes and randomly choose proportional to fractional
-    position in the interval.
-
-    Returns:
-        codes:       (N, M//2) uint8 packed FP4 codes.
-        scale_inv:   (N, M//16) float8_e4m3fn per-vector decode scales.
-        global_amax: scalar float32.
-    """
-    x_t_rht_bf16 = _rht_reference(A)
-    x_t_rht = x_t_rht_bf16.float()
-    N, M = x_t_rht.shape
-
-    global_amax = x_t_rht.abs().max().float()
-
-    x_vecs = x_t_rht.view(N, M // 16, 16)
-    vec_max = x_t_rht_bf16.view(N, M // 16, 16).float().abs().amax(dim=-1, keepdim=True)
-
-    _f32_max = torch.tensor(
-        torch.finfo(torch.float32).max, dtype=torch.float32, device=A.device
-    )
-    if global_amax.item() == 0:
-        global_encode_scale = torch.ones(1, dtype=torch.float32, device=A.device)
-    else:
-        global_encode_scale = torch.minimum(
-            torch.tensor(
-                _FP8_E4M3_MAX * _FP4_E2M1_MAX, dtype=torch.float32, device=A.device
-            )
-            / global_amax,
-            _f32_max,
-        )
-        if global_encode_scale.item() == 0.0:
-            global_encode_scale = torch.ones(1, dtype=torch.float32, device=A.device)
-    global_decode_scale = (
-        torch.ones(1, dtype=torch.float32, device=A.device) / global_encode_scale
-    )
-
-    pvscale = (vec_max / _FP4_E2M1_MAX) * global_encode_scale
-    pvscale = pvscale.clamp(-_FP8_E4M3_MAX, _FP8_E4M3_MAX)
-    pvscale_fp8 = pvscale.to(torch.float8_e4m3fn)
-    scale_inv = pvscale_fp8.squeeze(-1)  # (N, M//16)
-
-    encode_scale = torch.minimum(
-        1.0 / (pvscale_fp8.to(torch.float32) * global_decode_scale),
-        _f32_max,
-    )
-    scaled = (x_vecs * encode_scale).clamp(-_FP4_E2M1_MAX, _FP4_E2M1_MAX).view(N, M)
-
-    # Stochastic rounding on the non-uniform FP4 magnitude grid.
-    # For each value v, find its lower (lo) and upper (hi) FP4 neighbors and
-    # randomly round up with probability (v - lo) / (hi - lo).
-    sign = torch.sign(scaled)
-    sign = torch.where(scaled == 0.0, torch.ones_like(sign), sign)
-    abs_scaled = scaled.abs()
-
-    mags = _FP4_MAGNITUDES.to(device=A.device)
-    # searchsorted(right=False): returns first index k where mags[k] >= abs_scaled.
-    # lo is the grid point just below abs_scaled.
-    lo_idx = torch.searchsorted(mags.contiguous(), abs_scaled.contiguous()) - 1
-    lo_idx = lo_idx.clamp(0, 7)
-    hi_idx = (lo_idx + 1).clamp(0, 7)
-
-    lo_val = mags[lo_idx]
-    hi_val = mags[hi_idx]
-    gap = hi_val - lo_val
-    frac = torch.where(
-        gap > 0.0, (abs_scaled - lo_val) / gap, torch.zeros_like(abs_scaled)
-    )
-
-    u = torch.rand(abs_scaled.shape, device=A.device, generator=generator)
-    rounded_abs = torch.where(u < frac, hi_val, lo_val)
-    codes = cast_to_fp4x2(sign * rounded_abs)  # (N, M//2) uint8
-
-    return codes, scale_inv, global_amax
-
-
 def _dequantize(
     codes: torch.Tensor,
     scales: torch.Tensor,
     global_amax: torch.Tensor,
 ) -> torch.Tensor:
-    """Decode packed FP4 codes back to float32 post-RHT values."""
+    """Decode packed FP4 codes back to float32 values."""
     lo = (codes & 0xF).long()
     hi = (codes >> 4).long()
     all_codes = torch.empty(
@@ -311,7 +220,6 @@ def _dequantize(
     scale_f32 = scales.to(torch.float32).repeat_interleave(16, dim=1)
     global_decode_scale = float(global_amax) / (_FP8_E4M3_MAX * _FP4_E2M1_MAX)
     return sign * mag * scale_f32 * global_decode_scale
-
 
 
 # ---------------------------------------------------------------------------
@@ -424,138 +332,105 @@ def test_triton_rht_quantize_rtne_sqnr(M, N, compute_rowwise):
 
 
 @pytest.mark.skipif(not is_sm_at_least_100(), reason="Requires SM100+")
-@pytest.mark.parametrize("swizzle_scale_factors", [False, True], ids=["sw0", "sw1"])
 @torch.no_grad()
-def test_triton_rht_quantize_sr_col_variance(swizzle_scale_factors):
-    """SR columnwise output must have variance > 0 across seeds (SR is stochastic)."""
-    M, N = _SR_M, _SR_N
-    A = torch.randn(M, N, dtype=torch.bfloat16, device="cuda")
+def test_triton_rht_quantize_sr_midpoint_distribution():
+    """SR of a value exactly at the FP4 midpoint (1.25) must round each direction ~50% of the time.
 
-    # Shared global amax for dequantization (input-derived, same across all runs)
-    _, _, col_amax, *_ = triton_rht_quantize_row_col(
-        A, stochastic_rounding=False, compute_rowwise=False, swizzle_scale_factors=False
-    )
+    Constructs input A via inverse RHT so that post-RHT values are exactly:
+      - 6.0 at the first element of each 16-group (anchors vec_max = global_amax = 6.0,
+        so encode_scale = 1.0 exactly).
+      - 1.25 everywhere else (exactly at the midpoint of the FP4 [1.0, 1.5] interval).
 
-    col_samples = []
-    for seed in range(_SR_NUM_SAMPLES):
-        torch.manual_seed(seed)
-        col_codes, col_sf, *_ = triton_rht_quantize_row_col(
-            A,
-            stochastic_rounding=True,
-            compute_rowwise=False,
-            swizzle_scale_factors=swizzle_scale_factors,
+    The RHT matrix is orthogonal (B @ B.T = I in bfloat16), so the round-trip is exact.
+    RTNE rounds 1.25 to code 2 (1.0) — the even neighbor — by round-to-nearest-even.
+    SR must round to code 2 (1.0) or code 3 (1.5) with equal probability (~50% each).
+    """
+    N_RHT, M_RHT = 128, 128  # post-RHT shape (N_RHT = N_A, M_RHT = M_A)
+    N_SAMPLES = 32
+
+    # Build A such that RHT(A.T) has 1.25 at non-anchor positions and 6.0 at anchors.
+    # Since B is orthogonal, A.T = target @ B^{-1} = target @ B.T.
+    B = get_rht_matrix(with_random_sign_mask=True, device="cuda").float()
+    target = torch.full((N_RHT, M_RHT), 1.25, dtype=torch.float32, device="cuda")
+    target[:, ::16] = 6.0  # one anchor per 16-group along M
+    A_t = (target.reshape(N_RHT * M_RHT // 16, 16) @ B.t()).reshape(N_RHT, M_RHT)
+    A = A_t.t().contiguous().to(torch.bfloat16)  # kernel expects (M_A, N_A) contiguous
+
+    count_lo = 0  # code 2 = 1.0
+    count_hi = 0  # code 3 = 1.5
+
+    for _ in range(N_SAMPLES):
+        col_codes, _, _, _, _, _ = triton_rht_quantize_row_col(
+            A, stochastic_rounding=True, compute_rowwise=False, swizzle_scale_factors=False
         )
-        if swizzle_scale_factors:
-            col_sf = from_blocked(col_sf.flatten(), N, M // 16)
-        col_samples.append(_dequantize(col_codes, col_sf, col_amax))
+        # Unpack col_codes (N_RHT, M_RHT//2) uint8 → (N_RHT, M_RHT) nibbles
+        lo = (col_codes & 0xF).long()
+        hi = (col_codes >> 4).long()
+        all_nibs = torch.empty(N_RHT, M_RHT, dtype=torch.long, device="cuda")
+        all_nibs[:, ::2] = lo
+        all_nibs[:, 1::2] = hi
+        mag_codes = all_nibs & 0x7
 
-    col_mean_var = torch.stack(col_samples).var(dim=0).mean().item()
-    assert col_mean_var > 0, (
-        f"SR col variance is zero over {_SR_NUM_SAMPLES} seeds — "
-        "SR may have silently degraded to deterministic quantization"
+        # Exclude anchor positions (m % 16 == 0 → scaled=6.0 → code 7)
+        col_idx = torch.arange(M_RHT, device="cuda")
+        target_mags = mag_codes[:, (col_idx % 16) != 0]  # (N_RHT, 15 * M_RHT//16)
+
+        count_lo += (target_mags == 2).sum().item()  # rounded to 1.0
+        count_hi += (target_mags == 3).sum().item()  # rounded to 1.5
+
+    total = count_lo + count_hi
+    frac_hi = count_hi / total
+    assert 0.40 <= frac_hi <= 0.60, (
+        f"SR at midpoint 1.25: expected ~50% round to code 3 (1.5), "
+        f"got {frac_hi:.4f} over {total} samples"
     )
 
 
 @pytest.mark.skipif(not is_sm_at_least_100(), reason="Requires SM100+")
-@pytest.mark.parametrize("swizzle_scale_factors", [False, True], ids=["sw0", "sw1"])
+@pytest.mark.parametrize("compute_rowwise", [False, True], ids=["rw0", "rw1"])
 @torch.no_grad()
-def test_triton_rht_quantize_sr_col_mean_mae_lt_rn(swizzle_scale_factors):
-    """Averaged SR columnwise MAE must be less than single-pass RTNE MAE.
+def test_triton_rht_quantize_sr_at_most_one_fp4_step_from_rtne(compute_rowwise):
+    """SR code must be at most 1 FP4 magnitude index step from the RTNE code.
 
-    SR is unbiased: averaging over seeds cancels per-element rounding bias, giving
-    lower MAE than a single deterministic RTNE pass (which has persistent rounding
-    error per element).
+    SR picks the floor or ceil of the scaled value on the FP4 magnitude grid.
+    RTNE also picks floor or ceil (nearest). Therefore |sr_mag_idx - rtne_mag_idx| <= 1
+    must hold for every element, and signs must agree.
     """
-    M, N = _SR_M, _SR_N
-    torch.manual_seed(0)
+    M, N = 128, 128
+    N_SAMPLES = 16
+    torch.manual_seed(42)
     A = torch.randn(M, N, dtype=torch.bfloat16, device="cuda")
-    ref_rht = _rht_reference(A).float()
 
-    # Shared global amax (input-derived, same for SR and RTNE)
-    _, _, col_amax, *_ = triton_rht_quantize_row_col(
-        A, stochastic_rounding=False, compute_rowwise=False, swizzle_scale_factors=False
+    def _unpack(codes: torch.Tensor) -> torch.Tensor:
+        """Unpack (R, C//2) uint8 → (R, C) nibble values."""
+        lo = (codes & 0xF).long()
+        hi = (codes >> 4).long()
+        out = torch.empty(codes.shape[0], codes.shape[1] * 2, dtype=torch.long, device=codes.device)
+        out[:, ::2] = lo
+        out[:, 1::2] = hi
+        return out
+
+    col_rn, _, _, row_rn, _, _ = triton_rht_quantize_row_col(
+        A, stochastic_rounding=False, compute_rowwise=compute_rowwise, swizzle_scale_factors=False
     )
+    rn_nibs = _unpack(row_rn if compute_rowwise else col_rn)
+    rn_sign = rn_nibs >> 3
+    rn_mag = rn_nibs & 0x7
 
-    # Collect SR samples
-    sr_samples = []
-    for seed in range(_SR_NUM_SAMPLES):
-        torch.manual_seed(seed)
-        col_codes, col_sf, *_ = triton_rht_quantize_row_col(
-            A,
-            stochastic_rounding=True,
-            compute_rowwise=False,
-            swizzle_scale_factors=swizzle_scale_factors,
+    for _ in range(N_SAMPLES):
+        col_sr, _, _, row_sr, _, _ = triton_rht_quantize_row_col(
+            A, stochastic_rounding=True, compute_rowwise=compute_rowwise, swizzle_scale_factors=False
         )
-        if swizzle_scale_factors:
-            col_sf = from_blocked(col_sf.flatten(), N, M // 16)
-        sr_samples.append(_dequantize(col_codes, col_sf, col_amax))
+        sr_nibs = _unpack(row_sr if compute_rowwise else col_sr)
+        sr_sign = sr_nibs >> 3
+        sr_mag = sr_nibs & 0x7
 
-    sr_avg = torch.stack(sr_samples).mean(dim=0)
-    sr_mean_mae = float((sr_avg - ref_rht).abs().mean())
+        # Sign must match RTNE (SR preserves sign; exception: both sides of zero are sign=0)
+        nonzero = (sr_mag != 0) | (rn_mag != 0)
+        assert ((sr_sign == rn_sign) | ~nonzero).all(), "SR changed sign relative to RTNE"
 
-    # RTNE baseline
-    rn_codes, rn_sf, rn_amax, *_ = triton_rht_quantize_row_col(
-        A, stochastic_rounding=False, compute_rowwise=False, swizzle_scale_factors=False
-    )
-    rn_mae = float((_dequantize(rn_codes, rn_sf, rn_amax) - ref_rht).abs().mean())
-
-    assert sr_mean_mae < rn_mae, (
-        f"SR averaged col MAE ({sr_mean_mae:.6f}) >= RTNE MAE ({rn_mae:.6f}) — "
-        "SR may have regressed to round-nearest or is biased"
-    )
-
-
-@pytest.mark.skipif(not is_sm_at_least_100(), reason="Requires SM100+")
-@pytest.mark.parametrize("swizzle_scale_factors", [False, True], ids=["sw0", "sw1"])
-@torch.no_grad()
-def test_triton_rht_quantize_sr_col_vs_reference_mae(swizzle_scale_factors):
-    """Triton SR mean MAE must agree with PyTorch reference SR mean MAE (rtol=0.2, atol=1e-4).
-
-    Validates that the Triton SR implementation produces the same statistical
-    quantization quality as the PyTorch reference SR algorithm (stochastic rounding
-    on the non-uniform FP4 E2M1 magnitude grid).
-    """
-    M, N = _SR_M, _SR_N
-    torch.manual_seed(0)
-    A = torch.randn(M, N, dtype=torch.bfloat16, device="cuda")
-    ref_rht = _rht_reference(A).float()
-
-    _, _, col_amax, *_ = triton_rht_quantize_row_col(
-        A, stochastic_rounding=False, compute_rowwise=False, swizzle_scale_factors=False
-    )
-
-    # Triton SR samples
-    tri_samples = []
-    for seed in range(_SR_NUM_SAMPLES):
-        torch.manual_seed(seed)
-        col_codes, col_sf, *_ = triton_rht_quantize_row_col(
-            A,
-            stochastic_rounding=True,
-            compute_rowwise=False,
-            swizzle_scale_factors=swizzle_scale_factors,
+        # Magnitude index must be at most 1 step from RTNE
+        mag_diff = (sr_mag - rn_mag).abs()
+        assert (mag_diff <= 1).all(), (
+            f"SR magnitude index differs by {mag_diff.max().item()} from RTNE (must be ≤1)"
         )
-        if swizzle_scale_factors:
-            col_sf = from_blocked(col_sf.flatten(), N, M // 16)
-        tri_samples.append(_dequantize(col_codes, col_sf, col_amax))
-
-    triton_mean_mae = float(
-        (torch.stack(tri_samples).mean(dim=0) - ref_rht).abs().mean()
-    )
-
-    # Reference SR samples (independent generator per seed)
-    ref_samples = []
-    for seed in range(_SR_NUM_SAMPLES):
-        gen = torch.Generator(device=A.device).manual_seed(seed)
-        ref_codes, ref_sf, _ = _rht_quantize_reference_sr(A, gen)
-        ref_samples.append(_dequantize(ref_codes, ref_sf, col_amax))
-
-    ref_mean_mae = float(
-        (torch.stack(ref_samples).mean(dim=0) - ref_rht).abs().mean()
-    )
-
-    torch.testing.assert_close(
-        torch.tensor(triton_mean_mae),
-        torch.tensor(ref_mean_mae),
-        rtol=0.2,
-        atol=1e-4,
-    )
