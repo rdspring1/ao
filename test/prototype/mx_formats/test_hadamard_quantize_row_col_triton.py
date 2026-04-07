@@ -10,17 +10,19 @@ Covers all 8 (stochastic_rounding × compute_rowwise × swizzle_scale_factors) c
 
   SR (stochastic_rounding=True):
     - test_triton_rht_quantize_sr_midpoint_distribution: Values at the FP4 [1.0, 1.5]
-      midpoint (1.25) round to each neighbor ~50% of the time (rowwise path).
+      midpoint (1.25) round to each neighbor ~50% of the time (columnwise path; input
+      constructed via inverse RHT so post-RHT values are exactly 1.25).
     - test_triton_rht_quantize_sr_at_most_one_fp4_step_from_rtne: SR code is at most 1
-      FP4 magnitude index step from the RTNE code for every element (col and row paths).
+      FP4 magnitude index step from the RTNE code for every element (columnwise path
+      only; rowwise path always uses RTNE regardless of stochastic_rounding).
 
 8-combination coverage:
   SR=F, RW=F, SW=F  — rtne_scales_vs_reference + rtne_sqnr
   SR=F, RW=F, SW=T  — rtne_scales_vs_reference
   SR=F, RW=T, SW=F  — rtne_scales_vs_reference + rtne_sqnr
   SR=F, RW=T, SW=T  — rtne_scales_vs_reference
-  SR=T, RW=F, SW=F  — sr_at_most_one_fp4_step_from_rtne
-  SR=T, RW=T, SW=F  — sr_midpoint_distribution + sr_at_most_one_fp4_step_from_rtne
+  SR=T, RW=F, SW=F  — sr_midpoint_distribution + sr_at_most_one_fp4_step_from_rtne
+  SR=T, RW=T, SW=F  — (rowwise path always uses RTNE; covered by rtne tests)
 """
 import pytest
 import torch
@@ -68,6 +70,8 @@ def _rht_quantize_reference(
         scale_inv:   (N, M//16) float8_e4m3fn per-vector decode scales.
         global_amax: scalar float32.
     """
+    # Pass bfloat16 output of _rht_reference directly: nvfp4_quantize converts bf16→f32
+    # losslessly, so block amax matches the kernel's tl.max(bf16) exactly.
     x_t_rht = _rht_reference(A)  # (N, M) bfloat16
     global_amax = x_t_rht.float().abs().max()
     scale_inv, codes = nvfp4_quantize(
@@ -99,6 +103,8 @@ def _dequantize(
     global_amax: torch.Tensor,
 ) -> torch.Tensor:
     """Decode packed FP4 codes via NVFP4Tensor.dequantize()."""
+    # orig_dtype=bfloat16: all test inputs are bfloat16; affects only the default
+    # output dtype of dequantize(), overridden by the explicit .float() call below.
     return NVFP4Tensor(
         codes, scales, 16, torch.bfloat16,
         per_tensor_scale=per_tensor_amax_to_scale(global_amax),
@@ -270,14 +276,16 @@ def test_triton_rht_quantize_sr_midpoint_distribution():
 
 
 @pytest.mark.skipif(not is_sm_at_least_100(), reason="Requires SM100+")
-@pytest.mark.parametrize("compute_rowwise", [False, True], ids=["rw0", "rw1"])
 @torch.no_grad()
-def test_triton_rht_quantize_sr_at_most_one_fp4_step_from_rtne(compute_rowwise):
+def test_triton_rht_quantize_sr_at_most_one_fp4_step_from_rtne():
     """SR code must be at most 1 FP4 magnitude index step from the RTNE code.
 
     SR picks the floor or ceil of the scaled value on the FP4 magnitude grid.
     RTNE also picks floor or ceil (nearest). Therefore |sr_mag_idx - rtne_mag_idx| <= 1
     must hold for every element, and signs must agree.
+
+    Only the columnwise path is tested: the rowwise path always uses RTNE regardless
+    of stochastic_rounding, so testing it here would be vacuous.
     """
     M, N = 128, 128
     N_SAMPLES = 16
@@ -293,18 +301,18 @@ def test_triton_rht_quantize_sr_at_most_one_fp4_step_from_rtne(compute_rowwise):
         out[:, 1::2] = hi
         return out
 
-    col_rn, _, _, row_rn, _, _ = triton_rht_quantize_row_col(
-        A, stochastic_rounding=False, compute_rowwise=compute_rowwise, swizzle_scale_factors=False
+    col_rn, _, _, _, _, _ = triton_rht_quantize_row_col(
+        A, stochastic_rounding=False, compute_rowwise=False, swizzle_scale_factors=False
     )
-    rn_nibs = _unpack(row_rn if compute_rowwise else col_rn)
+    rn_nibs = _unpack(col_rn)
     rn_sign = rn_nibs >> 3
     rn_mag = rn_nibs & 0x7
 
     for _ in range(N_SAMPLES):
-        col_sr, _, _, row_sr, _, _ = triton_rht_quantize_row_col(
-            A, stochastic_rounding=True, compute_rowwise=compute_rowwise, swizzle_scale_factors=False
+        col_sr, _, _, _, _, _ = triton_rht_quantize_row_col(
+            A, stochastic_rounding=True, compute_rowwise=False, swizzle_scale_factors=False
         )
-        sr_nibs = _unpack(row_sr if compute_rowwise else col_sr)
+        sr_nibs = _unpack(col_sr)
         sr_sign = sr_nibs >> 3
         sr_mag = sr_nibs & 0x7
 
