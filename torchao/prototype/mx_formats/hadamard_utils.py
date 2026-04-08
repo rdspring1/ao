@@ -12,13 +12,13 @@ import triton.language as tl
 
 
 def get_wgrad_sign_vector(
-    device, dtype: torch.dtype = torch.bfloat16
+    shape, device, dtype: torch.dtype = torch.bfloat16
 ) -> torch.Tensor:
-    """Hard-coded random signs for Hadamard transform."""
-    return torch.tensor(
-        [1, 1, 1, -1, 1, -1, -1, -1, -1, -1, -1, 1, -1, 1, -1, -1],
-        dtype=dtype,
-        device=device,
+    """Generate a random {-1, 1} sign vector for the Hadamard transform."""
+    return torch.where(
+        torch.rand(shape, device=device) >= 0.5,
+        torch.ones(shape, dtype=dtype, device=device),
+        -torch.ones(shape, dtype=dtype, device=device),
     )
 
 
@@ -57,16 +57,20 @@ def get_hadamard_matrix(
 
 @functools.lru_cache(maxsize=None)
 def get_rht_matrix(
-    with_random_sign_mask: bool,
+    sign_vector: tuple[int, ...] | None,
     device,
     dtype: torch.dtype = torch.bfloat16,
     hadamard_dimension: int = 16,
 ) -> torch.Tensor:
-    """Construct matrix used in random Hadamard transform."""
-    if with_random_sign_mask:
-        signs = get_wgrad_sign_vector(device=device, dtype=dtype)
+    """Construct an RHT matrix from an explicit sign vector or a generated sign vector."""
+    if sign_vector is None:
+        signs = get_wgrad_sign_vector(hadamard_dimension, device=device, dtype=dtype)
     else:
-        signs = torch.ones(1, dtype=dtype, device=device)
+        assert len(sign_vector) == hadamard_dimension, (
+            f"Expected sign_vector length {hadamard_dimension}, "
+            f"got {len(sign_vector)}"
+        )
+        signs = torch.tensor(sign_vector, dtype=dtype, device=device)
     sign_matrix = signs * torch.eye(hadamard_dimension, dtype=dtype, device=device)
     return sign_matrix @ get_hadamard_matrix(
         hadamard_dimension, device=device, dtype=dtype

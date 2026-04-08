@@ -94,6 +94,7 @@ def _hadamard_amax_kernel(
 
 def triton_rht_amax(
     A: torch.Tensor,
+    sign_vector: tuple[int, ...] | None = None,
 ) -> torch.Tensor:
     """Apply RHT to A and return the global absolute maximum without materializing output.
 
@@ -133,7 +134,7 @@ def triton_rht_amax(
         A_tmp = torch.empty((M, N), dtype=torch.bfloat16, device=A.device)
         # Fresh zeros per trial to prevent amax accumulation across benchmark iterations.
         global_amax_tmp = torch.zeros((), dtype=torch.float32, device=A.device)
-        B_tmp = get_rht_matrix(with_random_sign_mask=True, device=A.device).to(
+        B_tmp = get_rht_matrix(sign_vector=sign_vector, device=A.device).to(
             torch.bfloat16
         )
         a_desc = TensorDescriptor.from_tensor(A_tmp, [cfg.BLOCK_M, cfg.BLOCK_N])
@@ -154,7 +155,7 @@ def triton_rht_amax(
 
     best = get_best_config(cache_key, HADAMARD_CONFIGS, benchmark_fn)
 
-    B = get_rht_matrix(with_random_sign_mask=True, device=A.device).to(torch.bfloat16)
+    B = get_rht_matrix(sign_vector=sign_vector, device=A.device).to(torch.bfloat16)
     global_amax = torch.zeros((), dtype=torch.float32, device=A.device)
 
     a_desc = TensorDescriptor.from_tensor(A, [best.BLOCK_M, best.BLOCK_N])
