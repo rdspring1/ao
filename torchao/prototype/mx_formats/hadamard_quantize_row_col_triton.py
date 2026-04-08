@@ -2,6 +2,7 @@ import itertools
 import triton
 import triton.language as tl
 import torch
+import torch.nn.functional as F
 from torchao.prototype.mx_formats.hadamard_utils import (
     get_rht_matrix,
     _compute_pid,
@@ -236,6 +237,8 @@ def triton_rht_quantize_row_col(
     stochastic_rounding: bool = False,
     swizzle_scale_factors: bool = False,
     compute_rowwise: bool = True,
+    sign_vector: tuple[int, ...] | None = None,
+    scaling_type: F.ScalingType = F.ScalingType.TensorWise,
 ) -> tuple:
     """RHT + NVFP4 E2M1 columnwise quantization fused with optional rowwise quantization.
 
@@ -256,6 +259,9 @@ def triton_rht_quantize_row_col(
             Requires M % 128 == 0 and N % 128 == 0.
         compute_rowwise (bool): Whether to compute the rowwise quantization path.
             When False, row_fp4/row_sf/row_amax in the return tuple are None.
+        sign_vector: Optional sign vector for the RHT. If None, a random one is generated.
+        scaling_type: ScalingType controlling reduction granularity. Only
+            ``ScalingType.TensorWise`` is currently supported.
 
     Returns:
         Tuple of (col_fp4, col_sf, col_amax, row_fp4, row_sf, row_amax):
@@ -268,7 +274,8 @@ def triton_rht_quantize_row_col(
 
     Raises:
         NotImplementedError: If hardware is pre-SM100.
-        AssertionError: If A is not bfloat16, not 2-D, not contiguous, or M % 16 != 0.
+        ValueError: If A is not bfloat16, not 2-D, not contiguous, M % 16 != 0, or
+            scaling_type is not ScalingType.TensorWise.
 
     CUDA graphs: call once before graph capture to warm up the autotuner.
     """
@@ -276,16 +283,26 @@ def triton_rht_quantize_row_col(
         raise NotImplementedError(
             "Kernel requires SM100 (Blackwell); detected pre-SM100 hardware."
         )
-    assert A.dtype == torch.bfloat16, f"Expected bfloat16, got {A.dtype}"
-    assert A.ndim == 2, "Tensor A must be 2-D"
-    assert A.is_contiguous(), "A must be row-major (contiguous)"
-    assert A.shape[0] % 16 == 0, f"M must be divisible by 16, got M={A.shape[0]}"
+    if A.dtype != torch.bfloat16:
+        raise ValueError(f"Expected bfloat16, got {A.dtype}")
+    if A.ndim != 2:
+        raise ValueError("Tensor A must be 2-D")
+    if not A.is_contiguous():
+        raise ValueError("A must be row-major (contiguous)")
+    if A.shape[0] % 16 != 0:
+        raise ValueError(f"M must be divisible by 16, got M={A.shape[0]}")
+    if scaling_type != F.ScalingType.TensorWise:
+        raise ValueError(
+            f"scaling_type={scaling_type!r} is not supported; "
+            "only ScalingType.TensorWise is implemented."
+        )
     M, N = A.shape
-    assert not compute_rowwise or N % 32 == 0, (
-        f"compute_rowwise requires N % 32 == 0 (rowwise FP4 output uses TMA which "
-        f"requires 16-byte-aligned inner stride; N//2 must be a multiple of 16), "
-        f"got N={N}"
-    )
+    if compute_rowwise and N % 32 != 0:
+        raise ValueError(
+            f"compute_rowwise requires N % 32 == 0 (rowwise FP4 output uses TMA which "
+            f"requires 16-byte-aligned inner stride; N//2 must be a multiple of 16), "
+            f"got N={N}"
+        )
 
     # Columnwise global amax: max(abs(RHT(A.t())))
     col_global_amax = triton_rht_amax(A)
@@ -312,7 +329,7 @@ def triton_rht_quantize_row_col(
     NUM_SMS = torch.cuda.get_device_properties(A.device).multi_processor_count
     GROUP_SIZE_N: int = 8
 
-    B = get_rht_matrix(sign_vector=None, device=A.device).to(torch.bfloat16)
+    B = get_rht_matrix(sign_vector=sign_vector, device=A.device).to(torch.bfloat16)
 
     # Columnwise outputs
     C = torch.empty((N, M // 2), dtype=torch.uint8, device=A.device)
