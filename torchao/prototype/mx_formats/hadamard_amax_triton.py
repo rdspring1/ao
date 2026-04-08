@@ -10,6 +10,7 @@ import itertools
 import triton
 import triton.language as tl
 import torch
+import torch.nn.functional as F
 from torchao.prototype.mx_formats.hadamard_utils import get_rht_matrix, _compute_pid
 from torchao.utils import is_sm_at_least_90
 
@@ -109,6 +110,7 @@ def _hadamard_amax_kernel(
 def triton_rht_amax(
     A: torch.Tensor,
     sign_vector: tuple[int, ...] | None = None,
+    scaling_type: F.ScalingType = F.ScalingType.TensorWise,
 ) -> torch.Tensor:
     """Apply RHT to A and return the global absolute maximum without materializing output.
 
@@ -118,13 +120,17 @@ def triton_rht_amax(
 
     Args:
         A: (M, N) bfloat16 tensor, row-major. M must be divisible by 16.
+        sign_vector: Optional sign vector for the RHT. If None, a random one is generated.
+        scaling_type: ScalingType controlling reduction granularity. Only
+            ``ScalingType.TensorWise`` is currently supported.
 
     Returns:
         Scalar float32 tensor containing max(abs(RHT(A))).
 
     Raises:
         NotImplementedError: If hardware is pre-SM90.
-        AssertionError: If A is not bfloat16, not 2-D, not contiguous, or M % 16 != 0.
+        ValueError: If A is not bfloat16, not 2-D, not contiguous, M % 16 != 0, or
+            scaling_type is not ScalingType.TensorWise.
 
     CUDA graphs: call this function once before graph capture to warm up the autotuner.
     Subsequent calls are CUDA graph safe.
@@ -133,10 +139,19 @@ def triton_rht_amax(
         raise NotImplementedError(
             "Kernel requires SM90 (Hopper); detected pre-SM90 hardware."
         )
-    assert A.dtype == torch.bfloat16, f"Expected bfloat16, got {A.dtype}"
-    assert A.ndim == 2, "Tensor A must be 2-D"
-    assert A.is_contiguous(), "A must be row-major (contiguous)"
-    assert A.shape[0] % 16 == 0, f"M must be divisible by 16, got M={A.shape[0]}"
+    if A.dtype != torch.bfloat16:
+        raise ValueError(f"Expected bfloat16, got {A.dtype}")
+    if A.ndim != 2:
+        raise ValueError("Tensor A must be 2-D")
+    if not A.is_contiguous():
+        raise ValueError("A must be row-major (contiguous)")
+    if A.shape[0] % 16 != 0:
+        raise ValueError(f"M must be divisible by 16, got M={A.shape[0]}")
+    if scaling_type != F.ScalingType.TensorWise:
+        raise ValueError(
+            f"scaling_type={scaling_type!r} is not supported; "
+            "only ScalingType.TensorWise is implemented."
+        )
     M, N = A.shape
 
     NUM_SMS = torch.cuda.get_device_properties(A.device).multi_processor_count
