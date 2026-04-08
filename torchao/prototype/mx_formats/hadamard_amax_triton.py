@@ -10,17 +10,16 @@ import itertools
 import triton
 import triton.language as tl
 import torch
-from triton.tools.tensor_descriptor import TensorDescriptor
 from torchao.prototype.mx_formats.hadamard_utils import get_rht_matrix, _compute_pid
-from torchao.prototype.mx_formats.autotune_configs import (
-    KernelConfig,
-    get_best_config,
-)
 from torchao.utils import is_sm_at_least_90
 
 # SM90+ autotune configs. BLOCK_M must be divisible by 16 (RHT reshape constraint).
-HADAMARD_CONFIGS: list[KernelConfig] = [
-    KernelConfig(BLOCK_M=bm, BLOCK_N=bn, NUM_STAGES=ns, NUM_WARPS=nw)
+HADAMARD_CONFIGS: list[triton.Config] = [
+    triton.Config(
+        {'BLOCK_M': bm, 'BLOCK_N': bn, 'NUM_STAGES': ns},
+        num_warps=nw,
+        num_stages=ns,
+    )
     for bm, bn, ns, nw in itertools.product(
         [64, 128],  # BLOCK_M
         [32, 64],   # BLOCK_N
@@ -30,10 +29,11 @@ HADAMARD_CONFIGS: list[KernelConfig] = [
 ]
 
 
+@triton.autotune(configs=HADAMARD_CONFIGS, key=['M', 'N'])
 @triton.jit
 def _hadamard_amax_kernel(
-    a_desc,
-    b_desc,
+    a_ptr,
+    b_ptr,
     global_max_ptr,
     M,
     N,
@@ -44,6 +44,20 @@ def _hadamard_amax_kernel(
     NUM_STAGES: tl.constexpr,
 ):
     """Persistent RHT kernel with fused amax reduction; no output tensor written."""
+    # Create TMA descriptors in-kernel from raw pointers and shape/stride
+    a_desc = tl.make_tensor_descriptor(
+        a_ptr,
+        shape=[M, N],
+        strides=[N, 1],
+        block_shape=[BLOCK_M, BLOCK_N],
+    )
+    b_desc = tl.make_tensor_descriptor(
+        b_ptr,
+        shape=[16, 16],
+        strides=[16, 1],
+        block_shape=[16, 16],
+    )
+
     # Persistent grid-stride loop
     start_pid = tl.program_id(0)
     num_pid_m = tl.cdiv(M, BLOCK_M)
@@ -128,50 +142,25 @@ def triton_rht_amax(
     NUM_SMS = torch.cuda.get_device_properties(A.device).multi_processor_count
     GROUP_SIZE_N: int = 8  # L2 reuse grouping along M
 
-    cache_key = ("hadamard_amax", M, N, A.device.index)
-
-    def benchmark_fn(cfg: KernelConfig) -> None:
-        A_tmp = torch.empty((M, N), dtype=torch.bfloat16, device=A.device)
-        # Fresh zeros per trial to prevent amax accumulation across benchmark iterations.
-        global_amax_tmp = torch.zeros((), dtype=torch.float32, device=A.device)
-        B_tmp = get_rht_matrix(sign_vector=sign_vector, device=A.device).to(
-            torch.bfloat16
+    # tl.make_tensor_descriptor requires a Triton allocator for per-CTA scratch space.
+    # Outside torch.compile, none is set by default; mirror what torch._inductor does.
+    if hasattr(triton, "set_allocator"):
+        triton.set_allocator(
+            lambda size, align, stream: torch.empty(
+                size, dtype=torch.int8, device=A.device
+            )
         )
-        a_desc = TensorDescriptor.from_tensor(A_tmp, [cfg.BLOCK_M, cfg.BLOCK_N])
-        b_desc = TensorDescriptor.from_tensor(B_tmp, [16, 16])
-        _hadamard_amax_kernel[(NUM_SMS,)](
-            a_desc,
-            b_desc,
-            global_amax_tmp,
-            M,
-            N,
-            BLOCK_M=cfg.BLOCK_M,
-            BLOCK_N=cfg.BLOCK_N,
-            GROUP_SIZE_N=GROUP_SIZE_N,
-            NUM_SMS=NUM_SMS,
-            NUM_STAGES=cfg.NUM_STAGES,
-            num_warps=cfg.NUM_WARPS,
-        )
-
-    best = get_best_config(cache_key, HADAMARD_CONFIGS, benchmark_fn)
 
     B = get_rht_matrix(sign_vector=sign_vector, device=A.device).to(torch.bfloat16)
     global_amax = torch.zeros((), dtype=torch.float32, device=A.device)
 
-    a_desc = TensorDescriptor.from_tensor(A, [best.BLOCK_M, best.BLOCK_N])
-    b_desc = TensorDescriptor.from_tensor(B, [16, 16])
-
     _hadamard_amax_kernel[(NUM_SMS,)](
-        a_desc,
-        b_desc,
+        A,
+        B,
         global_amax,
         M,
         N,
-        BLOCK_M=best.BLOCK_M,
-        BLOCK_N=best.BLOCK_N,
         GROUP_SIZE_N=GROUP_SIZE_N,
         NUM_SMS=NUM_SMS,
-        NUM_STAGES=best.NUM_STAGES,
-        num_warps=best.NUM_WARPS,
     )
     return global_amax
