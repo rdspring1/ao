@@ -2,7 +2,6 @@ import itertools
 import triton
 import triton.language as tl
 import torch
-from triton.tools.tensor_descriptor import TensorDescriptor
 from torchao.prototype.mx_formats.hadamard_utils import (
     get_rht_matrix,
     _compute_pid,
@@ -13,15 +12,15 @@ from torchao.prototype.mx_formats.hadamard_utils import (
     _store_scales_swizzle,
 )
 from torchao.prototype.mx_formats.hadamard_amax_triton import triton_rht_amax
-from torchao.prototype.mx_formats.autotune_configs import (
-    KernelConfig,
-    get_best_config,
-)
 from torchao.utils import is_sm_at_least_100
 
 # SM100+ autotune configs. BLOCK_M=256 enables col TMA sf store; BLOCK_N=256 enables row TMA.
-HADAMARD_QUANTIZE_CONFIGS: list[KernelConfig] = [
-    KernelConfig(BLOCK_M=bm, BLOCK_N=bn, NUM_STAGES=ns, NUM_WARPS=nw)
+HADAMARD_QUANTIZE_CONFIGS: list[triton.Config] = [
+    triton.Config(
+        {'BLOCK_M': bm, 'BLOCK_N': bn, 'NUM_STAGES': ns},
+        num_warps=nw,
+        num_stages=ns,
+    )
     for bm, bn, ns, nw in itertools.product(
         [128, 256],   # BLOCK_M: 256 enables columnwise TMA sf store
         [128, 256],   # BLOCK_N: >= 128 for swizzle reshape; 256 enables rowwise TMA sf store
@@ -31,18 +30,19 @@ HADAMARD_QUANTIZE_CONFIGS: list[KernelConfig] = [
 ]
 
 
-
+@triton.autotune(
+    configs=HADAMARD_QUANTIZE_CONFIGS,
+    key=['M', 'N', 'STOCHASTIC_ROUNDING', 'SWIZZLE_SCALE_FACTORS', 'COMPUTE_ROWWISE'],
+)
 @triton.jit
 def _hadamard_quantize_row_col_kernel(
-    a_desc,
-    b_desc,
-    c_desc,
+    a_ptr,
+    b_ptr,
+    c_ptr,
     sf_ptr,
-    rht_col_sf_desc,
     global_amax_ptr,
-    rowwise_c_desc,
+    rowwise_c_ptr,
     rowwise_sf_ptr,
-    row_sf_desc,
     rowwise_global_amax_ptr,
     seed_ptr,
     M,
@@ -58,6 +58,67 @@ def _hadamard_quantize_row_col_kernel(
 ):
     """Warp-specialized TMA kernel fusing RHT + NVFP4 columnwise quantization and
     optional rowwise NVFP4 quantization of the original tensor in a single pass."""
+    # Create TMA descriptors in-kernel from raw pointers, shape, and stride
+    a_desc = tl.make_tensor_descriptor(
+        a_ptr,
+        shape=[M, N],
+        strides=[N, 1],
+        block_shape=[BLOCK_M, BLOCK_N],
+    )
+    b_desc = tl.make_tensor_descriptor(
+        b_ptr,
+        shape=[16, 16],
+        strides=[16, 1],
+        block_shape=[16, 16],
+    )
+    c_desc = tl.make_tensor_descriptor(
+        c_ptr,
+        shape=[N, M // 2],
+        strides=[M // 2, 1],
+        block_shape=[BLOCK_N, BLOCK_M // 2],
+    )
+    # Columnwise scale factor descriptor; TMA requires contiguous dim >= 16 bytes
+    # -> float8 needs BLOCK_M >= 256.
+    if BLOCK_M >= 256:
+        if SWIZZLE_SCALE_FACTORS:
+            rht_col_sf_desc = tl.make_tensor_descriptor(
+                sf_ptr,
+                shape=[N // 128, M // 64, 32, 16],
+                strides=[(M // 64) * 32 * 16, 32 * 16, 16, 1],
+                block_shape=[BLOCK_N // 128, BLOCK_M // 64, 32, 16],
+            )
+        else:
+            rht_col_sf_desc = tl.make_tensor_descriptor(
+                sf_ptr,
+                shape=[N, M // 16],
+                strides=[M // 16, 1],
+                block_shape=[BLOCK_N, BLOCK_M // 16],
+            )
+    # Rowwise descriptors
+    if COMPUTE_ROWWISE:
+        rowwise_c_desc = tl.make_tensor_descriptor(
+            rowwise_c_ptr,
+            shape=[M, N // 2],
+            strides=[N // 2, 1],
+            block_shape=[BLOCK_M, BLOCK_N // 2],
+        )
+        # TMA path: inner dim = BLOCK_N//16 bytes >= 16 bytes for BLOCK_N >= 256.
+        if BLOCK_N >= 256:
+            if SWIZZLE_SCALE_FACTORS:
+                row_sf_desc = tl.make_tensor_descriptor(
+                    rowwise_sf_ptr,
+                    shape=[M // 128, N // 64, 32, 16],
+                    strides=[(N // 64) * 32 * 16, 32 * 16, 16, 1],
+                    block_shape=[BLOCK_M // 128, BLOCK_N // 64, 32, 16],
+                )
+            else:
+                row_sf_desc = tl.make_tensor_descriptor(
+                    rowwise_sf_ptr,
+                    shape=[M, N // 16],
+                    strides=[N // 16, 1],
+                    block_shape=[BLOCK_M, BLOCK_N // 16],
+                )
+
     # Persistent grid-stride loop
     start_pid = tl.program_id(0)
     num_pid_m = tl.cdiv(M, BLOCK_M)
@@ -120,7 +181,7 @@ def _hadamard_quantize_row_col_kernel(
                 _store_scales_swizzle(scale_inv, sf_ptr, pid_n, pid_m, N, M, BLOCK_N, BLOCK_M)
         else:
             if BLOCK_M >= 256:
-                # TMA path: requires contiguous dim ≥ 16 bytes → float8 needs BLOCK_M ≥ 256.
+                # TMA path: requires contiguous dim >= 16 bytes -> float8 needs BLOCK_M >= 256.
                 rht_col_sf_desc.store([pid_n * BLOCK_N, pid_m * BLOCK_M // 16], scale_inv)
             else:
                 _store_scales_non_tma(
@@ -160,7 +221,7 @@ def _hadamard_quantize_row_col_kernel(
                     )
             else:
                 if BLOCK_N >= 256:
-                    # TMA path: inner dim = BLOCK_N//16 bytes ≥ 16 bytes for BLOCK_N ≥ 256.
+                    # TMA path: inner dim = BLOCK_N//16 bytes >= 16 bytes for BLOCK_N >= 256.
                     row_sf_desc.store(
                         [pid_m * BLOCK_M, pid_n * BLOCK_N // 16], rowwise_scale_inv
                     )
@@ -168,86 +229,6 @@ def _hadamard_quantize_row_col_kernel(
                     _store_scales_non_tma(
                         rowwise_scale_inv, rowwise_sf_ptr, pid_m, pid_n, N, M, BLOCK_M, BLOCK_N,
                     )
-
-
-def _launch_row_col_kernel(
-    cfg: KernelConfig,
-    A,
-    B,
-    C,
-    scale_factors,
-    col_global_amax,
-    rowwise_C,
-    rowwise_sf,
-    row_global_amax,
-    rand_bits,
-    M: int,
-    N: int,
-    NUM_SMS: int,
-    GROUP_SIZE_N: int,
-    stochastic_rounding: bool,
-    swizzle_scale_factors: bool,
-    compute_rowwise: bool,
-) -> None:
-    """Launch _hadamard_quantize_row_col_kernel with the given KernelConfig."""
-    BLOCK_M, BLOCK_N = cfg.BLOCK_M, cfg.BLOCK_N
-    NUM_STAGES, NUM_WARPS = cfg.NUM_STAGES, cfg.NUM_WARPS
-
-    a_desc = TensorDescriptor.from_tensor(A, [BLOCK_M, BLOCK_N])
-    b_desc = TensorDescriptor.from_tensor(B, [16, 16])
-    c_desc = TensorDescriptor.from_tensor(C, [BLOCK_N, BLOCK_M // 2])
-
-    # rht_col_sf_desc: TMA requires contiguous dim ≥ 16 bytes → float8 needs BLOCK_M ≥ 256.
-    rht_col_sf_desc = None
-    if BLOCK_M >= 256:
-        if swizzle_scale_factors:
-            rht_col_sf_desc = TensorDescriptor.from_tensor(
-                scale_factors, [BLOCK_N // 128, BLOCK_M // 64, 32, 16]
-            )
-        else:
-            rht_col_sf_desc = TensorDescriptor.from_tensor(
-                scale_factors, [BLOCK_N, BLOCK_M // 16]
-            )
-
-    rowwise_c_desc = None
-    row_sf_desc = None
-    if compute_rowwise:
-        rowwise_c_desc = TensorDescriptor.from_tensor(rowwise_C, [BLOCK_M, BLOCK_N // 2])
-        if BLOCK_N >= 256:
-            if swizzle_scale_factors:
-                row_sf_desc = TensorDescriptor.from_tensor(
-                    rowwise_sf, [BLOCK_M // 128, BLOCK_N // 64, 32, 16]
-                )
-            else:
-                row_sf_desc = TensorDescriptor.from_tensor(
-                    rowwise_sf, [BLOCK_M, BLOCK_N // 16]
-                )
-
-    _hadamard_quantize_row_col_kernel[(NUM_SMS,)](
-        a_desc,
-        b_desc,
-        c_desc,
-        scale_factors,
-        rht_col_sf_desc,
-        col_global_amax,
-        rowwise_c_desc,
-        rowwise_sf,
-        row_sf_desc,
-        row_global_amax,
-        rand_bits,
-        M,
-        N,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        GROUP_SIZE_N=GROUP_SIZE_N,
-        NUM_SMS=NUM_SMS,
-        NUM_STAGES=NUM_STAGES,
-        STOCHASTIC_ROUNDING=stochastic_rounding,
-        SWIZZLE_SCALE_FACTORS=swizzle_scale_factors,
-        COMPUTE_ROWWISE=compute_rowwise,
-        num_warps=NUM_WARPS,
-    )
-
 
 
 def triton_rht_quantize_row_col(
@@ -331,7 +312,7 @@ def triton_rht_quantize_row_col(
     NUM_SMS = torch.cuda.get_device_properties(A.device).multi_processor_count
     GROUP_SIZE_N: int = 8
 
-    B = get_rht_matrix(with_random_sign_mask=True, device=A.device).to(torch.bfloat16)
+    B = get_rht_matrix(sign_vector=None, device=A.device).to(torch.bfloat16)
 
     # Columnwise outputs
     C = torch.empty((N, M // 2), dtype=torch.uint8, device=A.device)
@@ -363,25 +344,16 @@ def triton_rht_quantize_row_col(
         rowwise_C = torch.empty((1,), dtype=torch.uint8, device=A.device)
         rowwise_sf = torch.empty((1,), dtype=torch.float8_e4m3fn, device=A.device)
 
-    # Autotune: benchmark all configs on first call for this (M, N, ...) key.
-    device_cap = torch.cuda.get_device_capability(A.device)
-    cache_key = ("hadamard_quantize_row_col", M, N, device_cap, compute_rowwise, swizzle_scale_factors)
-
-    def benchmark_fn(cfg: KernelConfig) -> None:
-        _launch_row_col_kernel(
-            cfg, A, B, C, scale_factors, col_global_amax,
-            rowwise_C, rowwise_sf, row_global_amax,
-            0,  # rand_bits=0: deterministic during tuning
-            M, N, NUM_SMS, GROUP_SIZE_N,
-            stochastic_rounding=False,
-            swizzle_scale_factors=swizzle_scale_factors,
-            compute_rowwise=compute_rowwise,
+    # tl.make_tensor_descriptor requires a Triton allocator for per-CTA scratch space.
+    # Outside torch.compile, none is set by default; mirror what torch._inductor does.
+    if hasattr(triton, "set_allocator"):
+        triton.set_allocator(
+            lambda size, align, stream: torch.empty(
+                size, dtype=torch.int8, device=A.device
+            )
         )
 
-    cfg = get_best_config(cache_key, HADAMARD_QUANTIZE_CONFIGS, benchmark_fn)
-
-    _launch_row_col_kernel(
-        cfg,
+    _hadamard_quantize_row_col_kernel[(NUM_SMS,)](
         A,
         B,
         C,
@@ -393,11 +365,11 @@ def triton_rht_quantize_row_col(
         rand_bits,
         M,
         N,
-        NUM_SMS,
-        GROUP_SIZE_N,
-        stochastic_rounding,
-        swizzle_scale_factors,
-        compute_rowwise,
+        GROUP_SIZE_N=GROUP_SIZE_N,
+        NUM_SMS=NUM_SMS,
+        STOCHASTIC_ROUNDING=stochastic_rounding,
+        SWIZZLE_SCALE_FACTORS=swizzle_scale_factors,
+        COMPUTE_ROWWISE=compute_rowwise,
     )
 
     if compute_rowwise:

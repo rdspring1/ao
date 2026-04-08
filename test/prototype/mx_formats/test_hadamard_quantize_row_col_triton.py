@@ -56,7 +56,7 @@ _N_VALUES = [128, 200, 256, 384, 512, 1024]
 def _rht_reference(A: torch.Tensor) -> torch.Tensor:
     """PyTorch reference RHT: returns (N, M) bfloat16."""
     M_A, N_A = A.shape
-    B = get_rht_matrix(with_random_sign_mask=True, device=A.device)
+    B = get_rht_matrix(sign_vector=None, device=A.device)
     return (A.t().reshape(-1, 16) @ B).reshape(N_A, M_A).to(torch.bfloat16)
 
 
@@ -239,7 +239,7 @@ def test_triton_rht_quantize_rs_midpoint_distribution():
 
     # Build A such that RHT(A.T) has 1.25 at non-anchor positions and 6.0 at anchors.
     # Since B is orthogonal, A.T = target @ B^{-1} = target @ B.T.
-    B = get_rht_matrix(with_random_sign_mask=True, device="cuda").float()
+    B = get_rht_matrix(sign_vector=None, device="cuda").float()
     target = torch.full((N_RHT, M_RHT), 1.25, dtype=torch.float32, device="cuda")
     target[:, ::16] = 6.0  # one anchor per 16-group along M
     A_t = (target.reshape(N_RHT * M_RHT // 16, 16) @ B.t()).reshape(N_RHT, M_RHT)
