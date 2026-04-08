@@ -11,16 +11,20 @@ import triton
 import triton.language as tl
 
 
-def get_wgrad_sign_vector(device) -> torch.Tensor:
+def get_wgrad_sign_vector(
+    device, dtype: torch.dtype = torch.bfloat16
+) -> torch.Tensor:
     """Hard-coded random signs for Hadamard transform."""
     return torch.tensor(
         [1, 1, 1, -1, 1, -1, -1, -1, -1, -1, -1, 1, -1, 1, -1, -1],
-        dtype=torch.float32,
+        dtype=dtype,
         device=device,
     )
 
 
-def get_hadamard_matrix(hadamard_dimension: int, device) -> torch.Tensor:
+def get_hadamard_matrix(
+    hadamard_dimension: int, device, dtype: torch.dtype = torch.bfloat16
+) -> torch.Tensor:
     """Construct a 16x16 Hadamard matrix (scaled by 1/sqrt(16))."""
     assert hadamard_dimension == 16, "Only hadamard dimension 16 is supported."
     hadamard_scale = 1 / math.sqrt(hadamard_dimension)
@@ -44,7 +48,7 @@ def get_hadamard_matrix(hadamard_dimension: int, device) -> torch.Tensor:
                 [1, 1, -1, -1, -1, -1, 1, 1, -1, -1, 1, 1, 1, 1, -1, -1],
                 [1, -1, -1, 1, -1, 1, 1, -1, -1, 1, 1, -1, 1, -1, -1, 1],
             ],
-            dtype=torch.float32,
+            dtype=dtype,
             device=device,
         )
         * hadamard_scale
@@ -52,18 +56,21 @@ def get_hadamard_matrix(hadamard_dimension: int, device) -> torch.Tensor:
 
 
 @functools.lru_cache(maxsize=None)
-def get_rht_matrix(with_random_sign_mask: bool, device) -> torch.Tensor:
+def get_rht_matrix(
+    with_random_sign_mask: bool,
+    device,
+    dtype: torch.dtype = torch.bfloat16,
+    hadamard_dimension: int = 16,
+) -> torch.Tensor:
     """Construct matrix used in random Hadamard transform."""
-    hadamard_dimension = 16
     if with_random_sign_mask:
-        signs = get_wgrad_sign_vector(device=device)
+        signs = get_wgrad_sign_vector(device=device, dtype=dtype)
     else:
-        signs = torch.ones(1, dtype=torch.float32, device=device)
-    sign_matrix = signs * torch.eye(
-        hadamard_dimension, dtype=torch.float32, device=device
+        signs = torch.ones(1, dtype=dtype, device=device)
+    sign_matrix = signs * torch.eye(hadamard_dimension, dtype=dtype, device=device)
+    return sign_matrix @ get_hadamard_matrix(
+        hadamard_dimension, device=device, dtype=dtype
     )
-    rht_matrix = sign_matrix @ get_hadamard_matrix(hadamard_dimension, device=device)
-    return rht_matrix.to(dtype=torch.bfloat16)
 
 
 @triton.jit

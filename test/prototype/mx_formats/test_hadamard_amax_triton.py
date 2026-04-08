@@ -3,10 +3,8 @@ import pytest
 import torch
 
 from torchao.utils import is_sm_at_least_90
+from torchao.prototype.mx_formats.hadamard_utils import get_rht_matrix
 
-if is_sm_at_least_90():
-    from torchao.prototype.mx_formats.hadamard_amax_triton import triton_rht_amax
-    from torchao.prototype.mx_formats.hadamard_utils import get_rht_matrix
 
 
 # M=32 excluded: all BLOCK_M configs (64, 128) exceed M=32 → all autotune configs fail.
@@ -22,6 +20,8 @@ _N_VALUES = [128, 200, 256, 384, 512, 1024]
 @torch.no_grad()
 def test_triton_rht_amax_vs_reference(M, N):
     """triton_rht_amax must match the reference RHT matmul amax exactly (bitwise)."""
+    from torchao.prototype.mx_formats.hadamard_amax_triton import triton_rht_amax
+
     torch.manual_seed(42)
     A = torch.randn(M, N, dtype=torch.bfloat16, device="cuda")
 
