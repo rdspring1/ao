@@ -94,8 +94,8 @@ def _compute_pid(tile_id, num_pid_in_group, num_pid_n, GROUP_SIZE_N: tl.constexp
 
 
 @triton.jit
-def convert_fp32_to_fp4_packed(x_pairs):
-    """Convert FP32 pairs to packed FP4 format using round-to-nearest."""
+def convert_8xfp32_to_4xfp4_packed(x_pairs):
+    """Convert 8 FP32 values to 4 packed FP4 bytes using round-to-nearest. Calls four cvt.rn instructions, each packing two FP32 values into one packed int8."""
     x_fp4x2 = tl.inline_asm_elementwise(
         asm="""
         {
@@ -117,8 +117,8 @@ def convert_fp32_to_fp4_packed(x_pairs):
 
 
 @triton.jit
-def convert_fp32_to_fp4_packed_rs(x_pairs, rbits):
-    """Hardware stochastic rounding for FP4 conversion using cvt.rs PTX."""
+def convert_8xfp32_to_4xfp4_packed_rs(x_pairs, rbits):
+    """Convert 8 FP32 values to 4 packed FP4 bytes using stochastic rounding. Calls two cvt.rs instructions, each packing four FP32 values into one packed int8."""
     x_fp4x2 = tl.inline_asm_elementwise(
         asm="""
         {
@@ -156,9 +156,9 @@ def _pack_fp4(
         local_m = tl.arange(0, BLOCK_M_PACKED)[None, :]
         offsets = local_n * BLOCK_M_PACKED + local_m
         rbits = tl.randint(new_seed, offsets)
-        return convert_fp32_to_fp4_packed_rs(scaled_pairs, rbits)
+        return convert_8xfp32_to_4xfp4_packed_rs(scaled_pairs, rbits)
     else:
-        return convert_fp32_to_fp4_packed(scaled_pairs)
+        return convert_8xfp32_to_4xfp4_packed(scaled_pairs)
 
 
 # ---------------------------------------------------------------------------
