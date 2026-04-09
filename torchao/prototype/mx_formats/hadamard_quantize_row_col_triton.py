@@ -8,7 +8,6 @@ from torchao.prototype.mx_formats.hadamard_utils import (
     _compute_pid,
     _nvfp4_quantize,
     _pack_fp4,
-    _store_scales_non_tma,
     _swizzle_scales,
     _store_scales_swizzle,
 )
@@ -33,7 +32,7 @@ HADAMARD_QUANTIZE_CONFIGS: list[triton.Config] = [
 
 @triton.autotune(
     configs=HADAMARD_QUANTIZE_CONFIGS,
-    key=['M', 'N', 'STOCHASTIC_ROUNDING', 'SWIZZLE_SCALE_FACTORS', 'COMPUTE_ROWWISE'],
+    key=['M', 'N', 'STOCHASTIC_ROUNDING', 'COMPUTE_ROWWISE'],
 )
 @triton.jit
 def _hadamard_quantize_row_col_kernel(
@@ -54,7 +53,6 @@ def _hadamard_quantize_row_col_kernel(
     NUM_SMS: tl.constexpr,
     NUM_STAGES: tl.constexpr,
     STOCHASTIC_ROUNDING: tl.constexpr,
-    SWIZZLE_SCALE_FACTORS: tl.constexpr,
     COMPUTE_ROWWISE: tl.constexpr,
 ):
     """Warp-specialized TMA kernel fusing RHT + NVFP4 columnwise quantization and
@@ -81,20 +79,12 @@ def _hadamard_quantize_row_col_kernel(
     # Columnwise scale factor descriptor; TMA requires contiguous dim >= 16 bytes
     # -> float8 needs BLOCK_M >= 256.
     if BLOCK_M >= 256:
-        if SWIZZLE_SCALE_FACTORS:
-            rht_col_sf_desc = tl.make_tensor_descriptor(
-                sf_ptr,
-                shape=[N // 128, M // 64, 32, 16],
-                strides=[(M // 64) * 32 * 16, 32 * 16, 16, 1],
-                block_shape=[BLOCK_N // 128, BLOCK_M // 64, 32, 16],
-            )
-        else:
-            rht_col_sf_desc = tl.make_tensor_descriptor(
-                sf_ptr,
-                shape=[N, M // 16],
-                strides=[M // 16, 1],
-                block_shape=[BLOCK_N, BLOCK_M // 16],
-            )
+        rht_col_sf_desc = tl.make_tensor_descriptor(
+            sf_ptr,
+            shape=[N // 128, M // 64, 32, 16],
+            strides=[(M // 64) * 32 * 16, 32 * 16, 16, 1],
+            block_shape=[BLOCK_N // 128, BLOCK_M // 64, 32, 16],
+        )
     # Rowwise descriptors
     if COMPUTE_ROWWISE:
         rowwise_c_desc = tl.make_tensor_descriptor(
@@ -105,20 +95,12 @@ def _hadamard_quantize_row_col_kernel(
         )
         # TMA path: inner dim = BLOCK_N//16 bytes >= 16 bytes for BLOCK_N >= 256.
         if BLOCK_N >= 256:
-            if SWIZZLE_SCALE_FACTORS:
-                row_sf_desc = tl.make_tensor_descriptor(
-                    rowwise_sf_ptr,
-                    shape=[M // 128, N // 64, 32, 16],
-                    strides=[(N // 64) * 32 * 16, 32 * 16, 16, 1],
-                    block_shape=[BLOCK_M // 128, BLOCK_N // 64, 32, 16],
-                )
-            else:
-                row_sf_desc = tl.make_tensor_descriptor(
-                    rowwise_sf_ptr,
-                    shape=[M, N // 16],
-                    strides=[N // 16, 1],
-                    block_shape=[BLOCK_M, BLOCK_N // 16],
-                )
+            row_sf_desc = tl.make_tensor_descriptor(
+                rowwise_sf_ptr,
+                shape=[M // 128, N // 64, 32, 16],
+                strides=[(N // 64) * 32 * 16, 32 * 16, 16, 1],
+                block_shape=[BLOCK_M // 128, BLOCK_N // 64, 32, 16],
+            )
 
     # Persistent grid-stride loop
     start_pid = tl.program_id(0)
@@ -172,22 +154,13 @@ def _hadamard_quantize_row_col_kernel(
         c_desc.store([pid_n * BLOCK_N, pid_m * BLOCK_M // 2], scaled_fp4x2)
 
         # Store columnwise scale factors
-        if SWIZZLE_SCALE_FACTORS:
-            scale_inv = _swizzle_scales(scale_inv, BLOCK_N, BLOCK_M)
-            if BLOCK_M >= 256:
-                rht_col_sf_desc.store(
-                    [pid_n * BLOCK_N // 128, pid_m * BLOCK_M // 64, 0, 0], scale_inv
-                )
-            else:
-                _store_scales_swizzle(scale_inv, sf_ptr, pid_n, pid_m, N, M, BLOCK_N, BLOCK_M)
+        scale_inv = _swizzle_scales(scale_inv, BLOCK_N, BLOCK_M)
+        if BLOCK_M >= 256:
+            rht_col_sf_desc.store(
+                [pid_n * BLOCK_N // 128, pid_m * BLOCK_M // 64, 0, 0], scale_inv
+            )
         else:
-            if BLOCK_M >= 256:
-                # TMA path: requires contiguous dim >= 16 bytes -> float8 needs BLOCK_M >= 256.
-                rht_col_sf_desc.store([pid_n * BLOCK_N, pid_m * BLOCK_M // 16], scale_inv)
-            else:
-                _store_scales_non_tma(
-                    scale_inv, sf_ptr, pid_n, pid_m, M, N, BLOCK_N, BLOCK_M
-                )
+            _store_scales_swizzle(scale_inv, sf_ptr, pid_n, pid_m, N, M, BLOCK_N, BLOCK_M)
 
         # --- Rowwise path: direct quantization of A (no RHT, no transpose) ---
         if COMPUTE_ROWWISE:
@@ -209,33 +182,21 @@ def _hadamard_quantize_row_col_kernel(
 
             rowwise_c_desc.store([pid_m * BLOCK_M, pid_n * BLOCK_N // 2], rowwise_fp4x2)
 
-            if SWIZZLE_SCALE_FACTORS:
-                rowwise_scale_inv = _swizzle_scales(rowwise_scale_inv, BLOCK_M, BLOCK_N)
-                if BLOCK_N >= 256:
-                    row_sf_desc.store(
-                        [pid_m * BLOCK_M // 128, pid_n * BLOCK_N // 64, 0, 0],
-                        rowwise_scale_inv,
-                    )
-                else:
-                    _store_scales_swizzle(
-                        rowwise_scale_inv, rowwise_sf_ptr, pid_m, pid_n, M, N, BLOCK_M, BLOCK_N
-                    )
+            rowwise_scale_inv = _swizzle_scales(rowwise_scale_inv, BLOCK_M, BLOCK_N)
+            if BLOCK_N >= 256:
+                row_sf_desc.store(
+                    [pid_m * BLOCK_M // 128, pid_n * BLOCK_N // 64, 0, 0],
+                    rowwise_scale_inv,
+                )
             else:
-                if BLOCK_N >= 256:
-                    # TMA path: inner dim = BLOCK_N//16 bytes >= 16 bytes for BLOCK_N >= 256.
-                    row_sf_desc.store(
-                        [pid_m * BLOCK_M, pid_n * BLOCK_N // 16], rowwise_scale_inv
-                    )
-                else:
-                    _store_scales_non_tma(
-                        rowwise_scale_inv, rowwise_sf_ptr, pid_m, pid_n, N, M, BLOCK_M, BLOCK_N,
-                    )
+                _store_scales_swizzle(
+                    rowwise_scale_inv, rowwise_sf_ptr, pid_m, pid_n, M, N, BLOCK_M, BLOCK_N
+                )
 
 
 def triton_rht_quantize_row_col(
     A: torch.Tensor,
     stochastic_rounding: bool = False,
-    swizzle_scale_factors: bool = False,
     compute_rowwise: bool = True,
     sign_vector: tuple[int, ...] | None = None,
     scaling_type: F.ScalingType = F.ScalingType.TensorWise,
@@ -243,9 +204,11 @@ def triton_rht_quantize_row_col(
     """RHT + NVFP4 E2M1 columnwise quantization fused with optional rowwise quantization.
 
     Produces both:
-      - Columnwise output: quantization of RHT(A.t()), shape (N, M//2) + (N, M//16) scales.
+      - Columnwise output: quantization of RHT(A.t()), shape (N, M//2) +
+        (N//128, M//64, 32, 16) swizzled scales.
       - Rowwise output (when ``compute_rowwise=True``): direct NVFP4 quantization of A,
-        shape (M, N//2) + (M, N//16) scales, using ``torch.max(torch.abs(A))`` as global amax.
+        shape (M, N//2) + (M//128, N//64, 32, 16) swizzled scales, using
+        ``torch.max(torch.abs(A))`` as global amax.
 
     Both paths share the same TMA tile loads. The rowwise global amax is computed on the
     host via ``torch.max(torch.abs(A))`` before the kernel launch.
@@ -255,8 +218,6 @@ def triton_rht_quantize_row_col(
         stochastic_rounding (bool): Use stochastic rounding for the columnwise FP4 path.
             Stochastic rounding for wgrad GEMMs improves gradient quality via noise averaging.
             Rowwise FP4 output never uses SR — it is intended for forward GEMMs.
-        swizzle_scale_factors (bool): Apply scale-factor swizzle for cuBLAS MX GEMM.
-            Requires M % 128 == 0 and N % 128 == 0.
         compute_rowwise (bool): Whether to compute the rowwise quantization path.
             When False, row_fp4/row_sf/row_amax in the return tuple are None.
         sign_vector: Optional sign vector for the RHT. If None, a random one is generated.
@@ -266,10 +227,10 @@ def triton_rht_quantize_row_col(
     Returns:
         Tuple of (col_fp4, col_sf, col_amax, row_fp4, row_sf, row_amax):
           - col_fp4:  (N, M//2) uint8 packed FP4 codes (columnwise).
-          - col_sf:   (N, M//16) or swizzled float8_e4m3fn scale factors.
+          - col_sf:   (N//128, M//64, 32, 16) swizzled float8_e4m3fn scale factors.
           - col_amax: scalar float32 global amax of RHT(A.t()).
           - row_fp4:  (M, N//2) uint8 packed FP4 codes (rowwise), or None.
-          - row_sf:   (M, N//16) or swizzled float8_e4m3fn scale factors, or None.
+          - row_sf:   (M//128, N//64, 32, 16) swizzled float8_e4m3fn scale factors, or None.
           - row_amax: scalar float32 global amax of A, or None.
 
     Raises:
@@ -291,12 +252,16 @@ def triton_rht_quantize_row_col(
         raise ValueError("A must be row-major (contiguous)")
     if A.shape[0] % 16 != 0:
         raise ValueError(f"M must be divisible by 16, got M={A.shape[0]}")
+    if A.shape[0] % 128 != 0:
+        raise ValueError(f"M must be divisible by 128 for swizzled scales, got M={A.shape[0]}")
     if scaling_type != F.ScalingType.TensorWise:
         raise ValueError(
             f"scaling_type={scaling_type!r} is not supported; "
             "only ScalingType.TensorWise is implemented."
         )
     M, N = A.shape
+    if N % 128 != 0:
+        raise ValueError(f"N must be divisible by 128 for swizzled scales, got N={N}")
     if compute_rowwise and N % 32 != 0:
         raise ValueError(
             f"compute_rowwise requires N % 32 == 0 (rowwise FP4 output uses TMA which "
@@ -305,7 +270,7 @@ def triton_rht_quantize_row_col(
         )
 
     # Columnwise global amax: max(abs(RHT(A.t())))
-    col_global_amax = triton_rht_amax(A)
+    col_global_amax = triton_rht_amax(A, sign_vector=sign_vector)
     assert col_global_amax.numel() == 1
     assert col_global_amax.dtype == torch.float32
 
@@ -333,29 +298,16 @@ def triton_rht_quantize_row_col(
 
     # Columnwise outputs
     C = torch.empty((N, M // 2), dtype=torch.uint8, device=A.device)
-
-    if swizzle_scale_factors:
-        assert M % 128 == 0, f"M must be divisible by 128 for swizzling, got M={M}"
-        assert N % 128 == 0, f"N must be divisible by 128 for swizzling, got N={N}"
-        scale_factors = torch.empty(
-            (N // 128, M // 64, 32, 16), dtype=torch.float8_e4m3fn, device=A.device
-        )
-    else:
-        scale_factors = torch.empty(
-            (N, M // 16), dtype=torch.float8_e4m3fn, device=A.device
-        )
+    scale_factors = torch.empty(
+        (N // 128, M // 64, 32, 16), dtype=torch.float8_e4m3fn, device=A.device
+    )
 
     # Rowwise outputs
     if compute_rowwise:
         rowwise_C = torch.empty((M, N // 2), dtype=torch.uint8, device=A.device)
-        if swizzle_scale_factors:
-            rowwise_sf = torch.empty(
-                (M // 128, N // 64, 32, 16), dtype=torch.float8_e4m3fn, device=A.device
-            )
-        else:
-            rowwise_sf = torch.empty(
-                (M, N // 16), dtype=torch.float8_e4m3fn, device=A.device
-            )
+        rowwise_sf = torch.empty(
+            (M // 128, N // 64, 32, 16), dtype=torch.float8_e4m3fn, device=A.device
+        )
     else:
         # Dummy 1-element tensors; kernel constexpr COMPUTE_ROWWISE=False skips all stores.
         rowwise_C = torch.empty((1,), dtype=torch.uint8, device=A.device)
@@ -385,7 +337,6 @@ def triton_rht_quantize_row_col(
         GROUP_SIZE_N=GROUP_SIZE_N,
         NUM_SMS=NUM_SMS,
         STOCHASTIC_ROUNDING=stochastic_rounding,
-        SWIZZLE_SCALE_FACTORS=swizzle_scale_factors,
         COMPUTE_ROWWISE=compute_rowwise,
     )
 

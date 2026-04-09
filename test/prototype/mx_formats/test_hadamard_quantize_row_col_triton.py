@@ -1,10 +1,8 @@
 """Tests for triton_rht_quantize_row_col (SM100+ kernel).
 
-Covers all 8 (stochastic_rounding × compute_rowwise × swizzle_scale_factors) combinations:
-
   RTNE (stochastic_rounding=False):
     - test_triton_rht_quantize_rtne_scales_vs_reference: FP8 scale factors match the PyTorch
-      reference bitwise for both col and row paths, with and without swizzle.
+      reference bitwise for both col and row paths in swizzled layout.
     - test_triton_rht_quantize_rtne_sqnr: Dequantized output reconstructs post-RHT / raw-A
       values with SQNR ≥ 20 dB for both col and row paths.
 
@@ -16,13 +14,11 @@ Covers all 8 (stochastic_rounding × compute_rowwise × swizzle_scale_factors) c
       FP4 magnitude index step from the RTNE code for every element (columnwise path
       only; rowwise path always uses RTNE regardless of stochastic_rounding).
 
-8-combination coverage:
-  RS=F, RW=F, SW=F  — rtne_scales_vs_reference + rtne_sqnr
-  RS=F, RW=F, SW=T  — rtne_scales_vs_reference
-  RS=F, RW=T, SW=F  — rtne_scales_vs_reference + rtne_sqnr
-  RS=F, RW=T, SW=T  — rtne_scales_vs_reference
-  RS=T, RW=F, SW=F  — rs_midpoint_distribution + rs_at_most_one_fp4_step_from_rtne
-  RS=T, RW=T, SW=F  — (rowwise path always uses RTNE; covered by rtne tests)
+Coverage:
+  RS=F, RW=F  — rtne_scales_vs_reference + rtne_sqnr
+  RS=F, RW=T  — rtne_scales_vs_reference + rtne_sqnr
+  RS=T, RW=F  — rs_midpoint_distribution + rs_at_most_one_fp4_step_from_rtne
+  RS=T, RW=T  — rowwise path always uses RTNE; covered by rtne tests
 """
 import pytest
 import torch
@@ -46,6 +42,24 @@ if is_sm_at_least_100():
 _M_VALUES = [128, 160, 256, 512]
 # N must be ≥ 128 (BLOCK_N fixed=128). N=100 excluded.
 _N_VALUES = [128, 200, 256, 384, 512, 1024]
+_HARDCODED_SIGN_VECTOR = (
+    1,
+    1,
+    1,
+    -1,
+    1,
+    -1,
+    -1,
+    -1,
+    -1,
+    -1,
+    -1,
+    1,
+    -1,
+    1,
+    -1,
+    -1,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -56,7 +70,7 @@ _N_VALUES = [128, 200, 256, 384, 512, 1024]
 def _rht_reference(A: torch.Tensor) -> torch.Tensor:
     """PyTorch reference RHT: returns (N, M) bfloat16."""
     M_A, N_A = A.shape
-    B = get_rht_matrix(sign_vector=None, device=A.device)
+    B = get_rht_matrix(sign_vector=_HARDCODED_SIGN_VECTOR, device=A.device)
     return (A.t().reshape(-1, 16) @ B).reshape(N_A, M_A).to(torch.bfloat16)
 
 
@@ -108,6 +122,7 @@ def _dequantize(
     return NVFP4Tensor(
         codes, scales, 16, torch.bfloat16,
         per_tensor_scale=per_tensor_amax_to_scale(global_amax),
+        is_swizzled_scales=True,
     ).dequantize().float()
 
 
@@ -117,28 +132,24 @@ def _dequantize(
 
 
 @pytest.mark.skipif(not is_sm_at_least_100(), reason="Requires SM100+")
-@pytest.mark.parametrize("swizzle_scale_factors", [False, True], ids=["sw0", "sw1"])
 @pytest.mark.parametrize("compute_rowwise", [False, True], ids=["rw0", "rw1"])
 @pytest.mark.parametrize("N", _N_VALUES, ids=lambda n: f"N{n}")
 @pytest.mark.parametrize("M", _M_VALUES, ids=lambda m: f"M{m}")
 @torch.no_grad()
-def test_triton_rht_quantize_rtne_scales_vs_reference(
-    M, N, compute_rowwise, swizzle_scale_factors
-):
+def test_triton_rht_quantize_rtne_scales_vs_reference(M, N, compute_rowwise):
     """FP8 scale factors must match the PyTorch reference bitwise.
 
     Columnwise: RHT + quantize of A.T. Rowwise (compute_rowwise=True): quantize raw A.
-    For swizzle_scale_factors=True, compare against to_blocked(reference_scales).
 
     Note: packed FP4 codes are NOT checked bitwise — the kernel uses an approximate
     reciprocal (rcp.approx.f32, ≤2 ULP) while the reference uses correctly-rounded
     div.rn.f32, causing ~0.2% nibble differences at FP4 midpoints. Use the SQNR
     test for quantization quality validation.
     """
-    if swizzle_scale_factors and (M % 128 != 0 or N % 128 != 0):
-        pytest.skip("swizzle_scale_factors requires M % 128 == 0 and N % 128 == 0")
     if compute_rowwise and N % 32 != 0:
         pytest.skip(f"compute_rowwise requires N % 32 == 0, got N={N}")
+    if M % 128 != 0 or N % 128 != 0:
+        pytest.skip("swizzled scales require M % 128 == 0 and N % 128 == 0")
 
     torch.manual_seed(42)
     A = torch.randn(M, N, dtype=torch.bfloat16, device="cuda")
@@ -149,28 +160,22 @@ def test_triton_rht_quantize_rtne_scales_vs_reference(
             A,
             stochastic_rounding=False,
             compute_rowwise=compute_rowwise,
-            swizzle_scale_factors=swizzle_scale_factors,
+            sign_vector=_HARDCODED_SIGN_VECTOR,
         )
     )
 
     # Columnwise scale check
-    if swizzle_scale_factors:
-        torch.testing.assert_close(
-            tri_col_sf.flatten(), to_blocked(ref_col_sf), atol=0, rtol=0
-        )
-    else:
-        torch.testing.assert_close(tri_col_sf, ref_col_sf, atol=0, rtol=0)
+    torch.testing.assert_close(
+        tri_col_sf.flatten(), to_blocked(ref_col_sf), atol=0, rtol=0
+    )
 
     # Rowwise scale check
     if compute_rowwise:
         assert tri_row_sf is not None
         _, ref_row_sf, _ = _rht_quantize_rowwise_reference(A)
-        if swizzle_scale_factors:
-            torch.testing.assert_close(
-                tri_row_sf.flatten(), to_blocked(ref_row_sf), atol=0, rtol=0
-            )
-        else:
-            torch.testing.assert_close(tri_row_sf, ref_row_sf, atol=0, rtol=0)
+        torch.testing.assert_close(
+            tri_row_sf.flatten(), to_blocked(ref_row_sf), atol=0, rtol=0
+        )
     else:
         assert tri_row_sf is None
 
@@ -183,11 +188,12 @@ def test_triton_rht_quantize_rtne_scales_vs_reference(
 def test_triton_rht_quantize_rtne_sqnr(M, N, compute_rowwise):
     """Dequantized output must reconstruct post-RHT / raw-A values with SQNR ≥ 20 dB.
 
-    swizzle_scale_factors is not parametrized here — layout does not affect quantization
-    error, only scale memory arrangement.
+    Scale factors are always swizzled; layout does not affect quantization error.
     """
     if compute_rowwise and N % 32 != 0:
         pytest.skip(f"compute_rowwise requires N % 32 == 0, got N={N}")
+    if M % 128 != 0 or N % 128 != 0:
+        pytest.skip("swizzled scales require M % 128 == 0 and N % 128 == 0")
 
     torch.manual_seed(42)
     A = torch.randn(M, N, dtype=torch.bfloat16, device="cuda")
@@ -197,7 +203,7 @@ def test_triton_rht_quantize_rtne_sqnr(M, N, compute_rowwise):
             A,
             stochastic_rounding=False,
             compute_rowwise=compute_rowwise,
-            swizzle_scale_factors=False,
+            sign_vector=_HARDCODED_SIGN_VECTOR,
         )
     )
 
@@ -239,7 +245,7 @@ def test_triton_rht_quantize_rs_midpoint_distribution():
 
     # Build A such that RHT(A.T) has 1.25 at non-anchor positions and 6.0 at anchors.
     # Since B is orthogonal, A.T = target @ B^{-1} = target @ B.T.
-    B = get_rht_matrix(sign_vector=None, device="cuda").float()
+    B = get_rht_matrix(sign_vector=_HARDCODED_SIGN_VECTOR, device="cuda").float()
     target = torch.full((N_RHT, M_RHT), 1.25, dtype=torch.float32, device="cuda")
     target[:, ::16] = 6.0  # one anchor per 16-group along M
     A_t = (target.reshape(N_RHT * M_RHT // 16, 16) @ B.t()).reshape(N_RHT, M_RHT)
@@ -250,7 +256,10 @@ def test_triton_rht_quantize_rs_midpoint_distribution():
 
     for _ in range(N_SAMPLES):
         col_codes, _, _, _, _, _ = triton_rht_quantize_row_col(
-            A, stochastic_rounding=True, compute_rowwise=False, swizzle_scale_factors=False
+            A,
+            stochastic_rounding=True,
+            compute_rowwise=False,
+            sign_vector=_HARDCODED_SIGN_VECTOR,
         )
         # Unpack col_codes (N_RHT, M_RHT//2) uint8 → (N_RHT, M_RHT) nibbles
         lo = (col_codes & 0xF).long()
@@ -302,7 +311,10 @@ def test_triton_rht_quantize_rs_at_most_one_fp4_step_from_rtne():
         return out
 
     col_rn, _, _, _, _, _ = triton_rht_quantize_row_col(
-        A, stochastic_rounding=False, compute_rowwise=False, swizzle_scale_factors=False
+        A,
+        stochastic_rounding=False,
+        compute_rowwise=False,
+        sign_vector=_HARDCODED_SIGN_VECTOR,
     )
     rn_nibs = _unpack(col_rn)
     rn_sign = rn_nibs >> 3
@@ -310,7 +322,10 @@ def test_triton_rht_quantize_rs_at_most_one_fp4_step_from_rtne():
 
     for _ in range(N_SAMPLES):
         col_rs, _, _, _, _, _ = triton_rht_quantize_row_col(
-            A, stochastic_rounding=True, compute_rowwise=False, swizzle_scale_factors=False
+            A,
+            stochastic_rounding=True,
+            compute_rowwise=False,
+            sign_vector=_HARDCODED_SIGN_VECTOR,
         )
         rs_nibs = _unpack(col_rs)
         rs_sign = rs_nibs >> 3

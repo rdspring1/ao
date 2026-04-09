@@ -204,30 +204,6 @@ def _nvfp4_quantize(a_t_rht, global_amax, BLOCK_N: tl.constexpr, BLOCK_M: tl.con
 
 
 @triton.jit
-def _store_scales_non_tma(
-    scale_inv, sf_ptr, pid_n, pid_m, M, N, BLOCK_N: tl.constexpr, BLOCK_M: tl.constexpr
-):
-    """Store scale factors via manual pointer arithmetic (fallback for small BLOCK_M/N)."""
-    VEC_ELEMS_FP8: tl.constexpr = 16
-    M_SF = tl.cdiv(M, 16)
-    BLOCK_M_SF: tl.constexpr = BLOCK_M // 16
-    FLAT_TILE: tl.constexpr = BLOCK_N * BLOCK_M_SF
-
-    outer_idx = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    inner_idx = pid_m * BLOCK_M_SF + tl.arange(0, BLOCK_M_SF)
-    offsets = outer_idx[:, None] * M_SF + inner_idx[None, :]
-    mask = (outer_idx[:, None] < N) & (inner_idx[None, :] < M_SF)
-
-    flat_ptrs = sf_ptr + tl.reshape(offsets, (FLAT_TILE,))
-    flat_val = tl.reshape(scale_inv, (FLAT_TILE,))
-    flat_msk = tl.reshape(mask, (FLAT_TILE,))
-
-    tl.multiple_of(flat_ptrs, VEC_ELEMS_FP8)
-    tl.max_contiguous(flat_ptrs, VEC_ELEMS_FP8)
-    tl.store(flat_ptrs, flat_val, mask=flat_msk)
-
-
-@triton.jit
 def _swizzle_scales(scale_inv, BLOCK_OUTER: tl.constexpr, BLOCK_INNER: tl.constexpr):
     """Reshape (BLOCK_OUTER, BLOCK_INNER//16) → (BLOCK_OUTER//128, BLOCK_INNER//64, 32, 16).
 
