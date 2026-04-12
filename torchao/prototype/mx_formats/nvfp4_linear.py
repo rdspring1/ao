@@ -23,12 +23,19 @@ backend can be removed.
 from typing import Optional
 
 import torch
+import torch.nn.functional as F
 
+from torchao.prototype.custom_fp_utils import RoundingMode
+from torchao.prototype.mx_formats.hadamard_quantize_row_col_triton import (
+    triton_rht_quantize_row_col,
+)
+from torchao.prototype.mx_formats.kernels import triton_quantize_nvfp4
 from torchao.prototype.mx_formats.nvfp4_tensor import (
     NVFP4Tensor,
     _addmm_nvfp4_dispatch,
     per_tensor_amax_to_scale,
 )
+from torchao.prototype.mx_formats.quantize_2d_triton import triton_weight_quantize_2d
 from torchao.prototype.mx_formats.utils import (
     hp_data_dims_to_swizzled_scale_dims_nvfp4,
     to_blocked,
@@ -140,6 +147,151 @@ def _quantize_to_nvfp4_te(
     )
 
 
+def _ao_rowwise_quantize_sr(x: torch.Tensor):
+    """Triton NVFP4 rowwise quantization with stochastic rounding.
+
+    Returns (fp4_data, block_scales, global_scale).
+    block_scales: (M, N//16) float8_e4m3fn in SWIZZLE_32_4_4 memory layout.
+    """
+    global_scale = per_tensor_amax_to_scale(x.abs().max())
+    seed = torch.randint(0, 2**31 - 1, (1,), dtype=torch.int32, device=x.device)
+    scales, xq = triton_quantize_nvfp4(x, global_scale, RoundingMode.RS.value, seed)
+    return xq.view(torch.float4_e2m1fn_x2), scales, global_scale
+
+
+def _triton_weight_quantize_2d(x: torch.Tensor):
+    """Triton 2D (16×16) NVFP4 weight quantization.
+
+    Returns (fp4_data, block_scales_flat, global_scale).
+    block_scales_flat: swizzled scales flattened for scaled_mm.
+    """
+    codes, sf, global_amax = triton_weight_quantize_2d(x, swizzle_scale_factors=True)
+    return (
+        codes.view(torch.float4_e2m1fn_x2),
+        sf.flatten(),
+        per_tensor_amax_to_scale(global_amax),
+    )
+
+
+@torch._dynamo.allow_in_graph
+class nvfp4_mm_triton(torch.autograd.Function):
+    """NVFP4 quantized matmul: pure-triton RHT + stochastic rounding path.
+
+    3 GEMMs:
+      forward:   x_row @ W.T  = output         (triton RHT rowwise + 2D weight)
+      backward:  dy_sr @ W.T  = grad_input      (triton SR rowwise + 2D weight)
+      backward:  dy_col.T @ x_col = grad_weight (triton col RHT + SR for dy; saved col for x)
+
+    Requires: bfloat16 input, M % 128 == 0, K % 128 == 0, N % 128 == 0.
+    Saves only FP4 codes+scales for backward (memory efficient vs full-precision activations).
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        input_hp: torch.Tensor,
+        weight_hp: torch.Tensor,
+        bias: Optional[torch.Tensor],
+        kernel_preference: KernelPreference,
+    ):
+        M = input_hp.shape[-2]
+        K = input_hp.shape[-1]
+        N = weight_hp.shape[0]
+        if input_hp.dtype != torch.bfloat16:
+            input_hp = input_hp.to(torch.bfloat16)
+        if weight_hp.dtype != torch.bfloat16:
+            weight_hp = weight_hp.to(torch.bfloat16)
+        if M % 128 != 0 or K % 128 != 0 or N % 128 != 0:
+            raise ValueError(
+                f"nvfp4_mm_triton requires M, K, N all divisible by 128; "
+                f"got M={M}, K={K}, N={N}"
+            )
+        input_2d = input_hp.reshape(-1, K)
+
+        # RHT + columnwise + rowwise quantization of input in one fused kernel
+        (
+            x_col_codes, x_col_sf, x_col_amax,
+            x_row_codes, x_row_sf, x_row_amax,
+        ) = triton_rht_quantize_row_col(
+            input_2d.contiguous(), stochastic_rounding=False, compute_rowwise=True
+        )
+
+        W_fp4, W_bs, W_gs = _triton_weight_quantize_2d(weight_hp)
+        x_gs = per_tensor_amax_to_scale(x_row_amax)
+
+        output = torch.nn.functional.scaled_mm(
+            x_row_codes.view(torch.float4_e2m1fn_x2),
+            W_fp4.t(),
+            scale_a=[x_row_sf.flatten(), x_gs],
+            scale_recipe_a=[F.ScalingType.BlockWise1x16, F.ScalingType.TensorWise],
+            scale_b=[W_bs, W_gs],
+            scale_recipe_b=[F.ScalingType.BlockWise1x16, F.ScalingType.TensorWise],
+            swizzle_a=[F.SwizzleType.SWIZZLE_32_4_4, F.SwizzleType.NO_SWIZZLE],
+            swizzle_b=[F.SwizzleType.SWIZZLE_32_4_4, F.SwizzleType.NO_SWIZZLE],
+            output_dtype=torch.bfloat16,
+        )
+        output = output.reshape(*input_hp.shape[:-1], N)
+        if bias is not None:
+            output = output + bias
+
+        # Save columnwise x codes+scales for wgrad (FP4 — memory efficient)
+        ctx.save_for_backward(x_col_codes, x_col_sf, x_col_amax, weight_hp)
+        ctx.input_orig_shape = input_hp.shape
+        ctx.has_bias = bias is not None
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        x_col_codes, x_col_sf, x_col_amax, weight_hp = ctx.saved_tensors
+        grad_output = grad_output.contiguous()
+        grad_output_2d = grad_output.reshape(-1, grad_output.shape[-1])
+
+        # -----------------------------------------------------------
+        # GEMM 2: dy_sr @ W.T → grad_input  (SR rowwise)
+        # -----------------------------------------------------------
+        dy_fp4, dy_bs, dy_gs = _ao_rowwise_quantize_sr(grad_output_2d)
+        Wt_fp4, Wt_bs, Wt_gs = _triton_weight_quantize_2d(weight_hp.T.contiguous())
+        grad_input = torch.nn.functional.scaled_mm(
+            dy_fp4,
+            Wt_fp4.t(),
+            scale_a=[dy_bs, dy_gs],
+            scale_recipe_a=[F.ScalingType.BlockWise1x16, F.ScalingType.TensorWise],
+            scale_b=[Wt_bs, Wt_gs],
+            scale_recipe_b=[F.ScalingType.BlockWise1x16, F.ScalingType.TensorWise],
+            swizzle_a=[F.SwizzleType.SWIZZLE_32_4_4, F.SwizzleType.NO_SWIZZLE],
+            swizzle_b=[F.SwizzleType.SWIZZLE_32_4_4, F.SwizzleType.NO_SWIZZLE],
+            output_dtype=torch.bfloat16,
+        )
+        grad_input = grad_input.reshape(ctx.input_orig_shape)
+
+        # -----------------------------------------------------------
+        # GEMM 3: dy_col.T @ x_col → grad_weight  (col RHT + SR)
+        # -----------------------------------------------------------
+        # Both col scale tensors are already in SWIZZLE_32_4_4 layout — just flatten.
+        dy_col_codes, dy_col_sf, dy_col_amax, _, _, _ = triton_rht_quantize_row_col(
+            grad_output_2d, stochastic_rounding=True, compute_rowwise=False
+        )
+        dy_gs_w = per_tensor_amax_to_scale(dy_col_amax)
+        x_gs_w = per_tensor_amax_to_scale(x_col_amax)
+        grad_weight = torch.nn.functional.scaled_mm(
+            dy_col_codes.view(torch.float4_e2m1fn_x2),
+            x_col_codes.view(torch.float4_e2m1fn_x2).t(),
+            scale_a=[dy_col_sf.flatten(), dy_gs_w],
+            scale_recipe_a=[F.ScalingType.BlockWise1x16, F.ScalingType.TensorWise],
+            scale_b=[x_col_sf.flatten(), x_gs_w],
+            scale_recipe_b=[F.ScalingType.BlockWise1x16, F.ScalingType.TensorWise],
+            swizzle_a=[F.SwizzleType.SWIZZLE_32_4_4, F.SwizzleType.NO_SWIZZLE],
+            swizzle_b=[F.SwizzleType.SWIZZLE_32_4_4, F.SwizzleType.NO_SWIZZLE],
+            output_dtype=torch.bfloat16,
+        )
+
+        grad_bias = (
+            grad_output.sum(dim=tuple(range(grad_output.dim() - 1)))
+            if ctx.has_bias else None
+        )
+        return grad_input, grad_weight, grad_bias, None
+
+
 def nvfp4_linear(
     input_hp: torch.Tensor,
     weight_hp: torch.Tensor,
@@ -155,8 +307,10 @@ def nvfp4_linear(
         input_hp: High precision input [..., in_features]
         weight_hp: High precision weight [out_features, in_features]
         bias: Optional bias [out_features]
-        kernel_preference: Backend for quantization (TORCH, TE, or AUTO)
+        kernel_preference: Backend for quantization (TORCH, TE, AUTO, or TRITON)
     """
+    if kernel_preference == KernelPreference.TRITON:
+        return nvfp4_mm_triton.apply(input_hp, weight_hp, bias, kernel_preference)
     return nvfp4_mm.apply(input_hp, weight_hp, bias, kernel_preference)
 
 
