@@ -303,7 +303,7 @@ def triton_rht_quantize_row_col(
     assert col_global_amax.dtype == torch.float32
 
     if stochastic_rounding:
-        philox_seed_base = torch.randint(
+        seed_base = torch.randint(
             low=-(2**63),
             high=2**63 - 1,
             size=(1,),
@@ -318,7 +318,7 @@ def triton_rht_quantize_row_col(
             device=A.device,
         )
     else:
-        philox_seed_base = 0  # Safe NULL value for Triton
+        seed_base = 0  # Safe NULL value for Triton
         offset_base = 0
 
     NUM_SMS = torch.cuda.get_device_properties(A.device).multi_processor_count
@@ -363,7 +363,7 @@ def triton_rht_quantize_row_col(
         rowwise_C,
         rowwise_sf,
         row_global_amax,
-        philox_seed_base,
+        seed_base,
         offset_base,
         M,
         N,
