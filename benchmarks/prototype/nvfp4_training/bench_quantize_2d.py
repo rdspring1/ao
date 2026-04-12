@@ -1,0 +1,90 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD 3-Clause license found in the
+# LICENSE file in the root directory of this source tree.
+
+import itertools
+from dataclasses import dataclass
+from typing import List
+
+import torch
+from tabulate import tabulate
+from tqdm import tqdm
+
+from benchmarks.utils import benchmark_cuda_function_in_microseconds
+from torchao.prototype.mx_formats.quantize_2d_triton import triton_weight_quantize_2d
+
+device = torch.device("cuda")
+
+M_SHAPES = [128, 256, 1024, 8192]
+# N must be a multiple of BLOCK_N=256
+N_SHAPES = [256, 512, 1024, 2048, 4096, 8192, 16384, 32768]
+
+
+@dataclass(frozen=True)
+class ExperimentConfig:
+    m: int
+    n: int
+
+
+@dataclass(frozen=True)
+class ExperimentResult:
+    time_us: float
+    gbps: float
+
+
+@dataclass(frozen=True)
+class Experiment:
+    config: ExperimentConfig
+    result: ExperimentResult
+
+
+def get_configs() -> List[ExperimentConfig]:
+    return [
+        ExperimentConfig(m=m, n=n)
+        for m, n in itertools.product(M_SHAPES, N_SHAPES)
+    ]
+
+
+def run_experiment(config: ExperimentConfig) -> ExperimentResult | None:
+    m, n = config.m, config.n
+    x = torch.randn(m, n, dtype=torch.bfloat16, device=device)
+
+    try:
+        time_us = benchmark_cuda_function_in_microseconds(
+            triton_weight_quantize_2d, x
+        )
+    except NotImplementedError:
+        return None
+
+    read_bytes = m * n * 2                  # bf16 input
+    write_fp4 = m * (n // 2)               # packed FP4 output
+    write_scales = m * (n // 16)            # FP8 scale factors (non-swizzled layout)
+    gbps = ((read_bytes + write_fp4 + write_scales) / 1e9) / (time_us / 1e6)
+
+    return ExperimentResult(time_us=time_us, gbps=gbps)
+
+
+def print_results(experiments: List[Experiment]):
+    headers = ["M", "N", "time_us", "gbps"]
+    rows = [
+        [e.config.m, e.config.n, round(e.result.time_us, 3), round(e.result.gbps, 3)]
+        for e in experiments
+    ]
+    print(tabulate(rows, headers=headers))
+
+
+def main():
+    torch.random.manual_seed(123)
+    configs = get_configs()
+    results = []
+    for config in tqdm(configs):
+        result = run_experiment(config)
+        if result is not None:
+            results.append(Experiment(config=config, result=result))
+    print_results(results)
+
+
+if __name__ == "__main__":
+    main()
