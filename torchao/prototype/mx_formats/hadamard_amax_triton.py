@@ -30,16 +30,18 @@ HADAMARD_CONFIGS: list[triton.Config] = [
 ]
 
 
-@triton.autotune(configs=HADAMARD_CONFIGS, key=['M', 'N'])
+@triton.autotune(configs=HADAMARD_CONFIGS, key=['M', 'N'], cache_results=True)
 @triton.jit
 def _hadamard_amax_kernel(
     a_ptr,
     b_ptr,
-    global_max_ptr,
+    global_rht_amax_ptr,
+    global_a_amax_ptr,
     M,
     N,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    COMPUTE_ROWWISE: tl.constexpr,
     GROUP_SIZE_N: tl.constexpr,
     NUM_SMS: tl.constexpr,
     NUM_STAGES: tl.constexpr,
@@ -70,7 +72,8 @@ def _hadamard_amax_kernel(
     hadamard = b_desc.load([0, 0])
 
     # Track cumulative max across all tiles for this block
-    cumulative_max = tl.zeros((BLOCK_N * BLOCK_M // 16, 16), dtype=tl.float32)
+    cumulative_rht_amax = tl.zeros((BLOCK_N * BLOCK_M // 16, 16), dtype=tl.float32)
+    cumulative_a_amax = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
     # warp-specialized: producer warps issue TMA loads, consumer warps run wgmma
     for tile_id in tl.range(
@@ -100,11 +103,18 @@ def _hadamard_amax_kernel(
         # Update cumulative max at tile level to avoid failing
         # TritonGPUAutomaticWarpSpecialization MLIR pass
         abs_a_t_rht = tl.abs(a_t_rht)
-        cumulative_max = tl.maximum(cumulative_max, abs_a_t_rht)
+        cumulative_rht_amax = tl.maximum(cumulative_rht_amax, abs_a_t_rht)
+
+        if COMPUTE_ROWWISE:
+            cumulative_a_amax = tl.maximum(cumulative_a_amax, tl.abs(a.to(tl.float32)))
 
     # Get scalar max for this block and update global max with atomic max operation
-    tile_max = tl.max(tl.max(cumulative_max, axis=1), axis=0)
-    tl.atomic_max(global_max_ptr, tile_max.to(tl.float32))
+    tile_rht_amax = tl.max(tl.max(cumulative_rht_amax, axis=1), axis=0)
+    tl.atomic_max(global_rht_amax_ptr, tile_rht_amax.to(tl.float32))
+
+    if COMPUTE_ROWWISE:
+        tile_a_amax = tl.max(tl.max(cumulative_a_amax, axis=1), axis=0)
+        tl.atomic_max(global_a_amax_ptr, tile_a_amax.to(tl.float32))
 
 
 def triton_rht_amax(
@@ -112,8 +122,9 @@ def triton_rht_amax(
     sign_vector: tuple[int, ...] | None = None,
     hadamard_dimension: int = 16,
     scaling_type: F.ScalingType = F.ScalingType.TensorWise,
-) -> torch.Tensor:
-    """Apply RHT to A and return the global absolute maximum without materializing output.
+    compute_rowwise: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply RHT to A and return global absolute maxima without materializing output.
 
     Equivalent to rht_reference(A).abs().max().float() but fused: post-RHT values are
     never written to DRAM. Reduction is performed tile-by-tile inside the kernel and
@@ -125,9 +136,12 @@ def triton_rht_amax(
         hadamard_dimension: Dimension of the Hadamard matrix (default 16).
         scaling_type: ScalingType controlling reduction granularity. Only
             ``ScalingType.TensorWise`` is currently supported.
+        compute_rowwise: If True, also compute max(abs(A)) for rowwise quantization.
 
     Returns:
-        Scalar float32 tensor containing max(abs(RHT(A))).
+        Tuple of (global_rht_amax, global_a_amax):
+          - global_rht_amax: scalar float32 containing max(abs(RHT(A))).
+          - global_a_amax: scalar float32 containing max(abs(A)), or 0 if compute_rowwise=False.
 
     Raises:
         NotImplementedError: If hardware is pre-SM90.
@@ -169,15 +183,18 @@ def triton_rht_amax(
         )
 
     B = get_rht_matrix(sign_vector=sign_vector, device=A.device, hadamard_dimension=hadamard_dimension).to(torch.bfloat16)
-    global_amax = torch.zeros((), dtype=torch.float32, device=A.device)
+    global_rht_amax = torch.zeros((), dtype=torch.float32, device=A.device)
+    global_a_amax = torch.zeros((), dtype=torch.float32, device=A.device)
 
     _hadamard_amax_kernel[(NUM_SMS,)](
         A,
         B,
-        global_amax,
+        global_rht_amax,
+        global_a_amax,
         M,
         N,
+        COMPUTE_ROWWISE=compute_rowwise,
         GROUP_SIZE_N=GROUP_SIZE_N,
         NUM_SMS=NUM_SMS,
     )
-    return global_amax
+    return global_rht_amax, global_a_amax

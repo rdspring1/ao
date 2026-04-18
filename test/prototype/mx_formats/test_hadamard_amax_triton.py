@@ -85,6 +85,6 @@ def test_triton_rht_amax_vs_reference(M, N, sign_vector):
     get_rht_matrix.cache_clear()
     if sign_vector is None:
         torch.manual_seed(42)
-    triton_amax = triton_rht_amax(A, sign_vector=sign_vector)
+    triton_rht_amax_val, _ = triton_rht_amax(A, sign_vector=sign_vector, compute_rowwise=False)
 
-    torch.testing.assert_close(triton_amax, ref_amax, atol=0, rtol=0)
+    torch.testing.assert_close(triton_rht_amax_val, ref_amax, atol=0, rtol=0)
