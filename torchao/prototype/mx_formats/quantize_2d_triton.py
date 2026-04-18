@@ -77,7 +77,7 @@ def _nvfp4_2d_quantize(a, global_amax, BLOCK_N: tl.constexpr, BLOCK_M: tl.conste
 
 @triton.autotune(
     configs=QUANTIZE_2D_CONFIGS,
-    key=["M", "N", "SWIZZLE_SCALE_FACTORS"],
+    key=["M", "N", "SWIZZLE_SCALE_FACTORS", "COMPUTE_COLWISE"],
     cache_results=True,
 )
 @triton.jit
@@ -85,6 +85,8 @@ def _weight_quantize_2d_kernel(
     a_ptr,
     out_ptr,
     scales_ptr,
+    a_t_fp4_ptr,
+    a_t_sf_ptr,
     global_amax_ptr,
     M,
     N,
@@ -94,6 +96,7 @@ def _weight_quantize_2d_kernel(
     NUM_SMS: tl.constexpr,
     NUM_STAGES: tl.constexpr,
     SWIZZLE_SCALE_FACTORS: tl.constexpr,
+    COMPUTE_COLWISE: tl.constexpr,
 ):
     """2D (16×16) NVFP4 E2M1 weight quantization — one tile per CTA."""
     # Create TMA descriptors in-kernel from raw pointers, shape, and stride
@@ -122,6 +125,20 @@ def _weight_quantize_2d_kernel(
             shape=[M, N // 16],
             strides=[N // 16, 1],
             block_shape=[BLOCK_M, BLOCK_N // 16],
+        )
+    # Colwise (transposed) output descriptors — always swizzled
+    if COMPUTE_COLWISE:
+        a_t_fp4_desc = tl.make_tensor_descriptor(
+            a_t_fp4_ptr,
+            shape=[N, M // 2],
+            strides=[M // 2, 1],
+            block_shape=[BLOCK_N, BLOCK_M // 2],
+        )
+        a_t_sf_desc = tl.make_tensor_descriptor(
+            a_t_sf_ptr,
+            shape=[N // 128, M // 64, 32, 16],
+            strides=[(M // 64) * 32 * 16, 32 * 16, 16, 1],
+            block_shape=[BLOCK_N // 128, BLOCK_M // 64, 32, 16],
         )
 
     # Persistent grid-stride loop
@@ -168,25 +185,53 @@ def _weight_quantize_2d_kernel(
         else:
             sf_desc.store([pid_m * BLOCK_M, pid_n * BLOCK_N // 16], expand_sf)
 
+        # Colwise path: quantize transposed tile (rowwise W.T) — always swizzled
+        if COMPUTE_COLWISE:
+            a_t = tl.trans(a)  # (BLOCK_N, BLOCK_M)
+            t_scale_inv, t_scaled = _nvfp4_2d_quantize(a_t, global_amax, BLOCK_M, BLOCK_N)
+
+            t_scaled_pairs = t_scaled.reshape(BLOCK_N, BLOCK_M // 2, 2).split()
+            t_scaled_fp4x2 = convert_8xfp32_to_4xfp4_packed(t_scaled_pairs)
+            a_t_fp4_desc.store([pid_n * BLOCK_N, pid_m * BLOCK_M // 2], t_scaled_fp4x2)
+
+            # Expand and swizzle colwise scales: (BLOCK_N//16, BLOCK_M//16) → (N//128, M//64, 32, 16)
+            t_expand_sf = (
+                tl.expand_dims(t_scale_inv, axis=1)
+                .broadcast_to([BLOCK_N // 16, 16, BLOCK_M // 16])
+                .reshape(BLOCK_N, BLOCK_M // 16)
+            )
+            t_swizzle_sf = _swizzle_scales(t_expand_sf, BLOCK_N, BLOCK_M)
+            a_t_sf_desc.store(
+                [pid_n * BLOCK_N // 128, pid_m * BLOCK_M // 64, 0, 0], t_swizzle_sf
+            )
+
 
 def triton_weight_quantize_2d(
     A: torch.Tensor,
     swizzle_scale_factors: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    compute_colwise: bool = False,
+):
     """2D (16×16) NVFP4 E2M1 weight quantization without RHT.
 
     Args:
         A:                     (M, N) bfloat16, row-major. M and N divisible by 16.
-        swizzle_scale_factors: When True (requires M%128==0, N%128==0), returns scale
+        swizzle_scale_factors: When True (requires M%128==0, N%128==0), returns rowwise scale
                                factors in SWIZZLE_32_4_4 layout (M//128, N//64, 32, 16).
                                When False, returns (M, N//16) contiguous row-major scales.
+        compute_colwise:       When True (requires M%128==0, N%128==0), also quantize A.T,
+                               returning colwise codes (N, M//2) and swizzled scales
+                               (N//128, M//64, 32, 16). Returns a 5-tuple instead of 3-tuple.
 
     Returns:
-        Tuple of:
+        compute_colwise=False (default): 3-tuple of:
           - (M, N//2) uint8: packed FP4 E2M1 codes.
           - scale_factors float8_e4m3fn: per-block decode scale factors.
-              swizzle_scale_factors=False: (M, N//16)
-              swizzle_scale_factors=True:  (M//128, N//64, 32, 16)
+          - scalar float32: global amax of A.
+        compute_colwise=True: 5-tuple of:
+          - (M, N//2) uint8: rowwise FP4 codes.
+          - (M//128, N//64, 32, 16) float8_e4m3fn: rowwise swizzled scale factors.
+          - (N, M//2) uint8: colwise FP4 codes (rowwise W.T).
+          - (N//128, M//64, 32, 16) float8_e4m3fn: colwise swizzled scale factors.
           - scalar float32: global amax of A.
     """
     if not is_sm_at_least_100():
@@ -197,6 +242,12 @@ def triton_weight_quantize_2d(
     M, N = A.shape
     assert M % 16 == 0, f"M must be divisible by 16, got M={M}"
     assert N % 16 == 0, f"N must be divisible by 16, got N={N}"
+
+    if compute_colwise:
+        assert M % 128 == 0, f"compute_colwise requires M % 128 == 0, got M={M}"
+        assert N % 128 == 0, f"compute_colwise requires N % 128 == 0, got N={N}"
+        # compute_colwise always uses swizzled scales for both rowwise and colwise
+        swizzle_scale_factors = True
 
     global_amax = A.float().abs().max()
     out = torch.zeros((M, N // 2), dtype=torch.uint8, device=A.device)
@@ -210,6 +261,16 @@ def triton_weight_quantize_2d(
         scale_factors = torch.empty(
             (M, N // 16), dtype=torch.float8_e4m3fn, device=A.device
         )
+
+    if compute_colwise:
+        a_t_fp4 = torch.zeros((N, M // 2), dtype=torch.uint8, device=A.device)
+        a_t_sf = torch.empty(
+            (N // 128, M // 64, 32, 16), dtype=torch.float8_e4m3fn, device=A.device
+        )
+    else:
+        # Dummy 1-element tensors; kernel constexpr COMPUTE_COLWISE=False skips all stores.
+        a_t_fp4 = torch.empty((1,), dtype=torch.uint8, device=A.device)
+        a_t_sf = torch.empty((1,), dtype=torch.float8_e4m3fn, device=A.device)
 
     NUM_SMS = torch.cuda.get_device_properties(A.device).multi_processor_count
     GROUP_SIZE_N: int = 8
@@ -225,11 +286,16 @@ def triton_weight_quantize_2d(
         A,
         out,
         scale_factors,
+        a_t_fp4,
+        a_t_sf,
         global_amax,
         M,
         N,
         GROUP_SIZE_N=GROUP_SIZE_N,
         NUM_SMS=NUM_SMS,
         SWIZZLE_SCALE_FACTORS=swizzle_scale_factors,
+        COMPUTE_COLWISE=compute_colwise,
     )
+    if compute_colwise:
+        return out, scale_factors, a_t_fp4, a_t_sf, global_amax
     return out, scale_factors, global_amax
