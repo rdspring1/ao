@@ -33,6 +33,7 @@ HADAMARD_QUANTIZE_CONFIGS: list[triton.Config] = [
 @triton.autotune(
     configs=HADAMARD_QUANTIZE_CONFIGS,
     key=['M', 'N', 'STOCHASTIC_ROUNDING', 'COMPUTE_ROWWISE'],
+    cache_results=True,
 )
 @triton.jit
 def _hadamard_quantize_row_col_kernel(
@@ -45,6 +46,7 @@ def _hadamard_quantize_row_col_kernel(
     rowwise_sf_ptr,
     rowwise_global_amax_ptr,
     seed_base_ptr,
+    offset_base_ptr,
     M,
     N,
     BLOCK_M: tl.constexpr,
@@ -148,7 +150,7 @@ def _hadamard_quantize_row_col_kernel(
         # NVFP4 quantization epilogue (columnwise)
         scale_inv, scaled = _nvfp4_quantize(a_t_rht, global_amax, BLOCK_N, BLOCK_M)
         scaled_fp4x2 = _pack_fp4(
-            scaled, BLOCK_N, BLOCK_M, STOCHASTIC_ROUNDING, seed_base_ptr, tile_id
+            scaled, BLOCK_N, BLOCK_M, STOCHASTIC_ROUNDING, seed_base_ptr, offset_base_ptr, tile_id
         )
 
         c_desc.store([pid_n * BLOCK_N, pid_m * BLOCK_M // 2], scaled_fp4x2)
@@ -177,6 +179,7 @@ def _hadamard_quantize_row_col_kernel(
                 BLOCK_N,
                 False,
                 seed_base_ptr,
+                offset_base_ptr,
                 tile_id,
             )
 
@@ -271,29 +274,35 @@ def triton_rht_quantize_row_col(
             f"got N={N}"
         )
 
-    # Columnwise global amax: max(abs(RHT(A.t())))
-    col_global_amax = triton_rht_amax(A, sign_vector=sign_vector, hadamard_dimension=hadamard_dimension, scaling_type=scaling_type)
+    # Columnwise global amax: max(abs(RHT(A.t()))) and rowwise: max(abs(A)) — fused kernel
+    col_global_amax, row_global_amax = triton_rht_amax(
+        A,
+        sign_vector=sign_vector,
+        hadamard_dimension=hadamard_dimension,
+        scaling_type=scaling_type,
+        compute_rowwise=compute_rowwise,
+    )
     assert col_global_amax.numel() == 1
     assert col_global_amax.dtype == torch.float32
 
-    # Rowwise global amax: max(abs(A)) — plain PyTorch, no extra kernel
-    if compute_rowwise:
-        row_global_amax = torch.max(torch.abs(A)).float()
-    else:
-        row_global_amax = torch.zeros((), dtype=torch.float32, device=A.device)
-
     if stochastic_rounding:
-        # Base seed for the Philox RNG; per-tile seeds are derived from this via
-        # a Knuth hash inside _pack_fp4 so that adjacent tiles get independent noise.
         philox_seed_base = torch.randint(
-            low=-(2**31),
-            high=2**31 - 1,
+            low=-(2**63),
+            high=2**63 - 1,
             size=(1,),
-            dtype=torch.int32,
+            dtype=torch.int64,
+            device=A.device,
+        )
+        offset_base = torch.randint(
+            low=-(2**63),
+            high=2**63 - 1,
+            size=(1,),
+            dtype=torch.int64,
             device=A.device,
         )
     else:
         philox_seed_base = 0  # Safe NULL value for Triton
+        offset_base = 0
 
     NUM_SMS = torch.cuda.get_device_properties(A.device).multi_processor_count
     GROUP_SIZE_N: int = 8
@@ -336,6 +345,7 @@ def triton_rht_quantize_row_col(
         rowwise_sf,
         row_global_amax,
         philox_seed_base,
+        offset_base,
         M,
         N,
         GROUP_SIZE_N=GROUP_SIZE_N,
