@@ -173,6 +173,26 @@ def _triton_weight_quantize_2d(x: torch.Tensor):
     )
 
 
+def _triton_weight_quantize_2d_colwise(x: torch.Tensor):
+    """Triton 2D NVFP4 weight quantization producing both rowwise and colwise outputs.
+
+    Returns (W_fp4_x2, W_bs, W_gs, Wt_fp4_x2, Wt_sf, W_amax) where:
+      W_*  = rowwise quantized x (for forward GEMM)
+      Wt_* = colwise quantized x = rowwise quantized x.T (for dgrad GEMM)
+    """
+    codes, sf, t_codes, t_sf, global_amax = triton_weight_quantize_2d(
+        x, compute_colwise=True
+    )
+    return (
+        codes.view(torch.float4_e2m1fn_x2),
+        sf.flatten(),
+        per_tensor_amax_to_scale(global_amax),
+        t_codes.view(torch.float4_e2m1fn_x2),
+        t_sf,
+        global_amax,
+    )
+
+
 @torch._dynamo.allow_in_graph
 class nvfp4_mm_triton(torch.autograd.Function):
     """NVFP4 quantized matmul: pure-triton RHT + stochastic rounding path.
@@ -216,12 +236,13 @@ class nvfp4_mm_triton(torch.autograd.Function):
             input_2d.contiguous(), stochastic_rounding=False, compute_rowwise=True
         )
 
-        W_fp4, W_bs, W_gs = _triton_weight_quantize_2d(weight_hp)
+        # Fused weight quantization: rowwise for forward GEMM, colwise saved for dgrad
+        W_fp4_x2, W_bs, W_gs, Wt_fp4_x2, Wt_sf, W_amax = _triton_weight_quantize_2d_colwise(weight_hp)
         x_gs = per_tensor_amax_to_scale(x_row_amax)
 
         output = torch.nn.functional.scaled_mm(
             x_row_codes.view(torch.float4_e2m1fn_x2),
-            W_fp4.t(),
+            W_fp4_x2.t(),
             scale_a=[x_row_sf.flatten(), x_gs],
             scale_recipe_a=[F.ScalingType.BlockWise1x16, F.ScalingType.TensorWise],
             scale_b=[W_bs, W_gs],
@@ -234,26 +255,27 @@ class nvfp4_mm_triton(torch.autograd.Function):
         if bias is not None:
             output = output + bias
 
-        # Save columnwise x codes+scales for wgrad (FP4 — memory efficient)
-        ctx.save_for_backward(x_col_codes, x_col_sf, x_col_amax, weight_hp)
+        # Save columnwise x and pre-quantized W.T for backward (FP4 — memory efficient)
+        ctx.save_for_backward(x_col_codes, x_col_sf, x_col_amax, Wt_fp4_x2, Wt_sf, W_amax)
         ctx.input_orig_shape = input_hp.shape
         ctx.has_bias = bias is not None
         return output
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
-        x_col_codes, x_col_sf, x_col_amax, weight_hp = ctx.saved_tensors
+        x_col_codes, x_col_sf, x_col_amax, Wt_fp4_x2, Wt_sf, W_amax = ctx.saved_tensors
         grad_output = grad_output.contiguous()
         grad_output_2d = grad_output.reshape(-1, grad_output.shape[-1])
 
         # -----------------------------------------------------------
-        # GEMM 2: dy_sr @ W.T → grad_input  (SR rowwise)
+        # GEMM 2: dy_sr @ W.T → grad_input  (SR rowwise; saved colwise W)
         # -----------------------------------------------------------
         dy_fp4, dy_bs, dy_gs = _ao_rowwise_quantize_sr(grad_output_2d)
-        Wt_fp4, Wt_bs, Wt_gs = _triton_weight_quantize_2d(weight_hp.T.contiguous())
+        Wt_bs = Wt_sf.flatten()
+        Wt_gs = per_tensor_amax_to_scale(W_amax)
         grad_input = torch.nn.functional.scaled_mm(
             dy_fp4,
-            Wt_fp4.t(),
+            Wt_fp4_x2.t(),
             scale_a=[dy_bs, dy_gs],
             scale_recipe_a=[F.ScalingType.BlockWise1x16, F.ScalingType.TensorWise],
             scale_b=[Wt_bs, Wt_gs],
@@ -267,7 +289,7 @@ class nvfp4_mm_triton(torch.autograd.Function):
         # -----------------------------------------------------------
         # GEMM 3: dy_col.T @ x_col → grad_weight  (col RHT + SR)
         # -----------------------------------------------------------
-        # Both col scale tensors are already in SWIZZLE_32_4_4 layout — just flatten.
+        # Both col scale tensors are in SWIZZLE_32_4_4 layout — just flatten.
         dy_col_codes, dy_col_sf, dy_col_amax, _, _, _ = triton_rht_quantize_row_col(
             grad_output_2d, stochastic_rounding=True, compute_rowwise=False
         )
