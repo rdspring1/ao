@@ -173,15 +173,6 @@ def triton_rht_amax(
     NUM_SMS = torch.cuda.get_device_properties(A.device).multi_processor_count
     GROUP_SIZE_N: int = 8  # L2 reuse grouping along M
 
-    # tl.make_tensor_descriptor requires a Triton allocator for per-CTA scratch space.
-    # Outside torch.compile, none is set by default; mirror what torch._inductor does.
-    if hasattr(triton, "set_allocator"):
-        triton.set_allocator(
-            lambda size, align, stream: torch.empty(
-                size, dtype=torch.int8, device=A.device
-            )
-        )
-
     B = get_rht_matrix(sign_vector=sign_vector, device=A.device, hadamard_dimension=hadamard_dimension).to(torch.bfloat16)
     global_rht_amax = torch.zeros((), dtype=torch.float32, device=A.device)
     global_a_amax = torch.zeros((), dtype=torch.float32, device=A.device)

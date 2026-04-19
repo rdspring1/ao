@@ -10,6 +10,28 @@ import torch
 import triton
 import triton.language as tl
 
+_TMA_WORKSPACES: dict = {}
+
+
+def get_tma_workspace(device, nbytes: int = 131072) -> torch.Tensor:
+    """Return a pre-allocated per-device uint8 scratch buffer for TMA descriptors.
+
+    Call once before torch.compile to ensure allocation happens outside the CUDA
+    graph pool. Subsequent calls return the cached tensor (no new allocation).
+    Kernels run sequentially in the same CUDA stream and safely alias the buffer.
+
+    Also pre-warms get_rht_matrix (lru_cache) so its CUDA allocation happens
+    outside the pool context — prevents "untracked pool allocation" errors when
+    triton_rht_quantize_row_col is compiled under reduce-overhead.
+    """
+    key = str(device)
+    if key not in _TMA_WORKSPACES:
+        _TMA_WORKSPACES[key] = torch.empty(nbytes, dtype=torch.uint8, device=device)
+        # Pre-warm lru_cache with the same calling convention as triton_rht_amax uses,
+        # so the cache key matches and no pool allocation happens during warmup.
+        get_rht_matrix(sign_vector=None, device=device, hadamard_dimension=16)
+    return _TMA_WORKSPACES[key]
+
 
 def get_wgrad_sign_vector(
     shape, device, dtype: torch.dtype = torch.bfloat16

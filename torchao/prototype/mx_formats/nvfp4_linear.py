@@ -29,13 +29,17 @@ from torchao.prototype.custom_fp_utils import RoundingMode
 from torchao.prototype.mx_formats.hadamard_quantize_row_col_triton import (
     triton_rht_quantize_row_col,
 )
+from torchao.prototype.mx_formats.hadamard_utils import get_tma_workspace  # noqa: F401 (re-exported for user convenience)
 from torchao.prototype.mx_formats.kernels import triton_quantize_nvfp4
 from torchao.prototype.mx_formats.nvfp4_tensor import (
     NVFP4Tensor,
     _addmm_nvfp4_dispatch,
     per_tensor_amax_to_scale,
 )
-from torchao.prototype.mx_formats.quantize_2d_triton import triton_weight_quantize_2d
+from torchao.prototype.mx_formats.quantize_2d_triton import (
+    triton_weight_quantize_2d,
+    triton_weight_quantize_2d_colwise,
+)
 from torchao.prototype.mx_formats.utils import (
     hp_data_dims_to_swizzled_scale_dims_nvfp4,
     to_blocked,
@@ -180,9 +184,7 @@ def _triton_weight_quantize_2d_colwise(x: torch.Tensor):
       W_*  = rowwise quantized x (for forward GEMM)
       Wt_* = colwise quantized x = rowwise quantized x.T (for dgrad GEMM)
     """
-    codes, sf, t_codes, t_sf, global_amax = triton_weight_quantize_2d(
-        x, compute_colwise=True
-    )
+    codes, sf, t_codes, t_sf, global_amax = triton_weight_quantize_2d_colwise(x)
     return (
         codes.view(torch.float4_e2m1fn_x2),
         sf.flatten(),
@@ -229,11 +231,12 @@ class nvfp4_mm_triton(torch.autograd.Function):
         input_2d = input_hp.reshape(-1, K)
 
         # RHT + columnwise + rowwise quantization of input in one fused kernel
+        _fwd_seed_buf = torch.empty((1,), dtype=torch.int64, device=input_2d.device)
         (
             x_col_codes, x_col_sf, x_col_amax,
             x_row_codes, x_row_sf, x_row_amax,
         ) = triton_rht_quantize_row_col(
-            input_2d.contiguous(), stochastic_rounding=False, compute_rowwise=True
+            input_2d.contiguous(), _fwd_seed_buf, stochastic_rounding=False, compute_rowwise=True
         )
 
         # Fused weight quantization: rowwise for forward GEMM, colwise saved for dgrad
@@ -289,9 +292,23 @@ class nvfp4_mm_triton(torch.autograd.Function):
         # -----------------------------------------------------------
         # GEMM 3: dy_col.T @ x_col → grad_weight  (col RHT + SR)
         # -----------------------------------------------------------
-        # Both col scale tensors are in SWIZZLE_32_4_4 layout — just flatten.
+        # Generate SR seeds in compiled scope so torch.compile RNG tracking works
+        # correctly under CUDA graphs (reduce-overhead mode). Seeds must be outside
+        # the custom_op to avoid being captured as static values on first graph replay.
+        dy_sr_seed = torch.randint(
+            low=-(2**63), high=2**63 - 1, size=(1,), dtype=torch.int64,
+            device=grad_output_2d.device,
+        )
+        dy_sr_offset = torch.randint(
+            low=-(2**63), high=2**63 - 1, size=(1,), dtype=torch.int64,
+            device=grad_output_2d.device,
+        )
         dy_col_codes, dy_col_sf, dy_col_amax, _, _, _ = triton_rht_quantize_row_col(
-            grad_output_2d, stochastic_rounding=True, compute_rowwise=False
+            grad_output_2d,
+            dy_sr_seed,
+            stochastic_rounding=True,
+            compute_rowwise=False,
+            offset_base=dy_sr_offset,
         )
         dy_gs_w = per_tensor_amax_to_scale(dy_col_amax)
         x_gs_w = per_tensor_amax_to_scale(x_col_amax)

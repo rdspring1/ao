@@ -1,6 +1,7 @@
 """Triton kernel for 2D (16×16) NVFP4 E2M1 weight quantization."""
 
 import itertools
+from typing import Tuple
 import triton
 import triton.language as tl
 import torch
@@ -8,6 +9,7 @@ from torchao.prototype.mx_formats.hadamard_utils import (
     _compute_pid,
     convert_8xfp32_to_4xfp4_packed,
     _swizzle_scales,
+    get_tma_workspace,
 )
 from torchao.utils import is_sm_at_least_100
 
@@ -275,13 +277,6 @@ def triton_weight_quantize_2d(
     NUM_SMS = torch.cuda.get_device_properties(A.device).multi_processor_count
     GROUP_SIZE_N: int = 8
 
-    if hasattr(triton, "set_allocator"):
-        triton.set_allocator(
-            lambda size, align, stream: torch.empty(
-                size, dtype=torch.int8, device=A.device
-            )
-        )
-
     _weight_quantize_2d_kernel[(NUM_SMS,)](
         A,
         out,
@@ -299,3 +294,46 @@ def triton_weight_quantize_2d(
     if compute_colwise:
         return out, scale_factors, a_t_fp4, a_t_sf, global_amax
     return out, scale_factors, global_amax
+
+
+@torch.library.custom_op("torchao::triton_weight_quantize_2d_colwise", mutates_args=())
+def triton_weight_quantize_2d_colwise(
+    A: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """2D NVFP4 weight quantization producing both rowwise and colwise outputs.
+
+    Thin custom_op wrapper around triton_weight_quantize_2d(compute_colwise=True),
+    enabling torch.compile(fullgraph=True) compatibility via register_fake.
+
+    Call get_tma_workspace(device) once before torch.compile to pre-allocate the
+    TMA scratch buffer outside the CUDA graph pool.
+
+    Args:
+        A: (M, N) bfloat16, row-major. M and N must be divisible by 128.
+
+    Returns:
+        5-tuple (codes, sf, t_codes, t_sf, global_amax):
+          - codes:       (M, N//2) uint8 rowwise FP4 codes.
+          - sf:          (M//128, N//64, 32, 16) float8_e4m3fn rowwise swizzled scales.
+          - t_codes:     (N, M//2) uint8 colwise FP4 codes (rowwise of W.T).
+          - t_sf:        (N//128, M//64, 32, 16) float8_e4m3fn colwise swizzled scales.
+          - global_amax: scalar float32 global amax of A.
+    """
+    if hasattr(triton, "set_allocator"):
+        _ws = get_tma_workspace(A.device)
+        triton.set_allocator(lambda size, align, stream: _ws[:max(size, 1)])
+    codes, sf, t_codes, t_sf, global_amax = triton_weight_quantize_2d(
+        A, compute_colwise=True
+    )
+    return codes, sf, t_codes, t_sf, global_amax
+
+
+@triton_weight_quantize_2d_colwise.register_fake
+def _(A):
+    M, N = A.shape
+    codes = A.new_empty((M, N // 2), dtype=torch.uint8)
+    sf = A.new_empty((M // 128, N // 64, 32, 16), dtype=torch.float8_e4m3fn)
+    t_codes = A.new_empty((N, M // 2), dtype=torch.uint8)
+    t_sf = A.new_empty((N // 128, M // 64, 32, 16), dtype=torch.float8_e4m3fn)
+    global_amax = A.new_empty((), dtype=torch.float32)
+    return codes, sf, t_codes, t_sf, global_amax
