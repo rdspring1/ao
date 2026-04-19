@@ -1,6 +1,7 @@
 """Triton kernel for 2D (16×16) NVFP4 E2M1 weight quantization."""
 
 import itertools
+from typing import Tuple
 import triton
 import triton.language as tl
 import torch
@@ -8,6 +9,7 @@ from torchao.prototype.mx_formats.hadamard_utils import (
     _compute_pid,
     convert_8xfp32_to_4xfp4_packed,
     _swizzle_scales,
+    prepare_for_cuda_graph,
 )
 from torchao.utils import is_sm_at_least_100
 
@@ -189,13 +191,18 @@ def _weight_quantize_2d_kernel(
         )
 
 
-def triton_weight_quantize_2d(A: torch.Tensor, global_amax: torch.Tensor):
+@torch.library.custom_op("torchao::triton_weight_quantize_2d", mutates_args=())
+def triton_weight_quantize_2d(
+    A: torch.Tensor,
+    global_amax: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """2D (16×16) NVFP4 E2M1 weight quantization without RHT.
 
     Args:
         A:           (M, N) bfloat16, row-major. M and N divisible by 16.
         global_amax: scalar float32 global absolute maximum of A. Caller computes
-                     ``A.float().abs().max()`` and may all-reduce it before passing in.
+                     ``A.float().abs().max()`` (and optionally all-reduces for TP)
+                     before passing in.
 
     Returns:
         4-tuple of:
@@ -222,6 +229,10 @@ def triton_weight_quantize_2d(A: torch.Tensor, global_amax: torch.Tensor):
     if N % 128 != 0:
         raise ValueError(f"N must be divisible by 128 for swizzling, got N={N}")
 
+    if hasattr(triton, "set_allocator"):
+        _ws = prepare_for_cuda_graph(A.device)
+        triton.set_allocator(lambda size, align, stream: _ws[: max(size, 1)])
+
     a_fp4 = torch.zeros((M, N // 2), dtype=torch.uint8, device=A.device)
     a_sf = torch.empty(
         (M // 128, N // 64, 32, 16), dtype=torch.float8_e4m3fn, device=A.device
@@ -234,13 +245,6 @@ def triton_weight_quantize_2d(A: torch.Tensor, global_amax: torch.Tensor):
 
     NUM_SMS = torch.cuda.get_device_properties(A.device).multi_processor_count
     GROUP_SIZE_N: int = 8
-
-    if hasattr(triton, "set_allocator"):
-        triton.set_allocator(
-            lambda size, align, stream: torch.empty(
-                size, dtype=torch.int8, device=A.device
-            )
-        )
 
     _weight_quantize_2d_kernel[(NUM_SMS,)](
         A,
@@ -255,3 +259,13 @@ def triton_weight_quantize_2d(A: torch.Tensor, global_amax: torch.Tensor):
         NUM_SMS=NUM_SMS,
     )
     return a_fp4, a_sf, a_t_fp4, a_t_sf
+
+
+@triton_weight_quantize_2d.register_fake
+def _(A, global_amax):
+    M, N = A.shape
+    codes = A.new_empty((M, N // 2), dtype=torch.uint8)
+    sf = A.new_empty((M // 128, N // 64, 32, 16), dtype=torch.float8_e4m3fn)
+    t_codes = A.new_empty((N, M // 2), dtype=torch.uint8)
+    t_sf = A.new_empty((N // 128, M // 64, 32, 16), dtype=torch.float8_e4m3fn)
+    return codes, sf, t_codes, t_sf
