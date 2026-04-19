@@ -9,7 +9,7 @@ from torchao.prototype.mx_formats.hadamard_utils import (
     _compute_pid,
     convert_8xfp32_to_4xfp4_packed,
     _swizzle_scales,
-    get_tma_workspace,
+    prepare_for_cuda_graph,
 )
 from torchao.utils import is_sm_at_least_100
 
@@ -251,6 +251,10 @@ def triton_weight_quantize_2d(
         # compute_colwise always uses swizzled scales for both rowwise and colwise
         swizzle_scale_factors = True
 
+    if hasattr(triton, "set_allocator"):
+        _ws = prepare_for_cuda_graph(A.device)
+        triton.set_allocator(lambda size, align, stream: _ws[:max(size, 1)])
+
     global_amax = A.float().abs().max()
     out = torch.zeros((M, N // 2), dtype=torch.uint8, device=A.device)
     if swizzle_scale_factors:
@@ -305,7 +309,7 @@ def triton_weight_quantize_2d_colwise(
     Thin custom_op wrapper around triton_weight_quantize_2d(compute_colwise=True),
     enabling torch.compile(fullgraph=True) compatibility via register_fake.
 
-    Call get_tma_workspace(device) once before torch.compile to pre-allocate the
+    Call prepare_for_cuda_graph(device) once before torch.compile to pre-allocate the
     TMA scratch buffer outside the CUDA graph pool.
 
     Args:
@@ -320,7 +324,7 @@ def triton_weight_quantize_2d_colwise(
           - global_amax: scalar float32 global amax of A.
     """
     if hasattr(triton, "set_allocator"):
-        _ws = get_tma_workspace(A.device)
+        _ws = prepare_for_cuda_graph(A.device)
         triton.set_allocator(lambda size, align, stream: _ws[:max(size, 1)])
     codes, sf, t_codes, t_sf, global_amax = triton_weight_quantize_2d(
         A, compute_colwise=True

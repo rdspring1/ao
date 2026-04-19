@@ -22,7 +22,7 @@ if is_sm_at_least_100():
         triton_weight_quantize_2d,
         triton_weight_quantize_2d_colwise,
     )
-    from torchao.prototype.mx_formats.hadamard_utils import get_tma_workspace
+    from torchao.prototype.mx_formats.hadamard_utils import prepare_for_cuda_graph
 
 
 # BLOCK_M minimum is 128; N must be a multiple of BLOCK_N=256.
@@ -164,7 +164,7 @@ def test_triton_weight_quantize_2d_colwise_cuda_graph_compile():
     """
     shape = (128, 256)
     W = torch.randn(*shape, dtype=torch.bfloat16, device="cuda")
-    get_tma_workspace(W.device)  # pre-allocate TMA scratch outside pool context
+    prepare_for_cuda_graph(W.device)  # pre-allocate TMA scratch + SR bufs outside pool context
 
     def run(w):
         codes, sf, t_codes, t_sf, amax = triton_weight_quantize_2d_colwise(w)

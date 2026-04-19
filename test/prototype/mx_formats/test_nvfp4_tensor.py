@@ -970,13 +970,13 @@ def test_nvfp4_mm_triton_cuda_graph_compile():
     test_triton_rht_quantize_row_col_cuda_graph_compile.
     """
     from torchao.prototype.mx_formats.nvfp4_linear import nvfp4_linear
-    from torchao.prototype.mx_formats.hadamard_utils import get_tma_workspace
+    from torchao.prototype.mx_formats.hadamard_utils import prepare_for_cuda_graph
     from torchao.quantization.quantize_.common.kernel_preference import KernelPreference
 
     M, K, N = 128, 256, 128
     x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
     w = torch.randn(N, K, dtype=torch.bfloat16, device="cuda")
-    get_tma_workspace(x.device)  # pre-allocate TMA scratch outside pool context
+    prepare_for_cuda_graph(x.device)  # pre-allocate TMA scratch + SR bufs outside pool context
 
     def run(inp, wt):
         return nvfp4_linear(inp, wt, kernel_preference=KernelPreference.TRITON)

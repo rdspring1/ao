@@ -36,7 +36,7 @@ if is_sm_at_least_100():
     from torchao.prototype.mx_formats.hadamard_quantize_row_col_triton import (
         triton_rht_quantize_row_col,
     )
-    from torchao.prototype.mx_formats.hadamard_utils import get_rht_matrix, get_tma_workspace
+    from torchao.prototype.mx_formats.hadamard_utils import get_rht_matrix, prepare_for_cuda_graph
 
 # M must be ≥ 128 (BLOCK_M minimum). M=32/64/96 excluded.
 _M_VALUES = [128, 160, 256, 512]
@@ -372,7 +372,7 @@ def test_triton_rht_quantize_row_col_cuda_graph_compile():
     """
     shape = (128, 256)
     A = torch.randn(*shape, dtype=torch.bfloat16, device="cuda")
-    get_tma_workspace(A.device)  # pre-allocate TMA scratch outside pool context
+    prepare_for_cuda_graph(A.device)  # pre-allocate TMA scratch + SR bufs outside pool context
 
     # Pre-allocate seed_buf OUTSIDE torch.compile so its address is stable.
     seed_buf = torch.empty((1,), dtype=torch.int64, device=A.device)

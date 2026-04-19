@@ -29,7 +29,7 @@ from torchao.prototype.custom_fp_utils import RoundingMode
 from torchao.prototype.mx_formats.hadamard_quantize_row_col_triton import (
     triton_rht_quantize_row_col,
 )
-from torchao.prototype.mx_formats.hadamard_utils import get_tma_workspace  # noqa: F401 (re-exported for user convenience)
+from torchao.prototype.mx_formats.hadamard_utils import prepare_for_cuda_graph  # noqa: F401 (re-exported for user convenience)
 from torchao.prototype.mx_formats.kernels import triton_quantize_nvfp4
 from torchao.prototype.mx_formats.nvfp4_tensor import (
     NVFP4Tensor,
@@ -231,12 +231,18 @@ class nvfp4_mm_triton(torch.autograd.Function):
         input_2d = input_hp.reshape(-1, K)
 
         # RHT + columnwise + rowwise quantization of input in one fused kernel
+        # SR=False: kernel ignores seed_base/offset_base; empty tensors satisfy the signature.
         _fwd_seed_buf = torch.empty((1,), dtype=torch.int64, device=input_2d.device)
+        _fwd_offset_buf = torch.empty((1,), dtype=torch.int64, device=input_2d.device)
         (
             x_col_codes, x_col_sf, x_col_amax,
             x_row_codes, x_row_sf, x_row_amax,
         ) = triton_rht_quantize_row_col(
-            input_2d.contiguous(), _fwd_seed_buf, stochastic_rounding=False, compute_rowwise=True
+            input_2d.contiguous(),
+            stochastic_rounding=False,
+            compute_rowwise=True,
+            seed_base=_fwd_seed_buf,
+            offset_base=_fwd_offset_buf,
         )
 
         # Fused weight quantization: rowwise for forward GEMM, colwise saved for dgrad
@@ -292,23 +298,18 @@ class nvfp4_mm_triton(torch.autograd.Function):
         # -----------------------------------------------------------
         # GEMM 3: dy_col.T @ x_col → grad_weight  (col RHT + SR)
         # -----------------------------------------------------------
-        # Generate SR seeds in compiled scope so torch.compile RNG tracking works
-        # correctly under CUDA graphs (reduce-overhead mode). Seeds must be outside
-        # the custom_op to avoid being captured as static values on first graph replay.
-        dy_sr_seed = torch.randint(
-            low=-(2**63), high=2**63 - 1, size=(1,), dtype=torch.int64,
-            device=grad_output_2d.device,
-        )
-        dy_sr_offset = torch.randint(
-            low=-(2**63), high=2**63 - 1, size=(1,), dtype=torch.int64,
-            device=grad_output_2d.device,
-        )
+        # .random_() on fresh empty tensors: CUDA RNG kernel, advanced by cudagraph trees
+        # each replay → SR diversity without new allocations from torch.randint().
+        dy_sr_seed_buf = torch.empty((1,), dtype=torch.int64, device=grad_output_2d.device)
+        dy_sr_seed_buf.random_()
+        dy_sr_offset_buf = torch.empty((1,), dtype=torch.int64, device=grad_output_2d.device)
+        dy_sr_offset_buf.random_()
         dy_col_codes, dy_col_sf, dy_col_amax, _, _, _ = triton_rht_quantize_row_col(
             grad_output_2d,
-            dy_sr_seed,
             stochastic_rounding=True,
             compute_rowwise=False,
-            offset_base=dy_sr_offset,
+            seed_base=dy_sr_seed_buf,
+            offset_base=dy_sr_offset_buf,
         )
         dy_gs_w = per_tensor_amax_to_scale(dy_col_amax)
         x_gs_w = per_tensor_amax_to_scale(x_col_amax)

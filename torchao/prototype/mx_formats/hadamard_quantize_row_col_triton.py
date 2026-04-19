@@ -6,7 +6,7 @@ import torch
 import torch.nn.functional as F
 from torchao.prototype.mx_formats.hadamard_utils import (
     get_rht_matrix,
-    get_tma_workspace,
+    prepare_for_cuda_graph,
     _compute_pid,
     _nvfp4_quantize,
     _pack_fp4,
@@ -199,10 +199,10 @@ def _hadamard_quantize_row_col_kernel(
                 )
 
 
-@torch.library.custom_op("torchao::triton_rht_quantize_row_col", mutates_args=("seed_buf",))
+@torch.library.custom_op("torchao::triton_rht_quantize_row_col", mutates_args=("seed_base",))
 def triton_rht_quantize_row_col(
     A: torch.Tensor,
-    seed_buf: torch.Tensor,
+    seed_base: torch.Tensor,
     stochastic_rounding: bool = False,
     compute_rowwise: bool = True,
     sign_vector: Optional[List[int]] = None,
@@ -228,12 +228,12 @@ def triton_rht_quantize_row_col(
         sign_vector: Sign vector for the RHT as a list of ints. None (default) generates
             a random cached sign vector via get_rht_matrix.
         hadamard_dimension: Dimension of the Hadamard matrix (default 16).
-        philox_seed_base: Pre-generated int64 seed tensor for SR (size=(1,)). When None
-            and stochastic_rounding=True, a seed is generated internally. For correct
-            stochastic rounding under torch.compile CUDA graphs, generate this with
-            torch.randint in the compiled function body and pass it here.
-        offset_base: Pre-generated int64 offset tensor for SR (size=(1,)). Same semantics
-            as philox_seed_base.
+        seed_base: Pre-allocated int64 seed tensor for SR (size=(1,)). For correct
+            stochastic rounding under torch.compile CUDA graphs, pre-allocate via
+            prepare_for_cuda_graph(device) before compile; use .random_() in the
+            compiled body to advance the value each call.
+        offset_base: Pre-allocated int64 offset tensor for SR (size=(1,)). Same semantics
+            as seed_base.
 
     Returns:
         6-tuple (col_fp4, col_sf, col_amax, row_fp4, row_sf, row_amax):
@@ -244,9 +244,9 @@ def triton_rht_quantize_row_col(
           - row_sf:   (M//128, N//64, 32, 16) float8_e4m3fn if compute_rowwise, else dummy (1,).
           - row_amax: scalar float32 global amax of A if compute_rowwise, else 0.0 scalar.
 
-    CUDA graphs: call once before graph capture to warm up the autotuner. For SR with
-    CUDA graphs via torch.compile(mode="reduce-overhead"), generate philox_seed_base and
-    offset_base with torch.randint in the compiled scope and pass them here.
+    CUDA graphs: call prepare_for_cuda_graph(device) once before graph capture to warm
+    up the autotuner. For SR, use torch.empty() + .random_() inside the compiled scope
+    to generate seed_base/offset_base; cudagraph trees advances the RNG each replay.
     """
     if torch.cuda.is_available() and not is_sm_at_least_100():
         raise NotImplementedError(
@@ -274,7 +274,7 @@ def triton_rht_quantize_row_col(
     sv = tuple(sign_vector) if sign_vector else None
 
     if hasattr(triton, "set_allocator"):
-        _ws = get_tma_workspace(A.device)
+        _ws = prepare_for_cuda_graph(A.device)
         triton.set_allocator(lambda size, align, stream: _ws[:max(size, 1)])
 
     # Columnwise global amax: max(abs(RHT(A.t()))) and rowwise: max(abs(A)) — fused kernel
@@ -289,7 +289,7 @@ def triton_rht_quantize_row_col(
     # Resolve SR seeds: use caller-provided seeds for correct CUDA-graph SR behavior;
     # fall back to generating internally for eager callers that omit them.
     if stochastic_rounding:
-        _seed = seed_buf
+        _seed = seed_base
         _offset = offset_base if offset_base is not None else torch.randint(
             low=-(2**63), high=2**63 - 1, size=(1,), dtype=torch.int64, device=A.device,
         )
@@ -344,7 +344,7 @@ def triton_rht_quantize_row_col(
 @triton_rht_quantize_row_col.register_fake
 def _(
     A,
-    seed_buf,
+    seed_base,
     stochastic_rounding=False,
     compute_rowwise=True,
     sign_vector=None,
