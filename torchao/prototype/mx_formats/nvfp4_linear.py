@@ -23,19 +23,25 @@ backend can be removed.
 from typing import Optional
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 from torchao.prototype.custom_fp_utils import RoundingMode
 from torchao.prototype.mx_formats.hadamard_quantize_row_col_triton import (
     triton_rht_quantize_row_col,
 )
+from torchao.prototype.mx_formats.hadamard_utils import (
+    prepare_for_cuda_graph,
+)  # noqa: F401 (re-exported for user convenience)
 from torchao.prototype.mx_formats.kernels import triton_quantize_nvfp4
 from torchao.prototype.mx_formats.nvfp4_tensor import (
     NVFP4Tensor,
     _addmm_nvfp4_dispatch,
     per_tensor_amax_to_scale,
 )
-from torchao.prototype.mx_formats.quantize_2d_triton import triton_weight_quantize_2d
+from torchao.prototype.mx_formats.quantize_2d_triton import (
+    triton_weight_quantize_2d,
+)
 from torchao.prototype.mx_formats.utils import (
     hp_data_dims_to_swizzled_scale_dims_nvfp4,
     to_blocked,
@@ -148,19 +154,18 @@ def _quantize_to_nvfp4_te(
     )
 
 
-def _ao_rowwise_quantize_sr(x: torch.Tensor):
+def _ao_rowwise_quantize_sr(
+    x: torch.Tensor,
+    seed_base: torch.Tensor,
+    offset_base: torch.Tensor,
+):
     """Triton NVFP4 rowwise quantization with stochastic rounding.
 
     Returns (fp4_data, block_scales, global_scale).
     block_scales: (M, N//16) float8_e4m3fn in SWIZZLE_32_4_4 memory layout.
+    seed_base/offset_base are read-only; no mutation inside this function.
     """
     global_scale = per_tensor_amax_to_scale(x.abs().max())
-    seed_base = torch.randint(
-        -(2**63), 2**63 - 1, (1,), dtype=torch.int64, device=x.device
-    )
-    offset_base = torch.randint(
-        -(2**63), 2**63 - 1, (1,), dtype=torch.int64, device=x.device
-    )
     scales, xq = triton_quantize_nvfp4(
         x, global_scale, RoundingMode.RS.value, seed_base, offset_base
     )
@@ -196,6 +201,12 @@ class nvfp4_mm_triton(torch.autograd.Function):
 
     Requires: bfloat16 input, M % 128 == 0, K % 128 == 0, N % 128 == 0.
     Saves only FP4 codes+scales for backward (memory efficient vs full-precision activations).
+
+    sr_seed is a single fixed buffer giving the Philox key. Backward generates fresh
+    offset_base values via torch.randint (default CUDA RNG, no generator= arg). Under
+    torch.compile(mode="reduce-overhead") the default CUDA generator is a first-class
+    CUDA graph side input: the framework advances it between replays, giving different
+    SR noise each backward step without save_for_backward or external counter plumbing.
     """
 
     @staticmethod
@@ -205,6 +216,7 @@ class nvfp4_mm_triton(torch.autograd.Function):
         weight_hp: torch.Tensor,
         bias: Optional[torch.Tensor],
         kernel_preference: KernelPreference,
+        sr_seed: torch.Tensor,
     ):
         M = input_hp.shape[-2]
         K = input_hp.shape[-1]
@@ -220,7 +232,8 @@ class nvfp4_mm_triton(torch.autograd.Function):
             )
         input_2d = input_hp.reshape(-1, K)
 
-        # RHT + columnwise + rowwise quantization of input in one fused kernel
+        # RHT + columnwise + rowwise quantization of input in one fused kernel.
+        # SR=False in forward — sr_seed value is not consumed here.
         (
             x_col_codes,
             x_col_sf,
@@ -229,13 +242,20 @@ class nvfp4_mm_triton(torch.autograd.Function):
             x_row_sf,
             x_row_amax,
         ) = triton_rht_quantize_row_col(
-            input_2d.contiguous(), stochastic_rounding=False, compute_rowwise=True
+            input_2d.contiguous(),
+            stochastic_rounding=False,
+            compute_rowwise=True,
         )
 
         # Fused weight quantization: rowwise for forward GEMM, colwise saved for dgrad
-        W_fp4_x2, W_bs, W_gs, Wt_fp4_x2, Wt_sf, W_amax = _triton_weight_quantize_2d(
-            weight_hp
-        )
+        (
+            W_fp4_x2,
+            W_bs,
+            W_gs,
+            Wt_fp4_x2,
+            Wt_sf,
+            W_amax,
+        ) = _triton_weight_quantize_2d(weight_hp)
         x_gs = per_tensor_amax_to_scale(x_row_amax)
 
         output = torch.nn.functional.scaled_mm(
@@ -253,9 +273,14 @@ class nvfp4_mm_triton(torch.autograd.Function):
         if bias is not None:
             output = output + bias
 
-        # Save columnwise x and pre-quantized W.T for backward (FP4 — memory efficient)
         ctx.save_for_backward(
-            x_col_codes, x_col_sf, x_col_amax, Wt_fp4_x2, Wt_sf, W_amax
+            x_col_codes,
+            x_col_sf,
+            x_col_amax,
+            Wt_fp4_x2,
+            Wt_sf,
+            W_amax,
+            sr_seed,
         )
         ctx.input_orig_shape = input_hp.shape
         ctx.has_bias = bias is not None
@@ -263,14 +288,35 @@ class nvfp4_mm_triton(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
-        x_col_codes, x_col_sf, x_col_amax, Wt_fp4_x2, Wt_sf, W_amax = ctx.saved_tensors
+        (
+            x_col_codes,
+            x_col_sf,
+            x_col_amax,
+            Wt_fp4_x2,
+            Wt_sf,
+            W_amax,
+            sr_seed,
+        ) = ctx.saved_tensors
         grad_output = grad_output.contiguous()
         grad_output_2d = grad_output.reshape(-1, grad_output.shape[-1])
+        dev = grad_output.device
+
+        # Default CUDA RNG: torch.compile/reduce-overhead advances the default generator
+        # between CUDA graph replays — same mechanism as dropout/randn in CUDA graphs.
+        # Two independent calls give GEMM 2 and GEMM 3 different positions in the RNG stream.
+        offset_rowwise = torch.randint(
+            -(2**63), 2**63 - 1, (1,), dtype=torch.int64, device=dev
+        )
+        offset_colwise = torch.randint(
+            -(2**63), 2**63 - 1, (1,), dtype=torch.int64, device=dev
+        )
 
         # -----------------------------------------------------------
         # GEMM 2: dy_sr @ W.T → grad_input  (SR rowwise; saved colwise W)
         # -----------------------------------------------------------
-        dy_fp4, dy_bs, dy_gs = _ao_rowwise_quantize_sr(grad_output_2d)
+        dy_fp4, dy_bs, dy_gs = _ao_rowwise_quantize_sr(
+            grad_output_2d, sr_seed, offset_rowwise
+        )
         Wt_bs = Wt_sf.flatten()
         Wt_gs = per_tensor_amax_to_scale(W_amax)
         grad_input = torch.nn.functional.scaled_mm(
@@ -289,9 +335,12 @@ class nvfp4_mm_triton(torch.autograd.Function):
         # -----------------------------------------------------------
         # GEMM 3: dy_col.T @ x_col → grad_weight  (col RHT + SR)
         # -----------------------------------------------------------
-        # Both col scale tensors are in SWIZZLE_32_4_4 layout — just flatten.
         dy_col_codes, dy_col_sf, dy_col_amax, _, _, _ = triton_rht_quantize_row_col(
-            grad_output_2d, stochastic_rounding=True, compute_rowwise=False
+            grad_output_2d,
+            stochastic_rounding=True,
+            compute_rowwise=False,
+            seed_base=sr_seed,
+            offset_base=offset_colwise,
         )
         dy_gs_w = per_tensor_amax_to_scale(dy_col_amax)
         x_gs_w = per_tensor_amax_to_scale(x_col_amax)
@@ -312,7 +361,8 @@ class nvfp4_mm_triton(torch.autograd.Function):
             if ctx.has_bias
             else None
         )
-        return grad_input, grad_weight, grad_bias, None
+        # Two extra Nones: kernel_preference, sr_seed
+        return grad_input, grad_weight, grad_bias, None, None
 
 
 def nvfp4_linear(
@@ -320,6 +370,7 @@ def nvfp4_linear(
     weight_hp: torch.Tensor,
     bias: Optional[torch.Tensor] = None,
     kernel_preference: KernelPreference = KernelPreference.TORCH,
+    sr_seed: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Convenience wrapper around the nvfp4_mm autograd function.
 
@@ -331,9 +382,21 @@ def nvfp4_linear(
         weight_hp: High precision weight [out_features, in_features]
         bias: Optional bias [out_features]
         kernel_preference: Backend for quantization (TORCH, TE, AUTO, or TRITON)
+        sr_seed: Fixed int64 seed tensor (size=(1,)) for SR Philox key. Allocated
+            fresh if None. For reproducibility, pass a pre-allocated module buffer.
     """
     if kernel_preference == KernelPreference.TRITON:
-        return nvfp4_mm_triton.apply(input_hp, weight_hp, bias, kernel_preference)
+        if sr_seed is None:
+            sr_seed = torch.randint(
+                -(2**63), 2**63 - 1, (1,), dtype=torch.int64, device=input_hp.device
+            )
+        return nvfp4_mm_triton.apply(
+            input_hp,
+            weight_hp,
+            bias,
+            kernel_preference,
+            sr_seed,
+        )
     return nvfp4_mm.apply(input_hp, weight_hp, bias, kernel_preference)
 
 

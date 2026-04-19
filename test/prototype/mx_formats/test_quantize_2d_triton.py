@@ -15,12 +15,13 @@ from torchao.prototype.mx_formats.nvfp4_tensor import (
     NVFP4Tensor,
     per_tensor_amax_to_scale,
 )
-from torchao.utils import is_sm_at_least_100
+from torchao.utils import is_sm_at_least_100, torch_version_at_least
 
 if is_sm_at_least_100():
     from torchao.prototype.mx_formats.quantize_2d_triton import (
         triton_weight_quantize_2d,
     )
+from torchao.prototype.mx_formats.hadamard_utils import prepare_for_cuda_graph
 
 
 # BLOCK_M minimum is 128; N must be a multiple of BLOCK_N=256.
@@ -164,3 +165,34 @@ def test_triton_weight_quantize_2d_sqnr(M, N):
 
     sqnr_t = compute_error(A.T.float(), dequant_t)
     assert sqnr_t >= 15.0, f"Colwise SQNR {sqnr_t:.2f} dB < 15.0 dB for M={M} N={N}"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.skipif(not is_sm_at_least_100(), reason="Requires SM100+")
+@pytest.mark.skipif(
+    not torch_version_at_least("2.8.0"), reason="torch.compile requires PyTorch 2.8+"
+)
+def test_triton_weight_quantize_2d_cuda_graph_compile():
+    """triton_weight_quantize_2d_colwise under reduce-overhead CUDA graphs.
+
+    Weight quantization is deterministic (no SR), so consecutive calls should produce
+    identical outputs. Primarily verifies fullgraph=True compilation succeeds via the
+    registered custom_op + register_fake.
+    """
+    shape = (128, 256)
+    W = torch.randn(*shape, dtype=torch.bfloat16, device="cuda")
+    prepare_for_cuda_graph(
+        W.device
+    )  # pre-allocate TMA scratch + SR bufs outside pool context
+
+    def run(w):
+        codes, sf, t_codes, t_sf, amax = triton_weight_quantize_2d(w)
+        return codes.clone()
+
+    compiled = torch.compile(run, mode="reduce-overhead", fullgraph=True)
+    for _ in range(3):
+        compiled(W)  # warmup
+
+    r1 = compiled(W)
+    r2 = compiled(W)
+    torch.testing.assert_close(r1, r2)

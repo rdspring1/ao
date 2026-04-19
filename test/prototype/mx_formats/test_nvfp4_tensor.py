@@ -951,3 +951,73 @@ def test_nvfp4_rs_cuda_graph_compile():
     r3 = compiled_fn(x).clone()
 
     torch.testing.assert_close(unpack_uint4(r1), unpack_uint4(r3))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.skipif(
+    not is_sm_at_least_100(),
+    reason="CUDA capability >= 10.0 required for nvfp4 triton kernel",
+)
+@pytest.mark.skipif(
+    not torch_version_at_least("2.8.0"), reason="torch.compile requires PyTorch 2.8+"
+)
+def test_nvfp4_mm_triton_cuda_graph_compile():
+    """nvfp4_linear (TRITON kernel) forward and backward under reduce-overhead CUDA graphs.
+
+    Verifies:
+      1. torch.compile(fullgraph=True) succeeds (no FakeTensor errors, no pool errors).
+      2. Deterministic forward: consecutive compiled calls produce the same output.
+      3. Forward SQNR vs. high-precision reference is >= 15 dB.
+      4. Backward SR grad_weight differs across steps (default CUDA RNG advances each replay).
+    """
+    from torchao.prototype.mx_formats.nvfp4_training import NVFP4TrainingLinear
+    from torchao.prototype.mx_formats.hadamard_utils import prepare_for_cuda_graph
+    from torchao.quantization.quantize_.common.kernel_preference import KernelPreference
+
+    M, K, N = 128, 256, 128
+    prepare_for_cuda_graph(torch.device("cuda"))
+
+    layer = (
+        NVFP4TrainingLinear(K, N, bias=False, kernel_preference=KernelPreference.TRITON)
+        .cuda()
+        .to(torch.bfloat16)
+    )
+    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda", requires_grad=True)
+
+    compiled_layer = torch.compile(layer, mode="reduce-overhead", fullgraph=True)
+    compiled_bwd = torch.compile(fullgraph=True, mode="reduce-overhead")
+
+    # Warmup
+    for _ in range(3):
+        with torch._dynamo.compiled_autograd._enable(compiled_bwd):
+            compiled_layer(x).sum().backward()
+
+    # Forward is deterministic (RHT-based, no SR in forward)
+    r1 = compiled_layer(x)
+    r2 = compiled_layer(x)
+    torch.testing.assert_close(r1, r2)
+
+    # Forward SQNR vs. high-precision reference
+    x_hp = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+    ref = torch.nn.functional.linear(x_hp, layer.weight)
+    nvfp4_out = layer(x_hp)
+    sqnr = compute_error(ref, nvfp4_out)
+    assert sqnr >= 15.0, f"Forward SQNR {sqnr:.2f} dB < 15 dB"
+
+    # Backward SR diversity: grad_weight must differ across steps
+    def one_step():
+        x.grad = None
+        layer.weight.grad = None
+        with torch._dynamo.compiled_autograd._enable(compiled_bwd):
+            compiled_layer(x).sum().backward()
+        return layer.weight.grad.detach().clone()
+
+    for _ in range(3):
+        one_step()
+
+    g1 = one_step()
+    g2 = one_step()
+
+    assert not torch.equal(g1, g2), (
+        "Backward SR grad_weight must differ across steps (default CUDA RNG advances each replay)"
+    )
