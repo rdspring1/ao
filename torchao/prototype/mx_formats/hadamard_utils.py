@@ -11,6 +11,22 @@ import triton
 import triton.language as tl
 
 _TMA_WORKSPACES: dict = {}
+_SR_SEED_BUFS: dict = {}
+_SR_OFFSET_BUFS: dict = {}
+
+
+def _device_key(device) -> str:
+    """Normalize device to a canonical string key (e.g. 'cuda' and 'cuda:0' → 'cuda:0').
+
+    torch.device('cuda') and torch.device('cuda:0') stringify differently but refer
+    to the same physical device. Without normalization, callers using one form miss
+    cache entries created by callers using the other, causing spurious re-allocations
+    inside FakeTensor tracing mode (which produce FakeTensors instead of real tensors).
+    """
+    d = torch.device(device)
+    if d.type == "cuda" and d.index is None:
+        return f"cuda:{torch.cuda.current_device()}"
+    return str(d)
 
 
 def prepare_for_cuda_graph(device, nbytes: int = 131072) -> torch.Tensor:
@@ -24,13 +40,28 @@ def prepare_for_cuda_graph(device, nbytes: int = 131072) -> torch.Tensor:
     Also pre-warms get_rht_matrix (lru_cache) to prevent pool-allocation errors
     during graph capture.
     """
-    key = str(device)
+    key = _device_key(device)
     if key not in _TMA_WORKSPACES:
         _TMA_WORKSPACES[key] = torch.empty(nbytes, dtype=torch.uint8, device=device)
+        _SR_SEED_BUFS[key] = torch.zeros((1,), dtype=torch.int64, device=device)
+        _SR_OFFSET_BUFS[key] = torch.zeros((1,), dtype=torch.int64, device=device)
         # Pre-warm lru_cache with the same calling convention as triton_rht_amax uses,
         # so the cache key matches and no pool allocation happens during warmup.
         get_rht_matrix(sign_vector=None, device=device, hadamard_dimension=16)
     return _TMA_WORKSPACES[key]
+
+
+def get_sr_buffers(device) -> tuple:
+    """Return (seed_buf, offset_buf) pre-allocated outside the CUDA graph pool.
+
+    Lazily calls prepare_for_cuda_graph if not yet initialized. Use these buffers
+    inside torch.compile: update seed via torch.randint + copy_, increment offset
+    via add_(1) — both are Dynamo-safe unlike in-place .random_().
+    """
+    key = _device_key(device)
+    if key not in _SR_SEED_BUFS:
+        prepare_for_cuda_graph(device)
+    return _SR_SEED_BUFS[key], _SR_OFFSET_BUFS[key]
 
 
 def get_wgrad_sign_vector(

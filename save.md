@@ -1,64 +1,38 @@
 # Save Note
 
 ## Goal
-Make `nvfp4_mm_triton` fully correct under `torch.compile(mode="reduce-overhead", fullgraph=True)` CUDA graphs, including verified SR diversity in the backward pass.
+Make `nvfp4_mm_triton` backward compatible with `torch.compile(fullgraph=True)` via compiled autograd, with verified SR diversity across replays.
 
-## Current State
-All blocking issues fixed. All CUDA graph tests pass. One remaining verification gap.
+## Regression Status (all green)
+- `test_nvfp4_mm_triton_cuda_graph_compile` — PASSED
+- `test_triton_rht_quantize_row_col_cuda_graph_compile` — PASSED
 
-### Completed This Session
+## Applied Changes (in tree)
+- `hadamard_utils.py`: added `_SR_SEED_BUFS`/`_SR_OFFSET_BUFS` dicts, `get_sr_buffers()`, pre-alloc in `prepare_for_cuda_graph()`
+- `nvfp4_linear.py`: `.random_()` → `get_sr_buffers() + torch.randint + copy_ + add_(1)`
+- `test_nvfp4_tensor.py`: added `test_nvfp4_mm_triton_backward_sr_diversity_compiled_backward`
 
-**1. `get_tma_workspace` renamed → `prepare_for_cuda_graph`**
-`hadamard_utils.py`: renamed, docstring updated. All call sites in source + test files updated.
-
-**2. `seed_buf` renamed → `seed_base`**
-`hadamard_quantize_row_col_triton.py`: `mutates_args=("seed_base",)`, function param, body, `register_fake` — all updated. Stale `philox_seed_base` docstring fixed.
-
-**3. Backward SR seeds fixed**
-`nvfp4_linear.py` backward: replaced `torch.randint()` (pool-allocates, frozen) with `torch.empty() + .random_()`. Under `torch.compile(mode="reduce-overhead")` cudagraph trees, the `.random_()` CUDA RNG kernel advances each replay → SR diversity.
-
-Key constraint: global pre-allocated tensors (via `get_sr_bufs()`) cannot be passed to `triton_rht_quantize_row_col` inside a compiled region — the custom_op's FakeTensor dispatch requires all tensor inputs to be FakeTensors, and real tensors from globals fail with `AssertionError: Please convert all Tensors to FakeTensors first`. Locally-created tensors (via `torch.empty()`) are FakeTensors during tracing.
-
-**4. TMA allocator self-install restored**
-- `hadamard_amax_triton.py`: added `prepare_for_cuda_graph` import + 3-line allocator block in `triton_rht_amax()`
-- `quantize_2d_triton.py`: added allocator block in `triton_weight_quantize_2d()` (base fn, not just the wrapper)
-
-**5. Forward `_fwd_seed_buf` / `_fwd_offset_buf` cleaned up**
-`nvfp4_linear.py` forward: uses `torch.empty()` for both. SR=False, kernel ignores them. Passes as keyword args `seed_base=` / `offset_base=`.
-
-**6. Dead code removed**
-`hadamard_utils.py`: `_SR_BUFS` dict and `get_sr_bufs()` accessor removed (were unused after FakeTensor constraint was discovered).
-
-## Test Results
+## Outstanding Failure
+`test_nvfp4_mm_triton_backward_sr_diversity_compiled_backward` fails on first forward call:
 ```
-test_triton_rht_quantize_row_col_cuda_graph_compile       PASSED
-test_triton_weight_quantize_2d_colwise_cuda_graph_compile PASSED
-test_nvfp4_mm_triton_cuda_graph_compile                   PASSED
-130 passed (1 pre-existing unrelated MSLK failure excluded)
+hadamard_amax_triton.py:180 → get_rht_matrix(...).to(bfloat16)
+→ FunctionalTensor.to() → AttributeError: 'NoneType' object has no attribute 'export'
 ```
 
-## Remaining Gap
-**Backward SR diversity unverified.** No test asserts that compiled backward produces different `grad_weight` values across replays. The `.empty() + .random_()` pattern is believed correct (cudagraph trees advances CUDA RNG offset each replay) but empirically unverified.
+### Root Cause Chain
+1. `@torch.compile(fullgraph=True)` on `fwd` triggers AOT autograd
+2. AOT autograd joint-traces forward + backward in functional dispatch mode
+3. `triton_rht_quantize_row_col` has `mutates_args=("seed_base",)` → `adinplaceorview` dispatch executes real backend during tracing
+4. Backend calls `triton_rht_amax` → `get_rht_matrix(...).to(bfloat16)` on `lru_cache` real tensor
+5. Under functional dispatch mode, `.to()` dereferences `_detect_infra_mode(FUNCTIONAL).export` → `None` → crash
 
-## Next Action
-Write a backward SR diversity test:
-```python
-# compile forward+backward under reduce-overhead
-# run 3 warmup backward passes
-# assert grad_weight differs between replay 4 and replay 5
-```
+## Three Approaches to Fix
 
-## Why
-This validates the key correctness claim. If it fails, the approach needs revision (e.g., external seed passing via function args, register_hook pattern).
-
-## Expected Outcome
-Test should pass: cudagraph trees is documented to advance CUDA RNG offset between replays.
-
-## Confidence
-HIGH (compilation, forward tests) / MEDIUM (backward SR diversity empirically unverified)
-
-## Risk
-LOW — all existing tests pass.
+| Approach | Description | Risk |
+|---|---|---|
+| A | Wrap `triton_rht_amax` as a custom_op with `register_fake` so AOT doesn't trace into it | Medium — requires fake implementation |
+| B | In `triton_rht_amax`, detach/clone the RHT matrix before `.to()`: `get_rht_matrix(...).detach().to(bfloat16)` | Low — minimal change, may sidestep FunctionalTensor |
+| C | Pre-compute the bfloat16 matrix in `get_rht_matrix` or cache the converted version so `.to()` is never called during dispatch | Low — purely additive |
 
 ## Best Next Mode
-Implementer — add backward SR diversity test.
+Debugger — confirm which approach unblocks the FunctionalTensor issue in `hadamard_amax_triton.py:180`.

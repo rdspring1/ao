@@ -29,7 +29,7 @@ from torchao.prototype.custom_fp_utils import RoundingMode
 from torchao.prototype.mx_formats.hadamard_quantize_row_col_triton import (
     triton_rht_quantize_row_col,
 )
-from torchao.prototype.mx_formats.hadamard_utils import prepare_for_cuda_graph  # noqa: F401 (re-exported for user convenience)
+from torchao.prototype.mx_formats.hadamard_utils import get_sr_buffers, prepare_for_cuda_graph  # noqa: F401 (re-exported for user convenience)
 from torchao.prototype.mx_formats.kernels import triton_quantize_nvfp4
 from torchao.prototype.mx_formats.nvfp4_tensor import (
     NVFP4Tensor,
@@ -298,12 +298,13 @@ class nvfp4_mm_triton(torch.autograd.Function):
         # -----------------------------------------------------------
         # GEMM 3: dy_col.T @ x_col → grad_weight  (col RHT + SR)
         # -----------------------------------------------------------
-        # .random_() on fresh empty tensors: CUDA RNG kernel, advanced by cudagraph trees
-        # each replay → SR diversity without new allocations from torch.randint().
-        dy_sr_seed_buf = torch.empty((1,), dtype=torch.int64, device=grad_output_2d.device)
-        dy_sr_seed_buf.random_()
-        dy_sr_offset_buf = torch.empty((1,), dtype=torch.int64, device=grad_output_2d.device)
-        dy_sr_offset_buf.random_()
+        # Persistent buffers updated with Dynamo-safe ops so compiled_autograd works.
+        # torch.randint (out-of-place) + copy_ avoids Dynamo's ban on in-place .random_().
+        # offset_buf.add_(1) gives monotonically unique Philox counters without .item() sync.
+        dy_sr_seed_buf, dy_sr_offset_buf = get_sr_buffers(grad_output_2d.device)
+        new_seed = torch.randint(-(2**63), 2**63 - 1, (1,), dtype=torch.int64, device=grad_output_2d.device)
+        dy_sr_seed_buf.copy_(new_seed)
+        dy_sr_offset_buf.add_(1)
         dy_col_codes, dy_col_sf, dy_col_amax, _, _, _ = triton_rht_quantize_row_col(
             grad_output_2d,
             stochastic_rounding=True,

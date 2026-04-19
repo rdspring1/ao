@@ -997,3 +997,44 @@ def test_nvfp4_mm_triton_cuda_graph_compile():
     nvfp4_out = nvfp4_linear(x_hp, w_hp, kernel_preference=KernelPreference.TRITON)
     sqnr = compute_error(ref, nvfp4_out)
     assert sqnr >= 15.0, f"Forward SQNR {sqnr:.2f} dB < 15 dB"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.skipif(
+    not is_sm_at_least_100(),
+    reason="CUDA capability >= 10.0 required for nvfp4 triton kernel",
+)
+def test_nvfp4_mm_triton_backward_sr_diversity_compiled_backward():
+    from torchao.prototype.mx_formats.nvfp4_linear import nvfp4_mm_triton
+    from torchao.prototype.mx_formats.hadamard_utils import prepare_for_cuda_graph
+    from torchao.quantization.quantize_.common.kernel_preference import KernelPreference
+
+    M, K, N = 128, 128, 128
+    prepare_for_cuda_graph(torch.device("cuda"))
+
+    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda", requires_grad=True)
+    w = torch.randn(N, K, dtype=torch.bfloat16, device="cuda", requires_grad=True)
+
+    @torch.compile(mode="reduce-overhead", fullgraph=True)
+    def fwd(inp, wt):
+        return nvfp4_mm_triton.apply(inp, wt, None, KernelPreference.TRITON).sum()
+
+    compiled_bwd = torch.compile(fullgraph=True, mode="reduce-overhead")
+
+    def one_step():
+        x.grad = None
+        w.grad = None
+        loss = fwd(x, w)
+        with torch._dynamo.compiled_autograd.enable(compiled_bwd):
+            loss.backward()
+        return w.grad.detach().clone()
+
+    for _ in range(3):
+        one_step()
+
+    g1 = one_step()
+    g2 = one_step()
+
+    assert not torch.equal(g1, g2), (
+        "Backward SR grad_weight should differ across compiled backward runs"
+    )
