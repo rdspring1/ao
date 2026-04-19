@@ -1005,29 +1005,24 @@ def test_nvfp4_mm_triton_cuda_graph_compile():
     reason="CUDA capability >= 10.0 required for nvfp4 triton kernel",
 )
 def test_nvfp4_mm_triton_backward_sr_diversity_compiled_backward():
-    from torchao.prototype.mx_formats.nvfp4_linear import nvfp4_mm_triton
+    from torchao.prototype.mx_formats.nvfp4_linear import Nvfp4Linear
     from torchao.prototype.mx_formats.hadamard_utils import prepare_for_cuda_graph
-    from torchao.quantization.quantize_.common.kernel_preference import KernelPreference
 
     M, K, N = 128, 128, 128
     prepare_for_cuda_graph(torch.device("cuda"))
 
+    layer = Nvfp4Linear(K, N, bias=False).cuda().to(torch.bfloat16)
     x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda", requires_grad=True)
-    w = torch.randn(N, K, dtype=torch.bfloat16, device="cuda", requires_grad=True)
 
-    @torch.compile(mode="reduce-overhead", fullgraph=True)
-    def fwd(inp, wt):
-        return nvfp4_mm_triton.apply(inp, wt, None, KernelPreference.TRITON).sum()
-
+    compiled_layer = torch.compile(layer, mode="reduce-overhead", fullgraph=True)
     compiled_bwd = torch.compile(fullgraph=True, mode="reduce-overhead")
 
     def one_step():
         x.grad = None
-        w.grad = None
-        loss = fwd(x, w)
-        with torch._dynamo.compiled_autograd.enable(compiled_bwd):
-            loss.backward()
-        return w.grad.detach().clone()
+        layer.weight.grad = None
+        with torch._dynamo.compiled_autograd._enable(compiled_bwd):
+            compiled_layer(x).sum().backward()
+        return layer.weight.grad.detach().clone()
 
     for _ in range(3):
         one_step()

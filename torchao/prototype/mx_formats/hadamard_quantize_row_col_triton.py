@@ -199,7 +199,7 @@ def _hadamard_quantize_row_col_kernel(
                 )
 
 
-@torch.library.custom_op("torchao::triton_rht_quantize_row_col", mutates_args=("seed_base",))
+@torch.library.custom_op("torchao::triton_rht_quantize_row_col", mutates_args=())
 def triton_rht_quantize_row_col(
     A: torch.Tensor,
     seed_base: torch.Tensor,
