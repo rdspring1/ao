@@ -30,13 +30,16 @@ from torchao.prototype.mx_formats.nvfp4_tensor import (
     per_tensor_amax_to_scale,
 )
 from torchao.prototype.mx_formats.utils import to_blocked
-from torchao.utils import is_sm_at_least_100
+from torchao.utils import is_sm_at_least_100, torch_version_at_least
 
 if is_sm_at_least_100():
     from torchao.prototype.mx_formats.hadamard_quantize_row_col_triton import (
         triton_rht_quantize_row_col,
     )
-    from torchao.prototype.mx_formats.hadamard_utils import get_rht_matrix
+    from torchao.prototype.mx_formats.hadamard_utils import (
+        get_rht_matrix,
+        prepare_for_cuda_graph,
+    )
 
 # M must be ≥ 128 (BLOCK_M minimum). M=32/64/96 excluded.
 _M_VALUES = [128, 160, 256, 512]
@@ -119,11 +122,18 @@ def _dequantize(
     """Decode packed FP4 codes via NVFP4Tensor.dequantize()."""
     # orig_dtype=bfloat16: all test inputs are bfloat16; affects only the default
     # output dtype of dequantize(), overridden by the explicit .float() call below.
-    return NVFP4Tensor(
-        codes, scales, 16, torch.bfloat16,
-        per_tensor_scale=per_tensor_amax_to_scale(global_amax),
-        is_swizzled_scales=True,
-    ).dequantize().float()
+    return (
+        NVFP4Tensor(
+            codes,
+            scales,
+            16,
+            torch.bfloat16,
+            per_tensor_scale=per_tensor_amax_to_scale(global_amax),
+            is_swizzled_scales=True,
+        )
+        .dequantize()
+        .float()
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -155,13 +165,18 @@ def test_triton_rht_quantize_rtne_scales_vs_reference(M, N, compute_rowwise):
     A = torch.randn(M, N, dtype=torch.bfloat16, device="cuda")
 
     _, ref_col_sf, _ = _rht_quantize_reference(A)
-    tri_col_codes, tri_col_sf, tri_col_amax, tri_row_codes, tri_row_sf, tri_row_amax = (
-        triton_rht_quantize_row_col(
-            A,
-            stochastic_rounding=False,
-            compute_rowwise=compute_rowwise,
-            sign_vector=_HARDCODED_SIGN_VECTOR,
-        )
+    (
+        tri_col_codes,
+        tri_col_sf,
+        tri_col_amax,
+        tri_row_codes,
+        tri_row_sf,
+        tri_row_amax,
+    ) = triton_rht_quantize_row_col(
+        A,
+        stochastic_rounding=False,
+        compute_rowwise=compute_rowwise,
+        sign_vector=_HARDCODED_SIGN_VECTOR,
     )
 
     # Columnwise scale check
@@ -177,7 +192,9 @@ def test_triton_rht_quantize_rtne_scales_vs_reference(M, N, compute_rowwise):
             tri_row_sf.flatten(), to_blocked(ref_row_sf), atol=0, rtol=0
         )
     else:
-        assert tri_row_sf is None
+        # compute_rowwise=False: rowwise outputs are dummy (1,) tensors (not None),
+        # as required by the custom_op fixed-tuple return type.
+        assert tri_row_sf.numel() == 1
 
 
 @pytest.mark.skipif(not is_sm_at_least_100(), reason="Requires SM100+")
@@ -198,18 +215,25 @@ def test_triton_rht_quantize_rtne_sqnr(M, N, compute_rowwise):
     torch.manual_seed(42)
     A = torch.randn(M, N, dtype=torch.bfloat16, device="cuda")
 
-    tri_col_codes, tri_col_sf, tri_col_amax, tri_row_codes, tri_row_sf, tri_row_amax = (
-        triton_rht_quantize_row_col(
-            A,
-            stochastic_rounding=False,
-            compute_rowwise=compute_rowwise,
-            sign_vector=_HARDCODED_SIGN_VECTOR,
-        )
+    (
+        tri_col_codes,
+        tri_col_sf,
+        tri_col_amax,
+        tri_row_codes,
+        tri_row_sf,
+        tri_row_amax,
+    ) = triton_rht_quantize_row_col(
+        A,
+        stochastic_rounding=False,
+        compute_rowwise=compute_rowwise,
+        sign_vector=_HARDCODED_SIGN_VECTOR,
     )
 
     # Columnwise SQNR: dequantized should reconstruct RHT(A.T)
     ref_rht = _rht_reference(A).float()
-    col_sqnr = compute_error(ref_rht, _dequantize(tri_col_codes, tri_col_sf, tri_col_amax))
+    col_sqnr = compute_error(
+        ref_rht, _dequantize(tri_col_codes, tri_col_sf, tri_col_amax)
+    )
     assert col_sqnr >= 20.0, f"Col SQNR {col_sqnr:.2f} dB < 20.0 dB for M={M} N={N}"
 
     # Rowwise SQNR: dequantized should reconstruct raw A
@@ -255,11 +279,19 @@ def test_triton_rht_quantize_rs_midpoint_distribution():
     count_hi = 0  # code 3 = 1.5
 
     for _ in range(N_SAMPLES):
+        _seed_buf = torch.randint(
+            -(2**63), 2**63 - 1, (1,), dtype=torch.int64, device=A.device
+        )
+        _offset_buf = torch.randint(
+            -(2**63), 2**63 - 1, (1,), dtype=torch.int64, device=A.device
+        )
         col_codes, _, _, _, _, _ = triton_rht_quantize_row_col(
             A,
             stochastic_rounding=True,
             compute_rowwise=False,
             sign_vector=_HARDCODED_SIGN_VECTOR,
+            seed_base=_seed_buf,
+            offset_base=_offset_buf,
         )
         # Unpack col_codes (N_RHT, M_RHT//2) uint8 → (N_RHT, M_RHT) nibbles
         lo = (col_codes & 0xF).long()
@@ -305,7 +337,9 @@ def test_triton_rht_quantize_rs_at_most_one_fp4_step_from_rtne():
         """Unpack (R, C//2) uint8 → (R, C) nibble values."""
         lo = (codes & 0xF).long()
         hi = (codes >> 4).long()
-        out = torch.empty(codes.shape[0], codes.shape[1] * 2, dtype=torch.long, device=codes.device)
+        out = torch.empty(
+            codes.shape[0], codes.shape[1] * 2, dtype=torch.long, device=codes.device
+        )
         out[:, ::2] = lo
         out[:, 1::2] = hi
         return out
@@ -321,11 +355,19 @@ def test_triton_rht_quantize_rs_at_most_one_fp4_step_from_rtne():
     rn_mag = rn_nibs & 0x7
 
     for _ in range(N_SAMPLES):
+        _seed_buf = torch.randint(
+            -(2**63), 2**63 - 1, (1,), dtype=torch.int64, device=A.device
+        )
+        _offset_buf = torch.randint(
+            -(2**63), 2**63 - 1, (1,), dtype=torch.int64, device=A.device
+        )
         col_rs, _, _, _, _, _ = triton_rht_quantize_row_col(
             A,
             stochastic_rounding=True,
             compute_rowwise=False,
             sign_vector=_HARDCODED_SIGN_VECTOR,
+            seed_base=_seed_buf,
+            offset_base=_offset_buf,
         )
         rs_nibs = _unpack(col_rs)
         rs_sign = rs_nibs >> 3
@@ -333,10 +375,68 @@ def test_triton_rht_quantize_rs_at_most_one_fp4_step_from_rtne():
 
         # Sign must match RTNE (RS preserves sign; exception: both sides of zero are sign=0)
         nonzero = (rs_mag != 0) | (rn_mag != 0)
-        assert ((rs_sign == rn_sign) | ~nonzero).all(), "RS changed sign relative to RTNE"
+        assert (
+            (rs_sign == rn_sign) | ~nonzero
+        ).all(), "RS changed sign relative to RTNE"
 
         # Magnitude index must be at most 1 step from RTNE
         mag_diff = (rs_mag - rn_mag).abs()
-        assert (mag_diff <= 1).all(), (
-            f"RS magnitude index differs by {mag_diff.max().item()} from RTNE (must be ≤1)"
+        assert (
+            mag_diff <= 1
+        ).all(), f"RS magnitude index differs by {mag_diff.max().item()} from RTNE (must be ≤1)"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.skipif(not is_sm_at_least_100(), reason="Requires SM100+")
+@pytest.mark.skipif(
+    not torch_version_at_least("2.8.0"), reason="torch.compile requires PyTorch 2.8+"
+)
+def test_triton_rht_quantize_row_col_cuda_graph_compile():
+    """triton_rht_quantize_row_col (SR, compute_rowwise=False) under reduce-overhead CUDA graphs.
+
+    Verifies:
+      1. torch.compile(fullgraph=True, mode='reduce-overhead') succeeds without
+         pool-allocation errors or FakeTensor errors.
+      2. SR output varies between replays when seed_buf is mutated between calls
+         (mutates_args=("seed_buf",) gives the tensor a stable static-buffer address
+         so the kernel's captured seed pointer sees updated values on replay).
+      3. SR is being applied: compiled output differs from RTNE reference.
+    """
+    shape = (128, 256)
+    A = torch.randn(*shape, dtype=torch.bfloat16, device="cuda")
+    prepare_for_cuda_graph(
+        A.device
+    )  # pre-allocate TMA scratch + SR bufs outside pool context
+
+    # Pre-allocate seed_buf OUTSIDE torch.compile so its address is stable.
+    seed_buf = torch.randint(
+        -(2**63), 2**63 - 1, (1,), dtype=torch.int64, device=A.device
+    )
+
+    def run(data):
+        offset = torch.randint(
+            -(2**63), 2**63 - 1, (1,), dtype=torch.int64, device=A.device
         )
+        col_fp4, _, _, _, _, _ = triton_rht_quantize_row_col(
+            data,
+            stochastic_rounding=True,
+            compute_rowwise=False,
+            seed_base=seed_buf,
+            offset_base=offset,
+        )
+        return col_fp4.clone()
+
+    compiled = torch.compile(run, mode="reduce-overhead", fullgraph=True)
+    for _ in range(3):
+        compiled(A)  # warmup
+
+    # SR output should differ when seed_buf is updated between replays
+    r1 = compiled(A)
+    r2 = compiled(A)
+    assert not torch.equal(r1, r2), "SR outputs should differ with different seeds"
+
+    # SR IS applied: output should differ from round-to-nearest reference
+    rtne_ref, _, _, _, _, _ = triton_rht_quantize_row_col(
+        A, stochastic_rounding=False, compute_rowwise=False
+    )
+    assert not torch.equal(r1, rtne_ref), "SR should produce different output than RTNE"

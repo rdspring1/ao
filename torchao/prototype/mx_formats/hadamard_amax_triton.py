@@ -11,7 +11,7 @@ import triton
 import triton.language as tl
 import torch
 import torch.nn.functional as F
-from torchao.prototype.mx_formats.hadamard_utils import get_rht_matrix, _compute_pid
+from torchao.prototype.mx_formats.hadamard_utils import get_rht_matrix, prepare_for_cuda_graph, _compute_pid
 from torchao.utils import is_sm_at_least_90
 
 # SM90+ autotune configs. BLOCK_M must be divisible by 16 (RHT reshape constraint).
@@ -165,19 +165,14 @@ def triton_rht_amax(
         )
     M, N = A.shape
 
+    if hasattr(triton, "set_allocator"):
+        _ws = prepare_for_cuda_graph(A.device)
+        triton.set_allocator(lambda size, align, stream: _ws[:max(size, 1)])
+
     NUM_SMS = torch.cuda.get_device_properties(A.device).multi_processor_count
     GROUP_SIZE_N: int = 8  # L2 reuse grouping along M
 
-    # tl.make_tensor_descriptor requires a Triton allocator for per-CTA scratch space.
-    # Outside torch.compile, none is set by default; mirror what torch._inductor does.
-    if hasattr(triton, "set_allocator"):
-        triton.set_allocator(
-            lambda size, align, stream: torch.empty(
-                size, dtype=torch.int8, device=A.device
-            )
-        )
-
-    B = get_rht_matrix(sign_vector=sign_vector, device=A.device, hadamard_dimension=hadamard_dimension).to(torch.bfloat16)
+    B = get_rht_matrix(sign_vector, A.device, torch.bfloat16, hadamard_dimension)
     global_rht_amax = torch.zeros((), dtype=torch.float32, device=A.device)
     global_a_amax = torch.zeros((), dtype=torch.float32, device=A.device)
 
