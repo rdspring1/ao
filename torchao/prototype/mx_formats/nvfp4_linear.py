@@ -396,9 +396,18 @@ def nvfp4_linear(
 class Nvfp4Linear(nn.Module):
     """NVFP4 linear layer with CUDA-graph-safe stochastic rounding.
 
-    Two independent fixed seeds give uncorrelated Philox streams for the two
-    backward GEMMs. One shared sr_offset counter is advanced externally after
-    optimizer.step() via advance_sr_offset() — never mutated inside the graph.
+    Seeds are fixed module buffers (constant-fold by torch.compile is correct and
+    desirable). sr_offset lives at training-script scope and is passed as an explicit
+    argument so torch.compile treats it as a live graph input, not a closure constant.
+
+    Training loop pattern:
+        sr_offset = torch.zeros(1, dtype=torch.int64, device="cuda")
+        for step in range(num_steps):
+            out = model(x, sr_offset)
+            loss.backward()
+            optimizer.step()
+            with torch.no_grad():
+                sr_offset.add_(1)
     """
 
     def __init__(
@@ -417,6 +426,7 @@ class Nvfp4Linear(nn.Module):
         self.bias = (
             nn.Parameter(torch.empty(out_features, **factory_kwargs)) if bias else None
         )
+        # Seeds are truly fixed — module buffers (torch.compile may constant-fold; that's correct).
         self.register_buffer(
             "sr_seed_rowwise_dy",
             torch.randint(-(2**63), 2**63 - 1, (1,), dtype=torch.int64),
@@ -425,14 +435,9 @@ class Nvfp4Linear(nn.Module):
             "sr_seed_colwise_rht_dy_t",
             torch.randint(-(2**63), 2**63 - 1, (1,), dtype=torch.int64),
         )
-        self.register_buffer("sr_offset", torch.zeros((1,), dtype=torch.int64))
+        # sr_offset is NOT a module buffer — it lives at training-script scope.
 
-    @torch.no_grad()
-    def advance_sr_offset(self):
-        """Advance the SR offset counter. Call after optimizer.step(), outside the CUDA graph."""
-        self.sr_offset.add_(1)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, sr_offset: torch.Tensor) -> torch.Tensor:
         return nvfp4_mm_triton.apply(
             x,
             self.weight,
@@ -440,7 +445,7 @@ class Nvfp4Linear(nn.Module):
             KernelPreference.TRITON,
             self.sr_seed_rowwise_dy,
             self.sr_seed_colwise_rht_dy_t,
-            self.sr_offset,
+            sr_offset,
         )
 
 

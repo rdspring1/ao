@@ -1013,26 +1013,28 @@ def test_nvfp4_mm_triton_backward_sr_diversity_compiled_backward():
 
     layer = Nvfp4Linear(K, N, bias=False).cuda().to(torch.bfloat16)
     x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda", requires_grad=True)
+    # sr_offset lives at script scope — explicit argument so torch.compile treats it
+    # as a live graph input, not a closure constant.
+    sr_offset = torch.zeros(1, dtype=torch.int64, device="cuda")
 
     compiled_layer = torch.compile(layer, mode="reduce-overhead", fullgraph=True)
     compiled_bwd = torch.compile(fullgraph=True, mode="reduce-overhead")
 
-    def one_step():
+    def one_step(sr_offset):
         x.grad = None
         layer.weight.grad = None
         with torch._dynamo.compiled_autograd._enable(compiled_bwd):
-            compiled_layer(x).sum().backward()
-        # advance_sr_offset() is called OUTSIDE the graph, after backward completes,
-        # mirroring the training loop pattern: optimizer.step() then advance_sr_offset().
-        layer.advance_sr_offset()
+            compiled_layer(x, sr_offset).sum().backward()
+        with torch.no_grad():
+            sr_offset.add_(1)
         return layer.weight.grad.detach().clone()
 
     for _ in range(3):
-        one_step()
+        one_step(sr_offset)
 
-    g1 = one_step()
-    g2 = one_step()
+    g1 = one_step(sr_offset)
+    g2 = one_step(sr_offset)
 
     assert not torch.equal(g1, g2), (
-        "Backward SR grad_weight should differ across steps after advance_sr_offset()"
+        "Backward SR grad_weight should differ across steps (offset incremented each step)"
     )
