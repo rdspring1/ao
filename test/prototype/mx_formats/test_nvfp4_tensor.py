@@ -1022,6 +1022,9 @@ def test_nvfp4_mm_triton_backward_sr_diversity_compiled_backward():
         layer.weight.grad = None
         with torch._dynamo.compiled_autograd._enable(compiled_bwd):
             compiled_layer(x).sum().backward()
+        # advance_sr_offset() is called OUTSIDE the graph, after backward completes,
+        # mirroring the training loop pattern: optimizer.step() then advance_sr_offset().
+        layer.advance_sr_offset()
         return layer.weight.grad.detach().clone()
 
     for _ in range(3):
@@ -1031,5 +1034,5 @@ def test_nvfp4_mm_triton_backward_sr_diversity_compiled_backward():
     g2 = one_step()
 
     assert not torch.equal(g1, g2), (
-        "Backward SR grad_weight should differ across compiled backward runs"
+        "Backward SR grad_weight should differ across steps after advance_sr_offset()"
     )

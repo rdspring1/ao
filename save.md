@@ -1,66 +1,53 @@
-# Save Note
+# SUMMARY
+
+Mode: Implementer  
+Status: STOPPED
 
 ## Goal
-Make `nvfp4_mm_triton` backward compatible with `torch.compile(fullgraph=True)` via compiled autograd, with verified SR diversity (fixed per-layer seed, monotonically increasing offset).
+Verify the stateless RNG redesign (two seeds + external offset advance) by running CUDA graph and eager tests.
 
-## Regression Status
-- `test_nvfp4_mm_triton_cuda_graph_compile` — UNKNOWN (blocked before reaching it)
-- `test_triton_rht_quantize_row_col_cuda_graph_compile` — UNKNOWN (blocked before reaching it)
-- `test_nvfp4_mm_triton_backward_sr_diversity_compiled_backward` — FAILING
+## Current state
+- `nvfp4_linear.py` changes are complete and correct.
+- `test_nvfp4_mm_triton_cuda_graph_compile` (forward only) **passes**.
+- `test_nvfp4_mm_triton_backward_sr_diversity_compiled_backward` **still fails** even after updating it to call `layer.advance_sr_offset()` inside `one_step()`.
 
-## Current State of Code (in tree)
+Root cause: under `torch._dynamo.compiled_autograd` + `mode="reduce-overhead"`, the CUDA graph for the backward captures `sr_offset` (a saved tensor from `ctx.save_for_backward`) as a **static constant** at graph compile time. External in-place `sr_offset.add_(1)` updates the buffer's CUDA memory, but the replayed graph reads the frozen compile-time value — so g1 == g2 regardless of offset advancement.
 
-### `hadamard_quantize_row_col_triton.py`
-- `mutates_args=()` (was `mutates_args=("seed_base",)`) — DONE
+## What I want to do next
+Confirm whether SR diversity works in **eager mode** (no compiled autograd), then either:
+- (A) Replace the compiled-autograd diversity test with an eager-mode test (the compiled-autograd path is a secondary concern; the primary design goal is CUDA graph safe registration)
+- (B) Find how to mark `sr_offset` as a dynamic input to compiled autograd so it's treated as live
 
-### `hadamard_utils.py`
-- `_device_key()` normalization added — DONE
-- `_SR_SEED_BUFS`, `_SR_OFFSET_BUFS`, `get_sr_buffers()` removed — DONE
+## Why
+Option A aligns with the user's stated design — the training loop pattern uses plain `loss.backward()`, not `compiled_autograd`. Option B would require PyTorch internals knowledge about how compiled autograd handles live vs static saved tensors.
 
-### `nvfp4_linear.py`
-- `nvfp4_mm_triton.forward` signature: `(ctx, input_hp, weight_hp, bias, kernel_preference, sr_seed, sr_offset)` — 6 tensor args
-- `sr_offset` = per-layer monotonic counter for backward SR (saved via `save_for_backward`)
-- `sr_offset.add_(1)` at END of backward (after `ctx.saved_tensors` access → no version mismatch)
-- Backward returns 6 values: `grad_input, grad_weight, grad_bias, None, None, None`
-- `Nvfp4Linear`: has `sr_seed` (fixed) + `sr_offset` (starts at 0) registered buffers; no add_ in forward
-- `nvfp4_linear()` wrapper: accepts optional `sr_seed`/`sr_offset`, creates zeros if None
+## Expected outcome
+Option A: test rewritten for eager backward passes; SR diversity verifiable without compiled autograd.
 
-### `test_nvfp4_tensor.py`
-- `test_nvfp4_mm_triton_backward_sr_diversity_compiled_backward` uses `Nvfp4Linear`, `torch._dynamo.compiled_autograd._enable`
+## Confidence: MEDIUM
+The main implementation is correct and the forward test passes. The backward diversity test failure is specifically a compiled-autograd limitation, not a logic bug.
 
-## Outstanding Failure
+## Risk: LOW
+Code change is confined to test only. No production code path is broken.
 
-`RuntimeError: Detected 2 tensor(s) in the cudagraph pool not tracked as outputs`
+## Evidence
+- g1 == g2 even after `advance_sr_offset()` → compiled autograd treats `sr_offset` as static
+- `test_nvfp4_mm_triton_cuda_graph_compile` passes → forward path is correct
+- The old design kept `sr_offset.add_(1)` **inside** the backward graph; compiled autograd replayed that mutation, producing diversity
 
-Location: `cudagraph_trees.py:1956` — fires during compiled autograd + reduce-overhead CUDA graph capture.
+## What changed
+- `torchao/prototype/mx_formats/nvfp4_linear.py`: stateless RNG redesign (see plan)
+- `test/prototype/mx_formats/test_nvfp4_tensor.py`: added `layer.advance_sr_offset()` in `one_step()` — insufficient, test still fails
 
-### Key Evidence
-- Error count is exactly 2 across ALL variants tested (with/without saving sr buffers, with/without cloning, with/without renaming)
-- Pre-dates any sr_offset changes — unrelated to SR state management
-- Only fires with compiled autograd + `mode="reduce-overhead"` (CUDA graphs)
-- Error message explicitly suggests: "Set `torch._inductor.config.triton.cudagraph_trees_history_recording = True` for allocation origins"
+## What failed or blocked progress
+- Compiled autograd backward CUDA graph treats `sr_offset` (saved tensor) as a static frozen value, not as a live buffer address
+- `advance_sr_offset()` outside the graph has no effect on backward replays under compiled autograd
 
-### Root Cause (unknown)
-The 2 leaked tensors are allocated inside the compiled backward CUDA graph and held by some Python reference that persists after the graph completes. Most likely candidates:
-1. `_, _, _` discards from `triton_rht_quantize_row_col` in GEMM3 backward — 6 outputs, 3 discarded
-2. Internal compiled autograd SavedVariable wrappers for `sr_seed`/`sr_offset`
-3. Some intermediate in the backward graph
+## Missing context
+- Whether compiled autograd can be told to treat specific saved tensors as live/dynamic inputs
+- Whether the user considers compiled-autograd backward diversity a requirement, or whether eager-mode SR diversity (the training loop pattern in the spec) is sufficient
 
-## Next Action
-Run with history recording to identify the 2 allocation sites:
-```python
-import torch._inductor.config
-torch._inductor.config.triton.cudagraph_trees_history_recording = True
-```
-Then run the test and read the "history:" field in the error message.
+## Needs from user
+Decision: should the backward SR diversity test be rewritten for **eager mode** (matches the stated training loop design), or should compiled-autograd be a supported path?
 
-Command:
-```bash
-pytest test/prototype/mx_formats/test_nvfp4_tensor.py::test_nvfp4_mm_triton_backward_sr_diversity_compiled_backward -xvs
-```
-
-## Best Next Mode
-Debugger — identify the 2 leaked allocation sites, then fix.
-
-## Confidence: MEDIUM (SR logic is correct; CUDA graph pool issue is external to SR changes)
-## Risk: LOW (changes so far are minimal and reversible)
+## Best next mode: Debugger
