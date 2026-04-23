@@ -166,8 +166,9 @@ def _ao_rowwise_quantize_sr(
     seed_base/offset_base are read-only; no mutation inside this function.
     """
     global_scale = per_tensor_amax_to_scale(x.abs().max())
-    seed = (seed_base ^ offset_base).to(torch.int32)
-    scales, xq = triton_quantize_nvfp4(x, global_scale, RoundingMode.RS.value, seed)
+    scales, xq = triton_quantize_nvfp4(
+        x, global_scale, RoundingMode.RS.value, seed_base, offset_base
+    )
     return xq.view(torch.float4_e2m1fn_x2), scales, global_scale
 
 
