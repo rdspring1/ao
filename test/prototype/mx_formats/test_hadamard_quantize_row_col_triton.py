@@ -424,15 +424,15 @@ def test_triton_rht_quantize_row_col_cuda_graph_compile():
             seed_base=seed_buf,
             offset_base=offset,
         )
-        return col_fp4.clone()
+        return col_fp4
 
     compiled = torch.compile(run, mode="reduce-overhead", fullgraph=True)
     for _ in range(3):
         compiled(A)  # warmup
 
     # SR output should differ when seed_buf is updated between replays
-    r1 = compiled(A)
-    r2 = compiled(A)
+    r1 = compiled(A).clone()
+    r2 = compiled(A).clone()
     assert not torch.equal(r1, r2), "SR outputs should differ with different seeds"
 
     # SR IS applied: output should differ from round-to-nearest reference

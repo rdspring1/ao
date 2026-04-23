@@ -223,6 +223,7 @@ def triton_rht_quantize_row_col(
     compute_rowwise: bool = True,
     sign_vector: List[int] | None = None,
     hadamard_dimension: int = 16,
+    scaling_type: int = int(F.ScalingType.TensorWise),
     seed_base: torch.Tensor | None = None,
     offset_base: torch.Tensor | None = None,
 ) -> Tuple[
@@ -247,6 +248,9 @@ def triton_rht_quantize_row_col(
         sign_vector: Sign vector for the RHT as a list of ints. None (default) generates
             a random cached sign vector via get_rht_matrix.
         hadamard_dimension: Dimension of the Hadamard matrix (default 16).
+        scaling_type: int encoding of F.ScalingType controlling reduction granularity
+            passed to triton_rht_amax. Pass F.ScalingType.TensorWise.value (default).
+            Only ScalingType.TensorWise is currently supported.
         seed_base: Pre-allocated int64 seed tensor for SR (size=(1,)). For correct
             stochastic rounding under torch.compile CUDA graphs, pre-allocate via
             prepare_for_cuda_graph(device) before compile; use .random_() in the
@@ -302,12 +306,13 @@ def triton_rht_quantize_row_col(
         _ws = prepare_for_cuda_graph(A.device)
         triton.set_allocator(lambda size, align, stream: _ws[: max(size, 1)])
 
+    # scaling_type is int for custom_op compat; reconstruct enum for triton_rht_amax
     # Columnwise global amax: max(abs(RHT(A.t()))) and rowwise: max(abs(A)) — fused kernel
     col_global_amax, row_global_amax = triton_rht_amax(
         A,
         sign_vector=sv,
         hadamard_dimension=hadamard_dimension,
-        scaling_type=F.ScalingType.TensorWise,
+        scaling_type=F.ScalingType(scaling_type),
         compute_rowwise=compute_rowwise,
     )
 
@@ -383,6 +388,7 @@ def _(
     compute_rowwise=True,
     sign_vector=None,
     hadamard_dimension=16,
+    scaling_type=int(F.ScalingType.TensorWise),
     seed_base=None,
     offset_base=None,
 ):
