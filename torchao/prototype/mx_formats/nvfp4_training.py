@@ -18,7 +18,7 @@ Usage:
     quantize_(model, NVFP4TrainingConfig())
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 import torch
@@ -43,10 +43,17 @@ class NVFP4TrainingConfig(AOBaseConfig):
             TORCH: TorchAO native (round-to-nearest, no RHT).
             TE: TransformerEngine NVFP4Quantizer (stochastic rounding + RHT).
             AUTO: Use TE if available, else TORCH.
+            TRITON: Pure-Triton RHT + stochastic rounding path.
             Default: TORCH.
+        process_group: Optional ProcessGroup for column-parallel TP.
+            When set with kernel_preference=TRITON, forward dispatches to
+            nvfp4_col_parallel_linear (all-gather input, reduce-scatter dgrad).
+        world_size: TP world size.  Inferred from process_group if None.
     """
 
     kernel_preference: KernelPreference = KernelPreference.TORCH
+    process_group: Optional[object] = field(default=None, compare=False)
+    world_size: Optional[int] = None
 
 
 class NVFP4TrainingLinear(nn.Linear):
@@ -54,6 +61,10 @@ class NVFP4TrainingLinear(nn.Linear):
 
     Drop-in replacement for nn.Linear that quantizes activations, weights,
     and gradients to NVFP4 for all three training GEMMs.
+
+    When process_group is set and kernel_preference==TRITON the forward
+    uses the column-parallel protocol (sequence-parallel all-gather +
+    reduce-scatter).
     """
 
     def __init__(
@@ -62,13 +73,45 @@ class NVFP4TrainingLinear(nn.Linear):
         out_features: int,
         bias: bool = False,
         kernel_preference: KernelPreference = KernelPreference.TORCH,
+        process_group=None,
+        world_size: Optional[int] = None,
         device=None,
         dtype=None,
     ):
         super().__init__(in_features, out_features, bias, device=device, dtype=dtype)
         self.kernel_preference = kernel_preference
+        self.process_group = process_group
+        self.world_size = world_size
+        self._sr_seed: Optional[torch.Tensor] = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if (
+            self.process_group is not None
+            and self.kernel_preference == KernelPreference.TRITON
+        ):
+            from torchao.prototype.mx_formats.nvfp4_tensor_parallel import (
+                nvfp4_col_parallel_linear,
+            )
+            import torch.distributed as dist
+
+            ws = self.world_size
+            if ws is None:
+                ws = dist.get_world_size(self.process_group)
+            if self._sr_seed is None:
+                self._sr_seed = torch.randint(
+                    -(2**63), 2**63 - 1, (1,), dtype=torch.int64, device=x.device
+                )
+            w = self.weight
+            if hasattr(w, "to_local"):
+                w = w.to_local()
+            return nvfp4_col_parallel_linear(
+                x,
+                w,
+                self.bias,
+                sr_seed=self._sr_seed,
+                tp_group=self.process_group,
+                world_size=ws,
+            )
         return nvfp4_linear(
             x, self.weight, self.bias, kernel_preference=self.kernel_preference
         )
@@ -78,12 +121,16 @@ class NVFP4TrainingLinear(nn.Linear):
         cls,
         mod: nn.Linear,
         kernel_preference: KernelPreference = KernelPreference.TORCH,
+        process_group=None,
+        world_size: Optional[int] = None,
     ) -> "NVFP4TrainingLinear":
         new = cls(
             mod.in_features,
             mod.out_features,
             mod.bias is not None,
             kernel_preference=kernel_preference,
+            process_group=process_group,
+            world_size=world_size,
             device=mod.weight.device,
             dtype=mod.weight.dtype,
         )
@@ -106,5 +153,7 @@ def _nvfp4_training_transform(
         return NVFP4TrainingLinear.from_linear(
             module,
             kernel_preference=config.kernel_preference,
+            process_group=config.process_group,
+            world_size=config.world_size,
         )
     return module

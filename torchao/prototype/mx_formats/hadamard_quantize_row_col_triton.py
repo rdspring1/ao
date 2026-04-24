@@ -301,8 +301,7 @@ def triton_rht_quantize_row_col(
         _ws = prepare_for_cuda_graph(A.device)
         triton.set_allocator(lambda size, align, stream: _ws[: max(size, 1)])
 
-    # Resolve SR seeds: use caller-provided seeds for correct CUDA-graph SR behavior;
-    # fall back to generating internally for eager callers that omit them.
+    # Resolve SR seeds: use caller-provided seeds for correct CUDA-graph SR behavior.
     if stochastic_rounding:
         if col_seed_base is None:
             raise ValueError("stochastic_rounding=True requires col_seed_base tensor")
