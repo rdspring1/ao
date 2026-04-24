@@ -95,7 +95,7 @@ def test_triton_weight_quantize_2d_scales_vs_reference(M, N):
 
     ref_scales_expanded = _weight_quantize_2d_reference_scales(A)  # (M, N//16)
 
-    _, tri_scales, _, tri_t_scales, _ = triton_weight_quantize_2d(A)
+    _, tri_scales, _, tri_t_scales = triton_weight_quantize_2d(A, A.float().abs().max())
 
     ref_scales = _swizzle_py(ref_scales_expanded, M, N)
     torch.testing.assert_close(tri_scales, ref_scales, atol=0, rtol=0)
@@ -124,13 +124,10 @@ def test_triton_weight_quantize_2d_sqnr(M, N):
     torch.manual_seed(42)
     A = torch.randn(M, N, dtype=torch.bfloat16, device="cuda")
 
-    (
-        tri_codes,
-        tri_scales,
-        tri_t_codes,
-        tri_t_scales,
-        global_amax,
-    ) = triton_weight_quantize_2d(A)
+    global_amax = A.float().abs().max()
+    tri_codes, tri_scales, tri_t_codes, tri_t_scales = triton_weight_quantize_2d(
+        A, global_amax
+    )
 
     # NVFP4Tensor interprets (M, N//16) scales as rowwise block_size=16 scales,
     # which matches the 2D expanded layout since every 16 rows share the same scale.
@@ -186,7 +183,8 @@ def test_triton_weight_quantize_2d_cuda_graph_compile():
     )  # pre-allocate TMA scratch + SR bufs outside pool context
 
     def run(w):
-        codes, sf, t_codes, t_sf, amax = triton_weight_quantize_2d(w)
+        amax = w.float().abs().max()
+        codes, sf, t_codes, t_sf = triton_weight_quantize_2d(w, amax)
         return codes.clone()
 
     compiled = torch.compile(run, mode="reduce-overhead", fullgraph=True)

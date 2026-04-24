@@ -33,6 +33,7 @@ from torchao.prototype.mx_formats.utils import to_blocked
 from torchao.utils import is_sm_at_least_100, torch_version_at_least
 
 if is_sm_at_least_100():
+    from torchao.prototype.mx_formats.hadamard_amax_triton import triton_rht_amax
     from torchao.prototype.mx_formats.hadamard_quantize_row_col_triton import (
         triton_rht_quantize_row_col,
     )
@@ -165,18 +166,16 @@ def test_triton_rht_quantize_rtne_scales_vs_reference(M, N, compute_rowwise):
     A = torch.randn(M, N, dtype=torch.bfloat16, device="cuda")
 
     _, ref_col_sf, _ = _rht_quantize_reference(A)
-    (
-        tri_col_codes,
-        tri_col_sf,
-        tri_col_amax,
-        tri_row_codes,
-        tri_row_sf,
-        tri_row_amax,
-    ) = triton_rht_quantize_row_col(
+    col_amax, row_amax = triton_rht_amax(
+        A, sign_vector=list(_HARDCODED_SIGN_VECTOR), compute_rowwise=compute_rowwise
+    )
+    tri_col_codes, tri_col_sf, tri_row_codes, tri_row_sf = triton_rht_quantize_row_col(
         A,
         stochastic_rounding=False,
         compute_rowwise=compute_rowwise,
         sign_vector=_HARDCODED_SIGN_VECTOR,
+        col_global_amax=col_amax,
+        row_global_amax=row_amax,
     )
 
     # Columnwise scale check
@@ -215,32 +214,28 @@ def test_triton_rht_quantize_rtne_sqnr(M, N, compute_rowwise):
     torch.manual_seed(42)
     A = torch.randn(M, N, dtype=torch.bfloat16, device="cuda")
 
-    (
-        tri_col_codes,
-        tri_col_sf,
-        tri_col_amax,
-        tri_row_codes,
-        tri_row_sf,
-        tri_row_amax,
-    ) = triton_rht_quantize_row_col(
+    col_amax, row_amax = triton_rht_amax(
+        A, sign_vector=list(_HARDCODED_SIGN_VECTOR), compute_rowwise=compute_rowwise
+    )
+    tri_col_codes, tri_col_sf, tri_row_codes, tri_row_sf = triton_rht_quantize_row_col(
         A,
         stochastic_rounding=False,
         compute_rowwise=compute_rowwise,
         sign_vector=_HARDCODED_SIGN_VECTOR,
+        col_global_amax=col_amax,
+        row_global_amax=row_amax,
     )
 
     # Columnwise SQNR: dequantized should reconstruct RHT(A.T)
     ref_rht = _rht_reference(A).float()
-    col_sqnr = compute_error(
-        ref_rht, _dequantize(tri_col_codes, tri_col_sf, tri_col_amax)
-    )
+    col_sqnr = compute_error(ref_rht, _dequantize(tri_col_codes, tri_col_sf, col_amax))
     assert col_sqnr >= 20.0, f"Col SQNR {col_sqnr:.2f} dB < 20.0 dB for M={M} N={N}"
 
     # Rowwise SQNR: dequantized should reconstruct raw A
     if compute_rowwise:
         assert tri_row_codes is not None
         row_sqnr = compute_error(
-            A.float(), _dequantize(tri_row_codes, tri_row_sf, tri_row_amax)
+            A.float(), _dequantize(tri_row_codes, tri_row_sf, row_amax)
         )
         assert row_sqnr >= 20.0, f"Row SQNR {row_sqnr:.2f} dB < 20.0 dB for M={M} N={N}"
 
@@ -285,13 +280,18 @@ def test_triton_rht_quantize_rs_midpoint_distribution():
         _offset_buf = torch.randint(
             -(2**63), 2**63 - 1, (1,), dtype=torch.int64, device=A.device
         )
-        col_codes, _, _, _, _, _ = triton_rht_quantize_row_col(
+        col_amax, _ = triton_rht_amax(
+            A, sign_vector=list(_HARDCODED_SIGN_VECTOR), compute_rowwise=False
+        )
+        col_codes, _, _, _ = triton_rht_quantize_row_col(
             A,
             stochastic_rounding=True,
             compute_rowwise=False,
             sign_vector=_HARDCODED_SIGN_VECTOR,
             seed_base=_seed_buf,
             offset_base=_offset_buf,
+            col_global_amax=col_amax,
+            row_global_amax=col_amax,
         )
         # Unpack col_codes (N_RHT, M_RHT//2) uint8 → (N_RHT, M_RHT) nibbles
         lo = (col_codes & 0xF).long()
@@ -344,11 +344,16 @@ def test_triton_rht_quantize_rs_at_most_one_fp4_step_from_rtne():
         out[:, 1::2] = hi
         return out
 
-    col_rn, _, _, _, _, _ = triton_rht_quantize_row_col(
+    col_amax_rtne, _ = triton_rht_amax(
+        A, sign_vector=list(_HARDCODED_SIGN_VECTOR), compute_rowwise=False
+    )
+    col_rn, _, _, _ = triton_rht_quantize_row_col(
         A,
         stochastic_rounding=False,
         compute_rowwise=False,
         sign_vector=_HARDCODED_SIGN_VECTOR,
+        col_global_amax=col_amax_rtne,
+        row_global_amax=col_amax_rtne,
     )
     rn_nibs = _unpack(col_rn)
     rn_sign = rn_nibs >> 3
@@ -361,13 +366,18 @@ def test_triton_rht_quantize_rs_at_most_one_fp4_step_from_rtne():
         _offset_buf = torch.randint(
             -(2**63), 2**63 - 1, (1,), dtype=torch.int64, device=A.device
         )
-        col_rs, _, _, _, _, _ = triton_rht_quantize_row_col(
+        col_amax_rs, _ = triton_rht_amax(
+            A, sign_vector=list(_HARDCODED_SIGN_VECTOR), compute_rowwise=False
+        )
+        col_rs, _, _, _ = triton_rht_quantize_row_col(
             A,
             stochastic_rounding=True,
             compute_rowwise=False,
             sign_vector=_HARDCODED_SIGN_VECTOR,
             seed_base=_seed_buf,
             offset_base=_offset_buf,
+            col_global_amax=col_amax_rs,
+            row_global_amax=col_amax_rs,
         )
         rs_nibs = _unpack(col_rs)
         rs_sign = rs_nibs >> 3
@@ -402,6 +412,14 @@ def test_triton_rht_quantize_row_col_cuda_graph_compile():
          so the kernel's captured seed pointer sees updated values on replay).
       3. SR is being applied: compiled output differs from RTNE reference.
     """
+    # NOTE: this test fails when run in the same process after test_hadamard_amax_triton.py.
+    # Root cause: triton_rht_amax (a custom_op) calls triton.set_allocator() eagerly in
+    # the amax tests, leaving a process-global Triton allocator active during CUDA graph
+    # capture here. torch._dynamo.reset() does not clear Triton's global allocator state.
+    # TODO: fix by one of:
+    #   (a) move compile tests to a dedicated file run in an isolated subprocess / --forked
+    #   (b) add a conftest.py autouse fixture that calls triton.set_allocator(None) between files
+    #   (c) guard triton.set_allocator() in triton_rht_amax so it only fires inside compiled regions
     shape = (128, 256)
     A = torch.randn(*shape, dtype=torch.bfloat16, device="cuda")
     prepare_for_cuda_graph(
@@ -417,12 +435,15 @@ def test_triton_rht_quantize_row_col_cuda_graph_compile():
         offset = torch.randint(
             -(2**63), 2**63 - 1, (1,), dtype=torch.int64, device=A.device
         )
-        col_fp4, _, _, _, _, _ = triton_rht_quantize_row_col(
+        col_amax, _ = triton_rht_amax(data, compute_rowwise=False)
+        col_fp4, _, _, _ = triton_rht_quantize_row_col(
             data,
             stochastic_rounding=True,
             compute_rowwise=False,
             seed_base=seed_buf,
             offset_base=offset,
+            col_global_amax=col_amax,
+            row_global_amax=col_amax,
         )
         return col_fp4
 
@@ -436,7 +457,12 @@ def test_triton_rht_quantize_row_col_cuda_graph_compile():
     assert not torch.equal(r1, r2), "SR outputs should differ with different seeds"
 
     # SR IS applied: output should differ from round-to-nearest reference
-    rtne_ref, _, _, _, _, _ = triton_rht_quantize_row_col(
-        A, stochastic_rounding=False, compute_rowwise=False
+    rtne_col_amax, _ = triton_rht_amax(A, compute_rowwise=False)
+    rtne_ref, _, _, _ = triton_rht_quantize_row_col(
+        A,
+        stochastic_rounding=False,
+        compute_rowwise=False,
+        col_global_amax=rtne_col_amax,
+        row_global_amax=rtne_col_amax,
     )
     assert not torch.equal(r1, rtne_ref), "SR should produce different output than RTNE"

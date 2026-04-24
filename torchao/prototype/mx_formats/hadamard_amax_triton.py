@@ -7,30 +7,35 @@ persistent warp-specialized TMA kernel with per-CTA cumulative max and one atomi
 per CTA into a caller-provided scalar buffer.
 """
 import itertools
+from typing import List, Tuple
 import triton
 import triton.language as tl
 import torch
 import torch.nn.functional as F
-from torchao.prototype.mx_formats.hadamard_utils import get_rht_matrix, prepare_for_cuda_graph, _compute_pid
+from torchao.prototype.mx_formats.hadamard_utils import (
+    get_rht_matrix,
+    prepare_for_cuda_graph,
+    _compute_pid,
+)
 from torchao.utils import is_sm_at_least_90
 
 # SM90+ autotune configs. BLOCK_M must be divisible by 16 (RHT reshape constraint).
 HADAMARD_CONFIGS: list[triton.Config] = [
     triton.Config(
-        {'BLOCK_M': bm, 'BLOCK_N': bn, 'NUM_STAGES': ns},
+        {"BLOCK_M": bm, "BLOCK_N": bn, "NUM_STAGES": ns},
         num_warps=nw,
         num_stages=ns,
     )
     for bm, bn, ns, nw in itertools.product(
         [64, 128],  # BLOCK_M
-        [32, 64],   # BLOCK_N
+        [32, 64],  # BLOCK_N
         [2, 3, 4],  # NUM_STAGES
-        [4, 8],     # NUM_WARPS
+        [4, 8],  # NUM_WARPS
     )
 ]
 
 
-@triton.autotune(configs=HADAMARD_CONFIGS, key=['M', 'N'])
+@triton.autotune(configs=HADAMARD_CONFIGS, key=["M", "N"])
 @triton.jit
 def _hadamard_amax_kernel(
     a_ptr,
@@ -117,23 +122,23 @@ def _hadamard_amax_kernel(
         tl.atomic_max(global_a_amax_ptr, tile_a_amax.to(tl.float32))
 
 
+@torch.library.custom_op("torchao::triton_rht_amax", mutates_args=())
 def triton_rht_amax(
     A: torch.Tensor,
-    sign_vector: tuple[int, ...] | None = None,
+    sign_vector: List[int] | None = None,
     hadamard_dimension: int = 16,
-    scaling_type: F.ScalingType = F.ScalingType.TensorWise,
+    scaling_type: int = int(F.ScalingType.TensorWise),
     compute_rowwise: bool = True,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """Apply RHT to A and return global absolute maxima without materializing output.
     If compute_rowwise=True, then compute global max of abs(A) for rowwise
     quantization scaling.
 
     Args:
         A: (M, N) bfloat16 tensor, row-major. M must be divisible by 16.
-        sign_vector: Optional sign vector for the RHT. If None, a random one is generated.
+        sign_vector: Optional sign vector for the RHT as a list of ints. If None, a random one is generated.
         hadamard_dimension: Dimension of the Hadamard matrix (default 16).
-        scaling_type: ScalingType controlling reduction granularity. Only
-            ``ScalingType.TensorWise`` is currently supported.
+        scaling_type: int encoding of F.ScalingType. Only TensorWise is supported.
         compute_rowwise: If True, also compute max(abs(A)) for rowwise quantization.
 
     Returns:
@@ -158,7 +163,7 @@ def triton_rht_amax(
         raise ValueError("A must be row-major (contiguous)")
     if A.shape[0] % 16 != 0:
         raise ValueError(f"M must be divisible by 16, got M={A.shape[0]}")
-    if scaling_type != F.ScalingType.TensorWise:
+    if scaling_type != int(F.ScalingType.TensorWise):
         raise ValueError(
             f"scaling_type={scaling_type!r} is not supported; "
             "only ScalingType.TensorWise is implemented."
@@ -167,12 +172,13 @@ def triton_rht_amax(
 
     if hasattr(triton, "set_allocator"):
         _ws = prepare_for_cuda_graph(A.device)
-        triton.set_allocator(lambda size, align, stream: _ws[:max(size, 1)])
+        triton.set_allocator(lambda size, align, stream: _ws[: max(size, 1)])
 
     NUM_SMS = torch.cuda.get_device_properties(A.device).multi_processor_count
     GROUP_SIZE_N: int = 8  # L2 reuse grouping along M
 
-    B = get_rht_matrix(sign_vector, A.device, torch.bfloat16, hadamard_dimension)
+    sv = tuple(sign_vector) if sign_vector else None
+    B = get_rht_matrix(sv, A.device, torch.bfloat16, hadamard_dimension)
     global_rht_amax = torch.zeros((), dtype=torch.float32, device=A.device)
     global_a_amax = torch.zeros((), dtype=torch.float32, device=A.device)
 
@@ -188,3 +194,16 @@ def triton_rht_amax(
         NUM_SMS=NUM_SMS,
     )
     return global_rht_amax, global_a_amax
+
+
+@triton_rht_amax.register_fake
+def _(
+    A,
+    sign_vector=None,
+    hadamard_dimension=16,
+    scaling_type=int(F.ScalingType.TensorWise),
+    compute_rowwise=True,
+):
+    col_amax = A.new_empty((), dtype=torch.float32)
+    row_amax = A.new_empty((), dtype=torch.float32)
+    return col_amax, row_amax

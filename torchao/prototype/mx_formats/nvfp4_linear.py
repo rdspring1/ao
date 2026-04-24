@@ -27,6 +27,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from torchao.prototype.custom_fp_utils import RoundingMode
+from torchao.prototype.mx_formats.hadamard_amax_triton import triton_rht_amax
 from torchao.prototype.mx_formats.hadamard_quantize_row_col_triton import (
     triton_rht_quantize_row_col,
 )
@@ -179,7 +180,8 @@ def _triton_weight_quantize_2d(x: torch.Tensor):
       W_*  = rowwise quantized x (for forward GEMM)
       Wt_* = colwise quantized x = rowwise quantized x.T (for dgrad GEMM)
     """
-    codes, sf, t_codes, t_sf, global_amax = triton_weight_quantize_2d(x)
+    global_amax = x.float().abs().max()
+    codes, sf, t_codes, t_sf = triton_weight_quantize_2d(x, global_amax)
     return (
         codes.view(torch.float4_e2m1fn_x2),
         sf.flatten(),
@@ -230,21 +232,20 @@ class nvfp4_mm_triton(torch.autograd.Function):
                 f"nvfp4_mm_triton requires M, K, N all divisible by 128; "
                 f"got M={M}, K={K}, N={N}"
             )
-        input_2d = input_hp.reshape(-1, K)
+        input_2d = input_hp.reshape(-1, K).contiguous()
+
+        # Compute columnwise and rowwise amaxes before quantization so callers
+        # can all-reduce across TP ranks before passing them in.
+        x_col_amax, x_row_amax = triton_rht_amax(input_2d, compute_rowwise=True)
 
         # RHT + columnwise + rowwise quantization of input in one fused kernel.
         # SR=False in forward — sr_seed value is not consumed here.
-        (
-            x_col_codes,
-            x_col_sf,
-            x_col_amax,
-            x_row_codes,
-            x_row_sf,
-            x_row_amax,
-        ) = triton_rht_quantize_row_col(
-            input_2d.contiguous(),
+        x_col_codes, x_col_sf, x_row_codes, x_row_sf = triton_rht_quantize_row_col(
+            input_2d,
             stochastic_rounding=False,
             compute_rowwise=True,
+            col_global_amax=x_col_amax,
+            row_global_amax=x_row_amax,
         )
 
         # Fused weight quantization: rowwise for forward GEMM, colwise saved for dgrad
@@ -335,12 +336,15 @@ class nvfp4_mm_triton(torch.autograd.Function):
         # -----------------------------------------------------------
         # GEMM 3: dy_col.T @ x_col → grad_weight  (col RHT + SR)
         # -----------------------------------------------------------
-        dy_col_codes, dy_col_sf, dy_col_amax, _, _, _ = triton_rht_quantize_row_col(
+        dy_col_amax, _ = triton_rht_amax(grad_output_2d, compute_rowwise=False)
+        dy_col_codes, dy_col_sf, _, _ = triton_rht_quantize_row_col(
             grad_output_2d,
             stochastic_rounding=True,
             compute_rowwise=False,
             seed_base=sr_seed,
             offset_base=offset_colwise,
+            col_global_amax=dy_col_amax,
+            row_global_amax=dy_col_amax,
         )
         dy_gs_w = per_tensor_amax_to_scale(dy_col_amax)
         x_gs_w = per_tensor_amax_to_scale(x_col_amax)

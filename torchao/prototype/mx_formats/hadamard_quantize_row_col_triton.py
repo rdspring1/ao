@@ -13,7 +13,6 @@ from torchao.prototype.mx_formats.hadamard_utils import (
     _swizzle_scales,
     _store_scales_swizzle,
 )
-from torchao.prototype.mx_formats.hadamard_amax_triton import triton_rht_amax
 from torchao.utils import is_sm_at_least_100
 
 # SM100+ autotune configs. BLOCK_M=256 enables col TMA sf store; BLOCK_N=256 enables row TMA.
@@ -226,9 +225,9 @@ def triton_rht_quantize_row_col(
     scaling_type: int = int(F.ScalingType.TensorWise),
     seed_base: torch.Tensor | None = None,
     offset_base: torch.Tensor | None = None,
-) -> Tuple[
-    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
-]:
+    col_global_amax: torch.Tensor | None = None,
+    row_global_amax: torch.Tensor | None = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """RHT + NVFP4 E2M1 columnwise quantization fused with optional rowwise quantization.
 
     Produces both:
@@ -237,8 +236,7 @@ def triton_rht_quantize_row_col(
       - Rowwise output (when ``compute_rowwise=True``): direct NVFP4 quantization of A,
         shape (M, N//2) + (M//128, N//64, 32, 16) swizzled scales.
 
-    Both paths share the same TMA tile loads. The rowwise global amax is computed on the
-    host via ``torch.max(torch.abs(A))`` before the kernel launch.
+    Both paths share the same TMA tile loads.
 
     Args:
         A: (M, N) bfloat16 tensor, row-major. M must be divisible by 128, N by 128.
@@ -248,32 +246,46 @@ def triton_rht_quantize_row_col(
         sign_vector: Sign vector for the RHT as a list of ints. None (default) generates
             a random cached sign vector via get_rht_matrix.
         hadamard_dimension: Dimension of the Hadamard matrix (default 16).
-        scaling_type: int encoding of F.ScalingType controlling reduction granularity
-            passed to triton_rht_amax. Pass F.ScalingType.TensorWise.value (default).
-            Only ScalingType.TensorWise is currently supported.
+        scaling_type: int encoding of F.ScalingType. Only TensorWise is supported.
         seed_base: Pre-allocated int64 seed tensor for SR (size=(1,)). For correct
             stochastic rounding under torch.compile CUDA graphs, pre-allocate via
             prepare_for_cuda_graph(device) before compile; use .random_() in the
             compiled body to advance the value each call.
         offset_base: Pre-allocated int64 offset tensor for SR (size=(1,)). Same semantics
             as seed_base.
+        col_global_amax: scalar float32 global amax of RHT(A.t()). Caller must compute
+            via ``triton_rht_amax`` (and optionally all-reduce for TP) before passing in.
+        row_global_amax: scalar float32 global amax of A. Required when
+            ``compute_rowwise=True``; ignored (pass any scalar) when False.
 
     Returns:
-        6-tuple (col_fp4, col_sf, col_amax, row_fp4, row_sf, row_amax):
-          - col_fp4:  (N, M//2) uint8 packed FP4 codes (columnwise).
-          - col_sf:   (N//128, M//64, 32, 16) swizzled float8_e4m3fn scale factors.
-          - col_amax: scalar float32 global amax of RHT(A.t()).
-          - row_fp4:  (M, N//2) uint8 if compute_rowwise, else dummy (1,) uint8.
-          - row_sf:   (M//128, N//64, 32, 16) float8_e4m3fn if compute_rowwise, else dummy (1,).
-          - row_amax: scalar float32 global amax of A if compute_rowwise, else 0.0 scalar.
+        4-tuple (col_fp4, col_sf, row_fp4, row_sf):
+          - col_fp4: (N, M//2) uint8 packed FP4 codes (columnwise).
+          - col_sf:  (N//128, M//64, 32, 16) swizzled float8_e4m3fn scale factors.
+          - row_fp4: (M, N//2) uint8 if compute_rowwise, else dummy (1,) uint8.
+          - row_sf:  (M//128, N//64, 32, 16) float8_e4m3fn if compute_rowwise, else dummy (1,).
 
     Raises:
         NotImplementedError: If hardware is pre-SM100.
-        ValueError: If A is not bfloat16, not 2-D, not contiguous, M % 16 != 0.
+        ValueError: If A is not bfloat16, not 2-D, not contiguous, M % 16 != 0, or
+            col_global_amax/row_global_amax are None when required.
 
     CUDA graphs: call prepare_for_cuda_graph(device) once before graph capture to warm
     up the autotuner. cudagraph trees advances the RNG each replay.
     """
+    if col_global_amax is None:
+        raise ValueError(
+            "col_global_amax is required; call triton_rht_amax(A) first and "
+            "optionally all-reduce across TP ranks before passing in."
+        )
+    if compute_rowwise and row_global_amax is None:
+        raise ValueError(
+            "row_global_amax is required when compute_rowwise=True; call "
+            "triton_rht_amax(A, compute_rowwise=True) first."
+        )
+    if row_global_amax is None:
+        row_global_amax = col_global_amax  # ignored by kernel; use col as dummy
+
     if torch.cuda.is_available() and not is_sm_at_least_100():
         raise NotImplementedError(
             "Kernel requires SM100 (Blackwell); detected pre-SM100 hardware."
@@ -304,16 +316,6 @@ def triton_rht_quantize_row_col(
     if hasattr(triton, "set_allocator"):
         _ws = prepare_for_cuda_graph(A.device)
         triton.set_allocator(lambda size, align, stream: _ws[: max(size, 1)])
-
-    # scaling_type is int for custom_op compat; reconstruct enum for triton_rht_amax
-    # Columnwise global amax: max(abs(RHT(A.t()))) and rowwise: max(abs(A)) — fused kernel
-    col_global_amax, row_global_amax = triton_rht_amax(
-        A,
-        sign_vector=sv,
-        hadamard_dimension=hadamard_dimension,
-        scaling_type=F.ScalingType(scaling_type),
-        compute_rowwise=compute_rowwise,
-    )
 
     # Resolve SR seeds: use caller-provided seeds for correct CUDA-graph SR behavior;
     # fall back to generating internally for eager callers that omit them.
@@ -371,7 +373,7 @@ def triton_rht_quantize_row_col(
         COMPUTE_ROWWISE=compute_rowwise,
     )
 
-    return C, scale_factors, col_global_amax, rowwise_C, rowwise_sf, row_global_amax
+    return C, scale_factors, rowwise_C, rowwise_sf
 
 
 @triton_rht_quantize_row_col.register_fake
@@ -384,17 +386,16 @@ def _(
     scaling_type=int(F.ScalingType.TensorWise),
     seed_base=None,
     offset_base=None,
+    col_global_amax=None,
+    row_global_amax=None,
 ):
     M, N = A.shape
     col_fp4 = A.new_empty((N, M // 2), dtype=torch.uint8)
     col_sf = A.new_empty((N // 128, M // 64, 32, 16), dtype=torch.float8_e4m3fn)
-    col_amax = A.new_empty((), dtype=torch.float32)
     if compute_rowwise:
         row_fp4 = A.new_empty((M, N // 2), dtype=torch.uint8)
         row_sf = A.new_empty((M // 128, N // 64, 32, 16), dtype=torch.float8_e4m3fn)
-        row_amax = A.new_empty((), dtype=torch.float32)
     else:
         row_fp4 = A.new_empty((1,), dtype=torch.uint8)
         row_sf = A.new_empty((1,), dtype=torch.float8_e4m3fn)
-        row_amax = A.new_empty((), dtype=torch.float32)
-    return col_fp4, col_sf, col_amax, row_fp4, row_sf, row_amax
+    return col_fp4, col_sf, row_fp4, row_sf

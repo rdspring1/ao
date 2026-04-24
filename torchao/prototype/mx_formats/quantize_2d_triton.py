@@ -194,19 +194,22 @@ def _weight_quantize_2d_kernel(
 @torch.library.custom_op("torchao::triton_weight_quantize_2d", mutates_args=())
 def triton_weight_quantize_2d(
     A: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    global_amax: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """2D (16×16) NVFP4 E2M1 weight quantization without RHT.
 
     Args:
-        A:                     (M, N) bfloat16, row-major. M and N divisible by 16.
+        A:           (M, N) bfloat16, row-major. M and N divisible by 16.
+        global_amax: scalar float32 global absolute maximum of A. Caller computes
+                     ``A.float().abs().max()`` (and optionally all-reduces for TP)
+                     before passing in.
 
     Returns:
-        compute_colwise=True: 5-tuple of:
+        4-tuple of:
           - (M, N//2) uint8: rowwise FP4 codes.
           - (M//128, N//64, 32, 16) float8_e4m3fn: rowwise swizzled scale factors.
           - (N, M//2) uint8: colwise FP4 codes (rowwise W.T).
           - (N//128, M//64, 32, 16) float8_e4m3fn: colwise swizzled scale factors.
-          - scalar float32: global amax of A.
     """
     if not is_sm_at_least_100():
         raise NotImplementedError("triton_weight_quantize_2d requires SM100+")
@@ -230,7 +233,6 @@ def triton_weight_quantize_2d(
         _ws = prepare_for_cuda_graph(A.device)
         triton.set_allocator(lambda size, align, stream: _ws[: max(size, 1)])
 
-    global_amax = A.float().abs().max()
     a_fp4 = torch.zeros((M, N // 2), dtype=torch.uint8, device=A.device)
     a_sf = torch.empty(
         (M // 128, N // 64, 32, 16), dtype=torch.float8_e4m3fn, device=A.device
@@ -256,15 +258,14 @@ def triton_weight_quantize_2d(
         GROUP_SIZE_N=GROUP_SIZE_N,
         NUM_SMS=NUM_SMS,
     )
-    return a_fp4, a_sf, a_t_fp4, a_t_sf, global_amax
+    return a_fp4, a_sf, a_t_fp4, a_t_sf
 
 
 @triton_weight_quantize_2d.register_fake
-def _(A):
+def _(A, global_amax):
     M, N = A.shape
     codes = A.new_empty((M, N // 2), dtype=torch.uint8)
     sf = A.new_empty((M // 128, N // 64, 32, 16), dtype=torch.float8_e4m3fn)
     t_codes = A.new_empty((N, M // 2), dtype=torch.uint8)
     t_sf = A.new_empty((N // 128, M // 64, 32, 16), dtype=torch.float8_e4m3fn)
-    global_amax = A.new_empty((), dtype=torch.float32)
-    return codes, sf, t_codes, t_sf, global_amax
+    return codes, sf, t_codes, t_sf
