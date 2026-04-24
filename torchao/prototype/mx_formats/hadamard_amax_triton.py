@@ -46,7 +46,6 @@ def _hadamard_amax_kernel(
     N,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
-    COMPUTE_ROWWISE: tl.constexpr,
     GROUP_SIZE_N: tl.constexpr,
     NUM_SMS: tl.constexpr,
     NUM_STAGES: tl.constexpr,
@@ -110,16 +109,14 @@ def _hadamard_amax_kernel(
         abs_a_t_rht = tl.abs(a_t_rht)
         cumulative_rht_amax = tl.maximum(cumulative_rht_amax, abs_a_t_rht)
 
-        if COMPUTE_ROWWISE:
-            cumulative_a_amax = tl.maximum(cumulative_a_amax, tl.abs(a.to(tl.float32)))
+        cumulative_a_amax = tl.maximum(cumulative_a_amax, tl.abs(a.to(tl.float32)))
 
     # Get scalar max for this block and update global max with atomic max operation
     tile_rht_amax = tl.max(tl.max(cumulative_rht_amax, axis=1), axis=0)
     tl.atomic_max(global_rht_amax_ptr, tile_rht_amax.to(tl.float32))
 
-    if COMPUTE_ROWWISE:
-        tile_a_amax = tl.max(tl.max(cumulative_a_amax, axis=1), axis=0)
-        tl.atomic_max(global_a_amax_ptr, tile_a_amax.to(tl.float32))
+    tile_a_amax = tl.max(tl.max(cumulative_a_amax, axis=1), axis=0)
+    tl.atomic_max(global_a_amax_ptr, tile_a_amax.to(tl.float32))
 
 
 @torch.library.custom_op("torchao::triton_rht_amax", mutates_args=())
@@ -128,23 +125,19 @@ def triton_rht_amax(
     sign_vector: List[int] | None = None,
     hadamard_dimension: int = 16,
     scaling_type: int = int(F.ScalingType.TensorWise),
-    compute_rowwise: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Apply RHT to A and return global absolute maxima without materializing output.
-    If compute_rowwise=True, then compute global max of abs(A) for rowwise
-    quantization scaling.
 
     Args:
         A: (M, N) bfloat16 tensor, row-major. M must be divisible by 16.
         sign_vector: Optional sign vector for the RHT as a list of ints. If None, a random one is generated.
         hadamard_dimension: Dimension of the Hadamard matrix (default 16).
         scaling_type: int encoding of F.ScalingType. Only TensorWise is supported.
-        compute_rowwise: If True, also compute max(abs(A)) for rowwise quantization.
 
     Returns:
-        Tuple of (global_rht_amax, global_a_amax):
-          - global_rht_amax: scalar float32 containing max(abs(RHT(A))).
-          - global_a_amax: scalar float32 containing max(abs(A)), or 0 if compute_rowwise=False.
+        Tuple of (col_amax, row_amax):
+          - col_amax: scalar float32 containing max(abs(RHT(A))).
+          - row_amax: scalar float32 containing max(abs(A)).
 
     Raises:
         NotImplementedError: If hardware is pre-SM90.
@@ -189,7 +182,6 @@ def triton_rht_amax(
         global_a_amax,
         M,
         N,
-        COMPUTE_ROWWISE=compute_rowwise,
         GROUP_SIZE_N=GROUP_SIZE_N,
         NUM_SMS=NUM_SMS,
     )
@@ -202,7 +194,6 @@ def _(
     sign_vector=None,
     hadamard_dimension=16,
     scaling_type=int(F.ScalingType.TensorWise),
-    compute_rowwise=True,
 ):
     col_amax = A.new_empty((), dtype=torch.float32)
     row_amax = A.new_empty((), dtype=torch.float32)

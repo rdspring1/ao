@@ -90,16 +90,6 @@ def test_triton_rht_amax_vs_reference(M, N, sign_vector):
         torch.manual_seed(42)
 
     # Check RHT amax and regular amax are bitwise identical to reference.
-    triton_rht_amax_val, triton_amax_val = triton_rht_amax(
-        A, sign_vector=sign_vector, compute_rowwise=True
-    )
+    triton_rht_amax_val, triton_amax_val = triton_rht_amax(A, sign_vector=sign_vector)
     torch.testing.assert_close(triton_rht_amax_val, ref_rht_amax, atol=0, rtol=0)
     torch.testing.assert_close(triton_amax_val, ref_amax, atol=0, rtol=0)
-
-    # Test that second return value is zero is returned when compute_rowise=False
-    triton_rhst_amax_val, triton_amax_empty = triton_rht_amax(
-        A, sign_vector=sign_vector, compute_rowwise=False
-    )
-    ref_zero = torch.tensor(0, dtype=torch.float32, device=triton_amax_empty.device)
-    torch.testing.assert_close(triton_amax_empty, ref_zero, atol=0, rtol=0)
-    torch.testing.assert_close(triton_rht_amax_val, ref_rht_amax, atol=0, rtol=0)

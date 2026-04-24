@@ -42,8 +42,7 @@ class Experiment:
 
 def get_configs() -> List[ExperimentConfig]:
     return [
-        ExperimentConfig(m=m, n=n)
-        for m, n in itertools.product(M_SHAPES, N_SHAPES)
+        ExperimentConfig(m=m, n=n) for m, n in itertools.product(M_SHAPES, N_SHAPES)
     ]
 
 
@@ -52,16 +51,20 @@ def run_experiment(config: ExperimentConfig) -> ExperimentResult | None:
     x = torch.randn(m, n, dtype=torch.bfloat16, device=device)
 
     try:
+        global_amax = x.float().abs().max()
         time_us = benchmark_cuda_function_in_microseconds(
-            triton_weight_quantize_2d, x
+            triton_weight_quantize_2d,
+            x,
+            global_amax,
         )
     except NotImplementedError:
         return None
 
-    read_bytes = m * n * 2                  # bf16 input
-    write_fp4 = m * (n // 2)               # packed FP4 output
-    write_scales = m * (n // 16)            # FP8 scale factors (non-swizzled layout)
-    gbps = ((read_bytes + write_fp4 + write_scales) / 1e9) / (time_us / 1e6)
+    read_bytes = m * n * 2  # bf16 input
+    col_write = n * (m // 2) + (n // 128) * (m // 64) * 32 * 16
+    row_write = m * (n // 2) + (m // 128) * (n // 64) * 32 * 16
+    total_bytes = read_bytes + col_write + row_write
+    gbps = (total_bytes / 1e9) / (time_us / 1e6)
 
     return ExperimentResult(time_us=time_us, gbps=gbps)
 

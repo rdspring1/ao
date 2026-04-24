@@ -41,8 +41,7 @@ What it reports:
 ### Methodology
 
 - Sweeps M ∈ {128, 256, 1024, 8192} × N ∈ {128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768}
-  × `compute_rowwise` ∈ {False, True}
 - Skips configurations that raise `NotImplementedError` (pre-SM100 hardware).
 - Uses `benchmark_cuda_function_in_microseconds` from `benchmarks/utils.py`.
 - Bandwidth accounts for bfloat16 input read, columnwise FP4 + swizzled scale write,
-  and (when `compute_rowwise=True`) rowwise FP4 + swizzled scale write.
+  and rowwise FP4 + swizzled scale write.

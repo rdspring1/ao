@@ -34,7 +34,6 @@ from torchao.prototype.mx_formats.hadamard_quantize_row_col_triton import (
 from torchao.prototype.mx_formats.hadamard_utils import (
     prepare_for_cuda_graph,
 )  # noqa: F401 (re-exported for user convenience)
-from torchao.prototype.mx_formats.kernels import triton_quantize_nvfp4
 from torchao.prototype.mx_formats.nvfp4_tensor import (
     NVFP4Tensor,
     _addmm_nvfp4_dispatch,
@@ -155,24 +154,6 @@ def _quantize_to_nvfp4_te(
     )
 
 
-def _ao_rowwise_quantize_sr(
-    x: torch.Tensor,
-    seed_base: torch.Tensor,
-    offset_base: torch.Tensor,
-):
-    """Triton NVFP4 rowwise quantization with stochastic rounding.
-
-    Returns (fp4_data, block_scales, global_scale).
-    block_scales: (M, N//16) float8_e4m3fn in SWIZZLE_32_4_4 memory layout.
-    seed_base/offset_base are read-only; no mutation inside this function.
-    """
-    global_scale = per_tensor_amax_to_scale(x.abs().max())
-    scales, xq = triton_quantize_nvfp4(
-        x, global_scale, RoundingMode.RS.value, seed_base, offset_base
-    )
-    return xq.view(torch.float4_e2m1fn_x2), scales, global_scale
-
-
 def _triton_weight_quantize_2d(x: torch.Tensor):
     """Triton 2D NVFP4 weight quantization producing both rowwise and colwise outputs.
 
@@ -236,14 +217,13 @@ class nvfp4_mm_triton(torch.autograd.Function):
 
         # Compute columnwise and rowwise amaxes before quantization so callers
         # can all-reduce across TP ranks before passing them in.
-        x_col_amax, x_row_amax = triton_rht_amax(input_2d, compute_rowwise=True)
+        x_col_amax, x_row_amax = triton_rht_amax(input_2d)
 
         # RHT + columnwise + rowwise quantization of input in one fused kernel.
         # SR=False in forward — sr_seed value is not consumed here.
         x_col_codes, x_col_sf, x_row_codes, x_row_sf = triton_rht_quantize_row_col(
             input_2d,
             stochastic_rounding=False,
-            compute_rowwise=True,
             col_global_amax=x_col_amax,
             row_global_amax=x_row_amax,
         )
@@ -312,16 +292,29 @@ class nvfp4_mm_triton(torch.autograd.Function):
             -(2**63), 2**63 - 1, (1,), dtype=torch.int64, device=dev
         )
 
+        # Quantize grad_output for GEMM 2 (dgrad) -- rowwise + sr and GEMM 3 (wgrad) --
+        # colwise rht + sr.
+        dy_col_amax, dy_row_amax = triton_rht_amax(grad_output_2d)
+        dy_col_fp4, dy_col_sf, dy_row_fp4, dy_row_sf = triton_rht_quantize_row_col(
+            grad_output_2d,
+            stochastic_rounding=True,
+            col_seed_base=sr_seed,
+            row_seed_base=sr_seed,
+            col_offset_base=offset_colwise,
+            row_offset_base=offset_rowwise,
+            col_global_amax=dy_col_amax,
+            row_global_amax=dy_row_amax,
+        )
+
         # -----------------------------------------------------------
         # GEMM 2: dy_sr @ W.T → grad_input  (SR rowwise; saved colwise W)
         # -----------------------------------------------------------
-        dy_fp4, dy_bs, dy_gs = _ao_rowwise_quantize_sr(
-            grad_output_2d, sr_seed, offset_rowwise
-        )
+        dy_bs = dy_row_sf.flatten()
         Wt_bs = Wt_sf.flatten()
+        dy_gs = per_tensor_amax_to_scale(dy_row_amax)
         Wt_gs = per_tensor_amax_to_scale(W_amax)
         grad_input = torch.nn.functional.scaled_mm(
-            dy_fp4,
+            dy_row_fp4.view(torch.float4_e2m1fn_x2),
             Wt_fp4_x2.t(),
             scale_a=[dy_bs, dy_gs],
             scale_recipe_a=[F.ScalingType.BlockWise1x16, F.ScalingType.TensorWise],
@@ -336,22 +329,12 @@ class nvfp4_mm_triton(torch.autograd.Function):
         # -----------------------------------------------------------
         # GEMM 3: dy_col.T @ x_col → grad_weight  (col RHT + SR)
         # -----------------------------------------------------------
-        dy_col_amax, _ = triton_rht_amax(grad_output_2d, compute_rowwise=False)
-        dy_col_codes, dy_col_sf, _, _ = triton_rht_quantize_row_col(
-            grad_output_2d,
-            stochastic_rounding=True,
-            compute_rowwise=False,
-            seed_base=sr_seed,
-            offset_base=offset_colwise,
-            col_global_amax=dy_col_amax,
-            row_global_amax=dy_col_amax,
-        )
-        dy_gs_w = per_tensor_amax_to_scale(dy_col_amax)
+        dy_row_amax_w = per_tensor_amax_to_scale(dy_col_amax)
         x_gs_w = per_tensor_amax_to_scale(x_col_amax)
         grad_weight = torch.nn.functional.scaled_mm(
-            dy_col_codes.view(torch.float4_e2m1fn_x2),
+            dy_col_fp4.view(torch.float4_e2m1fn_x2),
             x_col_codes.view(torch.float4_e2m1fn_x2).t(),
-            scale_a=[dy_col_sf.flatten(), dy_gs_w],
+            scale_a=[dy_col_sf.flatten(), dy_row_amax_w],
             scale_recipe_a=[F.ScalingType.BlockWise1x16, F.ScalingType.TensorWise],
             scale_b=[x_col_sf.flatten(), x_gs_w],
             scale_recipe_b=[F.ScalingType.BlockWise1x16, F.ScalingType.TensorWise],
