@@ -45,9 +45,9 @@ class NVFP4TrainingConfig(AOBaseConfig):
             AUTO: Use TE if available, else TORCH.
             TRITON: Pure-Triton RHT + stochastic rounding path.
             Default: TORCH.
-        process_group: Optional ProcessGroup for column-parallel TP.
+        process_group: Optional ProcessGroup for tensor-parallel TP.
             When set with kernel_preference=TRITON, forward dispatches to
-            nvfp4_col_parallel_linear (all-gather input, reduce-scatter dgrad).
+            the selected NVFP4 tensor-parallel path.
         world_size: TP world size.  Inferred from process_group if None.
     """
 
@@ -62,9 +62,9 @@ class NVFP4TrainingLinear(nn.Linear):
     Drop-in replacement for nn.Linear that quantizes activations, weights,
     and gradients to NVFP4 for all three training GEMMs.
 
-    When process_group is set and kernel_preference==TRITON the forward
-    uses the column-parallel protocol (sequence-parallel all-gather +
-    reduce-scatter).
+    When process_group is set and kernel_preference==TRITON the forward uses
+    the tensor-parallel protocol selected by NVFP4ColwiseParallel or
+    NVFP4RowwiseParallel.
     """
 
     def __init__(
@@ -82,6 +82,7 @@ class NVFP4TrainingLinear(nn.Linear):
         self.kernel_preference = kernel_preference
         self.process_group = process_group
         self.world_size = world_size
+        self.tensor_parallel_style = "colwise"
         self._sr_seed: Optional[torch.Tensor] = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -91,6 +92,7 @@ class NVFP4TrainingLinear(nn.Linear):
         ):
             from torchao.prototype.mx_formats.nvfp4_tensor_parallel import (
                 nvfp4_col_parallel_linear,
+                nvfp4_row_parallel_linear,
             )
             import torch.distributed as dist
 
@@ -104,10 +106,18 @@ class NVFP4TrainingLinear(nn.Linear):
             w = self.weight
             if hasattr(w, "to_local"):
                 w = w.to_local()
-            return nvfp4_col_parallel_linear(
+            bias = self.bias
+            if hasattr(bias, "to_local"):
+                bias = bias.to_local()
+            tp_linear = (
+                nvfp4_row_parallel_linear
+                if self.tensor_parallel_style == "rowwise"
+                else nvfp4_col_parallel_linear
+            )
+            return tp_linear(
                 x,
                 w,
-                self.bias,
+                bias,
                 sr_seed=self._sr_seed,
                 tp_group=self.process_group,
                 world_size=ws,

@@ -4,7 +4,7 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 """
-Tests for NVFP4 column-parallel linear (sequence-parallel TP).
+Tests for NVFP4 tensor-parallel linear (sequence-parallel TP).
 
 Run with:
     torchrun --nproc_per_node=2 -m pytest test/prototype/mx_formats/test_nvfp4_parallel.py -s
@@ -22,6 +22,7 @@ from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torchao.quantization.utils import compute_error
 from torchao.prototype.mx_formats.nvfp4_tensor_parallel import (
     nvfp4_col_parallel_mm,
+    nvfp4_row_parallel_mm,
     swap_first_dims,
 )
 from torchao.utils import is_sm_at_least_100
@@ -278,3 +279,162 @@ def test_column_backward(distributed_env: DeviceMesh):
         dw_sqnr >= DW_SQNR_THRESHOLD
     ), f"dw SQNR {dw_sqnr:.2f} dB < {DW_SQNR_THRESHOLD} dB"
     torch.testing.assert_close(bias_local.grad, db_ref, atol=0, rtol=0)
+
+
+def test_row_single_rank_equivalence(distributed_env: DeviceMesh):
+    """Verify the row-parallel autograd function matches the single-GPU NVFP4 path at world_size=1."""
+    from torchao.prototype.mx_formats.nvfp4_linear import nvfp4_mm_triton
+
+    mesh = distributed_env
+    device = mesh.device_type
+    rank = dist.get_rank()
+    pg = dist.new_group([0])
+    M, K, N = 256, 256, 256
+    if rank != 0:
+        dist.barrier()
+        return
+
+    torch.manual_seed(17)
+    x = torch.randn(M, K, dtype=torch.bfloat16, device=device)
+    w = torch.randn(N, K, dtype=torch.bfloat16, device=device)
+    bias = torch.randn(N, dtype=torch.bfloat16, device=device)
+    sr_seed = torch.randint(
+        -(2**63), 2**63 - 1, (1,), dtype=torch.int64, device=device
+    )
+
+    sr_seed_ref = sr_seed.clone()
+    y_ref = nvfp4_mm_triton.apply(x.clone(), w.clone(), bias.clone(), None, sr_seed_ref)
+
+    sr_seed_tp = sr_seed.clone()
+    y_tp = nvfp4_row_parallel_mm.apply(
+        x.clone(), w.clone(), bias.clone(), sr_seed_tp, pg, 1
+    )
+
+    torch.testing.assert_close(y_ref, y_tp, atol=1e-2, rtol=1e-2)
+    dist.barrier()
+
+
+def test_row_forward(distributed_env: DeviceMesh):
+    """Verify row-parallel forward output shape, dtype, and SQNR vs fp32 reference."""
+    mesh = distributed_env
+    device = mesh.device_type
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    tp_group = mesh.get_group()
+    M, K, N = 512, 256, 512
+
+    assert M % world_size == 0 and K % world_size == 0
+    M_per_rank = M // world_size
+    K_per_rank = K // world_size
+
+    torch.manual_seed(19)
+    x_full = torch.randn(M, K, dtype=torch.bfloat16, device=device)
+    w_full = torch.randn(N, K, dtype=torch.bfloat16, device=device)
+    bias = torch.randn(N, dtype=torch.bfloat16, device=device)
+
+    x_local = x_full[:, rank * K_per_rank : (rank + 1) * K_per_rank].contiguous()
+    w_local = w_full[:, rank * K_per_rank : (rank + 1) * K_per_rank].contiguous()
+    sr_seed = torch.randint(
+        -(2**63), 2**63 - 1, (1,), dtype=torch.int64, device=device
+    )
+
+    y = nvfp4_row_parallel_mm.apply(
+        x_local, w_local, bias, sr_seed, tp_group, world_size
+    )
+
+    assert y.shape == (
+        M_per_rank,
+        N,
+    ), f"Rank {rank}: expected ({M_per_rank}, {N}), got {y.shape}"
+    assert y.dtype == torch.bfloat16, f"Expected bfloat16, got {y.dtype}"
+    assert not y.isnan().any(), "Output contains NaN"
+
+    y_ref_full = x_full.float() @ w_full.float().t() + bias.float()
+    y_ref_shard = y_ref_full[rank * M_per_rank : (rank + 1) * M_per_rank, :]
+    sqnr = compute_error(y_ref_shard, y.float())
+    SQNR_THRESHOLD = 15.0
+    assert sqnr >= SQNR_THRESHOLD, f"Forward SQNR {sqnr:.2f} dB < {SQNR_THRESHOLD} dB"
+
+
+def test_row_backward(distributed_env: DeviceMesh):
+    """Verify row-parallel backward gradient shapes and SQNR vs fp32 reference."""
+    mesh = distributed_env
+    device = mesh.device_type
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    tp_group = mesh.get_group()
+    M, K, N = 512, 256, 512
+
+    assert M % world_size == 0 and K % world_size == 0
+    M_per_rank = M // world_size
+    K_per_rank = K // world_size
+
+    torch.manual_seed(23)
+    x_full = torch.randn(M, K, dtype=torch.bfloat16, device=device)
+    w_full = torch.randn(N, K, dtype=torch.bfloat16, device=device)
+    bias = torch.randn(N, dtype=torch.bfloat16, device=device, requires_grad=True)
+    dy_full = torch.randn(M, N, dtype=torch.bfloat16, device=device)
+
+    x_local = (
+        x_full[:, rank * K_per_rank : (rank + 1) * K_per_rank]
+        .contiguous()
+        .detach()
+        .requires_grad_(True)
+    )
+    w_local = (
+        w_full[:, rank * K_per_rank : (rank + 1) * K_per_rank]
+        .contiguous()
+        .detach()
+        .requires_grad_(True)
+    )
+    dy_local = dy_full[rank * M_per_rank : (rank + 1) * M_per_rank, :].contiguous()
+    sr_seed = torch.randint(
+        -(2**63), 2**63 - 1, (1,), dtype=torch.int64, device=device
+    )
+
+    y = nvfp4_row_parallel_mm.apply(
+        x_local, w_local, bias, sr_seed, tp_group, world_size
+    )
+    y.backward(dy_local)
+
+    assert x_local.grad is not None, "x_local.grad is None"
+    assert w_local.grad is not None, "w_local.grad is None"
+    assert bias.grad is not None, "bias.grad is None"
+
+    assert x_local.grad.shape == (
+        M,
+        K_per_rank,
+    ), f"Rank {rank}: dx shape expected ({M}, {K_per_rank}), got {x_local.grad.shape}"
+    assert w_local.grad.shape == (
+        N,
+        K_per_rank,
+    ), f"Rank {rank}: dw shape expected ({N}, {K_per_rank}), got {w_local.grad.shape}"
+    assert bias.grad.shape == (
+        N,
+    ), f"Rank {rank}: db shape expected ({N},), got {bias.grad.shape}"
+    assert not x_local.grad.isnan().any(), "dx contains NaN"
+    assert not w_local.grad.isnan().any(), "dw contains NaN"
+    assert not bias.grad.isnan().any(), "db contains NaN"
+
+    x_ref = x_full.float().detach().requires_grad_(True)
+    w_ref = w_full.float().detach().requires_grad_(True)
+    y_ref = x_ref @ w_ref.t() + bias.detach().float()
+    y_ref.backward(dy_full.float())
+
+    dx_ref = x_ref.grad[:, rank * K_per_rank : (rank + 1) * K_per_rank]
+    dw_ref = w_ref.grad[:, rank * K_per_rank : (rank + 1) * K_per_rank]
+    db_ref = dy_local.sum(dim=0)
+    # Row-parallel bias is replicated, so each rank should see the full bias grad.
+    dist.all_reduce(db_ref, op=dist.ReduceOp.SUM, group=tp_group)
+
+    dx_sqnr = compute_error(dx_ref, x_local.grad.float())
+    dw_sqnr = compute_error(dw_ref, w_local.grad.float())
+    DX_SQNR_THRESHOLD = 14.0
+    DW_SQNR_THRESHOLD = 14.0
+    assert (
+        dx_sqnr >= DX_SQNR_THRESHOLD
+    ), f"dx SQNR {dx_sqnr:.2f} dB < {DX_SQNR_THRESHOLD} dB"
+    assert (
+        dw_sqnr >= DW_SQNR_THRESHOLD
+    ), f"dw SQNR {dw_sqnr:.2f} dB < {DW_SQNR_THRESHOLD} dB"
+    torch.testing.assert_close(bias.grad, db_ref, atol=0, rtol=0)
