@@ -95,6 +95,7 @@ class NVFP4TrainingLinear(nn.Linear):
                 nvfp4_row_parallel_linear,
             )
             import torch.distributed as dist
+            from torch.distributed.tensor import DTensor
 
             ws = self.world_size
             if ws is None:
@@ -104,10 +105,10 @@ class NVFP4TrainingLinear(nn.Linear):
                     -(2**63), 2**63 - 1, (1,), dtype=torch.int64, device=x.device
                 )
             w = self.weight
-            if hasattr(w, "to_local"):
+            if isinstance(w, DTensor):
                 w = w.to_local()
             bias = self.bias
-            if hasattr(bias, "to_local"):
+            if isinstance(bias, DTensor):
                 bias = bias.to_local()
             tp_linear = (
                 nvfp4_row_parallel_linear

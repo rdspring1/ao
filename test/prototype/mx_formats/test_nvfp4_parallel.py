@@ -25,6 +25,7 @@ from torch.distributed.tensor.parallel import parallelize_module
 
 from torchao.quantization.quantize_.common.kernel_preference import KernelPreference
 from torchao.quantization.utils import compute_error
+from torchao.prototype.mx_formats.hadamard_utils import prepare_for_cuda_graph
 from torchao.prototype.mx_formats.nvfp4_tensor_parallel import (
     NVFP4ColwiseParallel,
     NVFP4RowwiseParallel,
@@ -33,7 +34,7 @@ from torchao.prototype.mx_formats.nvfp4_tensor_parallel import (
     swap_first_dims,
 )
 from torchao.prototype.mx_formats.nvfp4_training import NVFP4TrainingLinear
-from torchao.utils import is_sm_at_least_100
+from torchao.utils import is_sm_at_least_100, torch_version_at_least
 
 
 if not torch.cuda.is_available():
@@ -95,6 +96,18 @@ def _fp32_mlp_reference(
         F.silu(w1) * w2,
         weights["out_proj.weight"].float(),
         weights["out_proj.bias"].float(),
+    )
+
+
+def _parallelize_nvfp4_mlp(model: NVFP4MLP, mesh: DeviceMesh) -> NVFP4MLP:
+    return parallelize_module(
+        model,
+        mesh,
+        {
+            "w1": NVFP4ColwiseParallel(use_local_output=False),
+            "w2": NVFP4ColwiseParallel(use_local_output=False),
+            "out_proj": NVFP4RowwiseParallel(),
+        },
     )
 
 
@@ -694,15 +707,7 @@ def test_mlp_colwise_rowwise_parallelize_module(distributed_env: DeviceMesh):
     torch.manual_seed(37)
     model = NVFP4MLP(K, H, device=device, dtype=torch.bfloat16)
     weights = {name: param.detach().clone() for name, param in model.named_parameters()}
-    model = parallelize_module(
-        model,
-        mesh,
-        {
-            "w1": NVFP4ColwiseParallel(use_local_output=False),
-            "w2": NVFP4ColwiseParallel(use_local_output=False),
-            "out_proj": NVFP4RowwiseParallel(),
-        },
-    )
+    model = _parallelize_nvfp4_mlp(model, mesh)
 
     assert model.w1.tensor_parallel_style == "colwise"
     assert model.w2.tensor_parallel_style == "colwise"
@@ -755,3 +760,52 @@ def test_mlp_colwise_rowwise_parallelize_module(distributed_env: DeviceMesh):
     sqnr = compute_error(y_ref_shard, y.float())
     SQNR_THRESHOLD = 10.0
     assert sqnr >= SQNR_THRESHOLD, f"MLP SQNR {sqnr:.2f} dB < {SQNR_THRESHOLD} dB"
+
+
+@pytest.mark.skipif(
+    not torch_version_at_least("2.8.0"), reason="torch.compile requires PyTorch 2.8+"
+)
+def test_mlp_colwise_rowwise_parallelize_module_cuda_graph_compile(
+    distributed_env: DeviceMesh,
+):
+    """Verify composed NVFP4 TP MLP works under torch.compile CUDA graphs."""
+    mesh = distributed_env
+    device = mesh.device_type
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    M, K, H = 512, 256, 512
+
+    assert M % world_size == 0
+    M_per_rank = M // world_size
+
+    prepare_for_cuda_graph(torch.device(device))
+    torch.manual_seed(41)
+    model = NVFP4MLP(K, H, device=device, dtype=torch.bfloat16)
+    model = _parallelize_nvfp4_mlp(model, mesh)
+    compiled_model = torch.compile(model, mode="reduce-overhead", fullgraph=True)
+    compiled_bwd = torch.compile(fullgraph=True, mode="reduce-overhead")
+
+    x_full = torch.randn(M, K, dtype=torch.bfloat16, device=device)
+    x_local = (
+        x_full[rank * M_per_rank : (rank + 1) * M_per_rank, :]
+        .contiguous()
+        .detach()
+        .requires_grad_(True)
+    )
+    target = torch.randn(M_per_rank, K, dtype=torch.bfloat16, device=device)
+
+    for _ in range(3):
+        model.zero_grad(set_to_none=True)
+        x_local.grad = None
+        with torch._dynamo.compiled_autograd._enable(compiled_bwd):
+            y = compiled_model(x_local)
+            assert y.shape == (M_per_rank, K)
+            loss = F.mse_loss(y.float(), target.float())
+            loss.backward()
+
+    assert x_local.grad is not None
+    assert not x_local.grad.isnan().any(), "compiled MLP input grad contains NaN"
+    for name, param in model.named_parameters():
+        assert param.grad is not None, f"{name}.grad is None"
+        grad = param.grad.to_local() if isinstance(param.grad, DTensor) else param.grad
+        assert not grad.isnan().any(), f"{name}.grad contains NaN"

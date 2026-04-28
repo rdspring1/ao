@@ -33,12 +33,13 @@ from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.parallel import parallelize_module
 
 from torchao.quantization.quantize_.common.kernel_preference import KernelPreference
+from torchao.prototype.mx_formats.hadamard_utils import prepare_for_cuda_graph
 from torchao.prototype.mx_formats.nvfp4_tensor_parallel import (
     NVFP4ColwiseParallel,
     NVFP4RowwiseParallel,
 )
 from torchao.prototype.mx_formats.nvfp4_training import NVFP4TrainingLinear
-from torchao.utils import is_sm_at_least_100
+from torchao.utils import is_sm_at_least_100, torch_version_at_least
 
 
 if not torch.cuda.is_available():
@@ -144,16 +145,8 @@ def _local_batch(
     )
 
 
-def test_nvfp4_mlp_fsdp2_tp_smoke(distributed_env: DeviceMesh):
-    mesh = distributed_env
-    dp_mesh = mesh["dp"]
-    tp_mesh = mesh["tp"]
-    dp_rank, tp_rank = mesh.get_coordinate()
-    device = mesh.device_type
-    M, K, H = 512, 256, 512
-
-    model = NVFP4MLP(K, H, device=device, dtype=torch.bfloat16)
-    model = parallelize_module(
+def _parallelize_nvfp4_mlp(model: NVFP4MLP, tp_mesh: DeviceMesh) -> NVFP4MLP:
+    return parallelize_module(
         model,
         tp_mesh,
         {
@@ -162,6 +155,27 @@ def test_nvfp4_mlp_fsdp2_tp_smoke(distributed_env: DeviceMesh):
             "out_proj": NVFP4RowwiseParallel(),
         },
     )
+
+
+def _test_nvfp4_mlp_fsdp2_tp_smoke(
+    distributed_env: DeviceMesh,
+    *,
+    compile_model: bool,
+) -> None:
+    mesh = distributed_env
+    dp_mesh = mesh["dp"]
+    tp_mesh = mesh["tp"]
+    dp_rank, tp_rank = mesh.get_coordinate()
+    device = mesh.device_type
+    M, K, H = 512, 256, 512
+
+    if compile_model:
+        prepare_for_cuda_graph(torch.device(device))
+
+    model = NVFP4MLP(K, H, device=device, dtype=torch.bfloat16)
+    model = _parallelize_nvfp4_mlp(model, tp_mesh)
+    if compile_model:
+        model = torch.compile(model, mode="reduce-overhead")
     model = fully_shard(model, mesh=dp_mesh)
 
     optim = torch.optim.SGD(model.parameters(), lr=1e-2)
@@ -195,3 +209,14 @@ def test_nvfp4_mlp_fsdp2_tp_smoke(distributed_env: DeviceMesh):
 
         optim.step()
         torch.cuda.synchronize()
+
+
+def test_nvfp4_mlp_fsdp2_tp_smoke(distributed_env: DeviceMesh):
+    _test_nvfp4_mlp_fsdp2_tp_smoke(distributed_env, compile_model=False)
+
+
+@pytest.mark.skipif(
+    not torch_version_at_least("2.8.0"), reason="torch.compile requires PyTorch 2.8+"
+)
+def test_nvfp4_mlp_fsdp2_tp_cuda_graph_compile_smoke(distributed_env: DeviceMesh):
+    _test_nvfp4_mlp_fsdp2_tp_smoke(distributed_env, compile_model=True)

@@ -172,6 +172,90 @@ vet
 
 ---
 
+## Compile/CUDA Graph Handoff
+
+### Goal
+Add CUDA graph + `torch.compile` coverage for:
+- 2-rank TP NVFP4 MLP composition
+- 4-rank `(dp, tp) = (2, 2)` FSDP2+TP smoke
+
+### Current State
+Done. Added:
+- `test_mlp_colwise_rowwise_parallelize_module_cuda_graph_compile`
+- `test_nvfp4_mlp_fsdp2_tp_cuda_graph_compile_smoke`
+- compile support plumbing in `test/prototype/mx_formats/test_nvfp4_fsdp2_tp.py`
+- compile-friendly explicit DTensor unwrapping in `NVFP4TrainingLinear.forward`
+
+Cheap checks passed:
+
+```bash
+python -m py_compile test/prototype/mx_formats/test_nvfp4_parallel.py test/prototype/mx_formats/test_nvfp4_fsdp2_tp.py
+git diff --check
+```
+
+Initial distributed validation failed:
+
+```bash
+PYTHONUNBUFFERED=1 torchrun --nproc_per_node=2 -m pytest test/prototype/mx_formats/test_nvfp4_parallel.py::test_mlp_colwise_rowwise_parallelize_module_cuda_graph_compile -q
+```
+
+Failure:
+- `torch._dynamo.exc.Unsupported`
+- root cause:
+  `NotImplementedError: Operator torchao.triton_weight_quantize_2d.default does not have a sharding strategy registered.`
+
+### Evidence
+The error occurs during Dynamo fake-tensor tracing of
+`NVFP4TrainingLinear.forward -> nvfp4_col_parallel_linear ->
+nvfp4_col_parallel_mm.apply`, where the autograd function receives DTensor
+weight/bias arguments.
+
+### Interpretation
+This is a `torch.compile` + DTensor + custom-op sharding integration issue, not
+a CUDA graph replay failure. The eager TP MLP and FSDP2+TP tests pass.
+
+### Debug Result
+Confirmed with a single `NVFP4TrainingLinear` under `NVFP4ColwiseParallel`:
+- eager reaches `nvfp4_col_parallel_mm.apply` with local tensor weight/bias
+- `torch.compile(..., fullgraph=True)` reaches the same boundary with DTensor
+  weight/bias
+
+This points at the `hasattr(..., "to_local")` unwrap in
+`NVFP4TrainingLinear.forward`; Dynamo does not preserve/evaluate it the same way
+eager does.
+
+Replacing the `hasattr(w, "to_local")` / `hasattr(bias, "to_local")` checks in
+`NVFP4TrainingLinear.forward` with explicit local `isinstance(..., DTensor)`
+checks fixed the boundary. Compiled tracing now passes local tensor weight/bias
+to `nvfp4_col_parallel_mm.apply`.
+
+2-rank TP compile/CUDA-graph validation passed:
+
+```bash
+PYTHONUNBUFFERED=1 torchrun --nproc_per_node=2 -m pytest test/prototype/mx_formats/test_nvfp4_parallel.py::test_mlp_colwise_rowwise_parallelize_module_cuda_graph_compile -q
+```
+
+Result:
+- `1 passed, 14 warnings in 154.35s`
+
+4-rank FSDP2+TP compile/CUDA-graph validation passed:
+
+```bash
+PYTHONUNBUFFERED=1 torchrun --standalone --nproc_per_node=4 -m pytest test/prototype/mx_formats/test_nvfp4_fsdp2_tp.py::test_nvfp4_mlp_fsdp2_tp_cuda_graph_compile_smoke -q
+```
+
+Result:
+- `1 passed, 14 warnings in 156.83s` on each rank
+
+### Risk
+Coverage is still smoke-level for FSDP2+TP compile; it checks finite output,
+finite grads, and optimizer step, not numeric parity.
+
+### Best Next Mode
+vet
+
+---
+
 ## MLP Composition And FSDP2+TP Coverage
 
 ### Goal
