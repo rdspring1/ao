@@ -18,13 +18,19 @@ import pytest
 import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
+from torch.distributed.tensor import DTensor, Replicate, Shard
+from torch.distributed.tensor.parallel import parallelize_module
 
+from torchao.quantization.quantize_.common.kernel_preference import KernelPreference
 from torchao.quantization.utils import compute_error
 from torchao.prototype.mx_formats.nvfp4_tensor_parallel import (
+    NVFP4ColwiseParallel,
+    NVFP4RowwiseParallel,
     nvfp4_col_parallel_mm,
     nvfp4_row_parallel_mm,
     swap_first_dims,
 )
+from torchao.prototype.mx_formats.nvfp4_training import NVFP4TrainingLinear
 from torchao.utils import is_sm_at_least_100
 
 
@@ -281,6 +287,91 @@ def test_column_backward(distributed_env: DeviceMesh):
     torch.testing.assert_close(bias_local.grad, db_ref, atol=0, rtol=0)
 
 
+def test_column_parallelize_module(distributed_env: DeviceMesh):
+    """Verify NVFP4ColwiseParallel works through parallelize_module."""
+    mesh = distributed_env
+    device = mesh.device_type
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    M, K, N = 512, 256, 512
+
+    assert M % world_size == 0 and N % world_size == 0
+    M_per_rank = M // world_size
+    N_per_rank = N // world_size
+
+    torch.manual_seed(29)
+    module = NVFP4TrainingLinear(
+        K,
+        N,
+        bias=True,
+        kernel_preference=KernelPreference.TRITON,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    w_full = module.weight.detach().clone()
+    bias_full = module.bias.detach().clone()
+    module = parallelize_module(module, mesh, NVFP4ColwiseParallel())
+
+    assert module.process_group is not None
+    assert module.world_size == world_size
+    assert module.tensor_parallel_style == "colwise"
+    assert isinstance(module.weight, DTensor)
+    assert isinstance(module.bias, DTensor)
+    assert module.weight.placements == (Shard(0),)
+    assert module.bias.placements == (Shard(0),)
+
+    x_full = torch.randn(M, K, dtype=torch.bfloat16, device=device)
+    dy_full = torch.randn(M, N, dtype=torch.bfloat16, device=device)
+    x_local = (
+        x_full[rank * M_per_rank : (rank + 1) * M_per_rank, :]
+        .contiguous()
+        .detach()
+        .requires_grad_(True)
+    )
+    dy_local = dy_full[:, rank * N_per_rank : (rank + 1) * N_per_rank].contiguous()
+
+    y = module(x_local)
+    y.backward(dy_local)
+
+    weight_grad = module.weight.grad.to_local()
+    bias_grad = module.bias.grad.to_local()
+    assert x_local.grad is not None, "x_local.grad is None"
+    assert weight_grad is not None, "weight grad is None"
+    assert bias_grad is not None, "bias grad is None"
+    assert y.shape == (
+        M,
+        N_per_rank,
+    ), f"Rank {rank}: expected ({M}, {N_per_rank}), got {y.shape}"
+    assert x_local.grad.shape == (M_per_rank, K)
+    assert weight_grad.shape == (N_per_rank, K)
+    assert bias_grad.shape == (N_per_rank,)
+
+    x_ref = x_full.float().detach().requires_grad_(True)
+    w_ref = w_full.float().detach().requires_grad_(True)
+    y_ref = x_ref @ w_ref.t() + bias_full.float()
+    y_ref.backward(dy_full.float())
+
+    y_ref_shard = y_ref[:, rank * N_per_rank : (rank + 1) * N_per_rank]
+    dx_ref = x_ref.grad[rank * M_per_rank : (rank + 1) * M_per_rank, :]
+    dw_ref = w_ref.grad[rank * N_per_rank : (rank + 1) * N_per_rank, :]
+    db_ref = dy_local.sum(dim=0)
+
+    SQNR_THRESHOLD = 15.0
+    DX_SQNR_THRESHOLD = 14.0
+    DW_SQNR_THRESHOLD = 14.0
+    y_sqnr = compute_error(y_ref_shard, y.float())
+    dx_sqnr = compute_error(dx_ref, x_local.grad.float())
+    dw_sqnr = compute_error(dw_ref, weight_grad.float())
+    assert y_sqnr >= SQNR_THRESHOLD, f"Forward SQNR {y_sqnr:.2f} dB < {SQNR_THRESHOLD} dB"
+    assert (
+        dx_sqnr >= DX_SQNR_THRESHOLD
+    ), f"dx SQNR {dx_sqnr:.2f} dB < {DX_SQNR_THRESHOLD} dB"
+    assert (
+        dw_sqnr >= DW_SQNR_THRESHOLD
+    ), f"dw SQNR {dw_sqnr:.2f} dB < {DW_SQNR_THRESHOLD} dB"
+    torch.testing.assert_close(bias_grad, db_ref, atol=0, rtol=0)
+
+
 def test_row_single_rank_equivalence(distributed_env: DeviceMesh):
     """Verify the row-parallel autograd function matches the single-GPU NVFP4 path at world_size=1."""
     from torchao.prototype.mx_formats.nvfp4_linear import nvfp4_mm_triton
@@ -438,3 +529,90 @@ def test_row_backward(distributed_env: DeviceMesh):
         dw_sqnr >= DW_SQNR_THRESHOLD
     ), f"dw SQNR {dw_sqnr:.2f} dB < {DW_SQNR_THRESHOLD} dB"
     torch.testing.assert_close(bias.grad, db_ref, atol=0, rtol=0)
+
+
+def test_row_parallelize_module(distributed_env: DeviceMesh):
+    """Verify NVFP4RowwiseParallel works through parallelize_module."""
+    mesh = distributed_env
+    device = mesh.device_type
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    tp_group = mesh.get_group()
+    M, K, N = 512, 256, 512
+
+    assert M % world_size == 0 and K % world_size == 0
+    M_per_rank = M // world_size
+    K_per_rank = K // world_size
+
+    torch.manual_seed(31)
+    module = NVFP4TrainingLinear(
+        K,
+        N,
+        bias=True,
+        kernel_preference=KernelPreference.TRITON,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    w_full = module.weight.detach().clone()
+    bias_full = module.bias.detach().clone()
+    module = parallelize_module(module, mesh, NVFP4RowwiseParallel())
+
+    assert module.process_group is not None
+    assert module.world_size == world_size
+    assert module.tensor_parallel_style == "rowwise"
+    assert isinstance(module.weight, DTensor)
+    assert isinstance(module.bias, DTensor)
+    assert module.weight.placements == (Shard(1),)
+    assert module.bias.placements == (Replicate(),)
+
+    x_full = torch.randn(M, K, dtype=torch.bfloat16, device=device)
+    dy_full = torch.randn(M, N, dtype=torch.bfloat16, device=device)
+    x_local = (
+        x_full[:, rank * K_per_rank : (rank + 1) * K_per_rank]
+        .contiguous()
+        .detach()
+        .requires_grad_(True)
+    )
+    dy_local = dy_full[rank * M_per_rank : (rank + 1) * M_per_rank, :].contiguous()
+
+    y = module(x_local)
+    y.backward(dy_local)
+
+    weight_grad = module.weight.grad.to_local()
+    bias_grad = module.bias.grad.to_local()
+    assert x_local.grad is not None, "x_local.grad is None"
+    assert weight_grad is not None, "weight grad is None"
+    assert bias_grad is not None, "bias grad is None"
+    assert y.shape == (
+        M_per_rank,
+        N,
+    ), f"Rank {rank}: expected ({M_per_rank}, {N}), got {y.shape}"
+    assert x_local.grad.shape == (M, K_per_rank)
+    assert weight_grad.shape == (N, K_per_rank)
+    assert bias_grad.shape == (N,)
+
+    x_ref = x_full.float().detach().requires_grad_(True)
+    w_ref = w_full.float().detach().requires_grad_(True)
+    y_ref = x_ref @ w_ref.t() + bias_full.float()
+    y_ref.backward(dy_full.float())
+
+    y_ref_shard = y_ref[rank * M_per_rank : (rank + 1) * M_per_rank, :]
+    dx_ref = x_ref.grad[:, rank * K_per_rank : (rank + 1) * K_per_rank]
+    dw_ref = w_ref.grad[:, rank * K_per_rank : (rank + 1) * K_per_rank]
+    db_ref = dy_local.sum(dim=0)
+    dist.all_reduce(db_ref, op=dist.ReduceOp.SUM, group=tp_group)
+
+    SQNR_THRESHOLD = 15.0
+    DX_SQNR_THRESHOLD = 14.0
+    DW_SQNR_THRESHOLD = 14.0
+    y_sqnr = compute_error(y_ref_shard, y.float())
+    dx_sqnr = compute_error(dx_ref, x_local.grad.float())
+    dw_sqnr = compute_error(dw_ref, weight_grad.float())
+    assert y_sqnr >= SQNR_THRESHOLD, f"Forward SQNR {y_sqnr:.2f} dB < {SQNR_THRESHOLD} dB"
+    assert (
+        dx_sqnr >= DX_SQNR_THRESHOLD
+    ), f"dx SQNR {dx_sqnr:.2f} dB < {DX_SQNR_THRESHOLD} dB"
+    assert (
+        dw_sqnr >= DW_SQNR_THRESHOLD
+    ), f"dw SQNR {dw_sqnr:.2f} dB < {DW_SQNR_THRESHOLD} dB"
+    torch.testing.assert_close(bias_grad, db_ref, atol=0, rtol=0)

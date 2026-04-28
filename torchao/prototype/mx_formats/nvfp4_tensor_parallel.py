@@ -9,7 +9,7 @@ NVFP4 tensor-parallel linear helpers for sequence-parallel training.
 
 Implements the column-parallel protocol described in:
   cutile/rht/docs/nvfp4_column_parallel_linear.md
-and scaffolds the row-parallel protocol described in:
+and the row-parallel protocol described in:
   cutile/rht/docs/nvfp4_row_parallel_linear.md
 
 The all-gather and reduce-scatter collectives are handled inside the autograd
@@ -481,7 +481,8 @@ class nvfp4_row_parallel_mm(torch.autograd.Function):
             output_dtype=torch.bfloat16,
         )
 
-        # --- Reduce-scatter outer product output along sequence dim → dx [m/w, n] ---
+        # --- Reduce-scatter outer product output along sequence dim
+        # → output [m/w, n] ---
         # TODO TE accumulates in bf16. Perhaps there should be an option for fp32
         # accumulation.
         output = reduce_scatter_tensor(output_hat, "SUM", scatter_dim=0, group=tp_group)
@@ -701,9 +702,14 @@ class NVFP4ColwiseParallel(ColwiseParallel):
 class NVFP4RowwiseParallel(RowwiseParallel):
     """RowwiseParallel for NVFP4TrainingLinear with row-parallel TP.
 
-    Weight sharding (DTensor Shard(1)) is handled by the parent class. The
-    autograd forward/backward path is intentionally stubbed in
-    ``nvfp4_row_parallel_mm`` for follow-up implementation.
+    Subclasses RowwiseParallel to inject the process group into
+    NVFP4TrainingLinear so its forward dispatches to nvfp4_row_parallel_linear.
+    Weight sharding (DTensor Shard(1)) and replicated bias placement are handled
+    by the parent class.
+
+    The NVFP4 collectives (amax all-reduce, FP4 all-gather, reduce-scatter) run
+    inside nvfp4_row_parallel_mm, so runtime hooks pass local tensor shards
+    through instead of redistributing BF16 activations.
     """
 
     @staticmethod
