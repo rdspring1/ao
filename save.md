@@ -169,3 +169,73 @@ described as implemented.
 
 ### Best Next Mode
 vet
+
+---
+
+## MLP Composition And FSDP2+TP Coverage
+
+### Goal
+Add one NVFP4 MLP-style composition test that exercises:
+- `NVFP4ColwiseParallel` hidden projections
+- DTensor activation handoff between colwise outputs
+- `NVFP4RowwiseParallel` output projection
+
+Then add a separate 2-D mesh `(dp, tp) = (2, 2)` FSDP2+TP smoke test.
+
+### Current State
+Done. Added:
+- `NVFP4MLP`
+- `_fp32_mlp_reference`
+- `test_mlp_colwise_rowwise_parallelize_module`
+- `test/prototype/mx_formats/test_nvfp4_fsdp2_tp.py`
+- `test_nvfp4_mlp_fsdp2_tp_smoke`
+
+The MLP tests use:
+- `w1`: `NVFP4ColwiseParallel(use_local_output=False)`
+- `w2`: `NVFP4ColwiseParallel(use_local_output=False)`
+- `out_proj`: `NVFP4RowwiseParallel()`
+
+Debug note:
+- The first MLP attempt passed full `[M, K]` input to the colwise layer.
+- Instrumentation showed colwise all-gather produced hidden DTensors with global
+  shape `[M * tp, H]`.
+- The test was fixed to pass local sequence input `[M / tp, K]` to the composed
+  NVFP4 TP model while keeping the fp32 reference on the full input.
+
+Checks passed:
+
+```bash
+python -m py_compile test/prototype/mx_formats/test_nvfp4_parallel.py
+python -m py_compile test/prototype/mx_formats/test_nvfp4_fsdp2_tp.py
+git diff --check
+```
+
+Focused MLP validation passed:
+
+```bash
+PYTHONUNBUFFERED=1 torchrun --nproc_per_node=2 -m pytest test/prototype/mx_formats/test_nvfp4_parallel.py::test_mlp_colwise_rowwise_parallelize_module -q
+```
+
+Result:
+- `1 passed in 16.03s`
+
+Full 2-rank TP validation passed:
+
+```bash
+PYTHONUNBUFFERED=1 torchrun --nproc_per_node=2 -m pytest test/prototype/mx_formats/test_nvfp4_parallel.py -q
+```
+
+Result:
+- `10 passed, 2 warnings in 30.00s`
+
+4-rank FSDP2+TP validation passed:
+
+```bash
+PYTHONUNBUFFERED=1 torchrun --standalone --nproc_per_node=4 -m pytest test/prototype/mx_formats/test_nvfp4_fsdp2_tp.py -q
+```
+
+Result:
+- `1 passed in 20.94s` on each rank
+
+### Best Next Mode
+vet

@@ -17,6 +17,8 @@ import os
 import pytest
 import torch
 import torch.distributed as dist
+import torch.nn as nn
+import torch.nn.functional as F
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed.tensor import DTensor, Replicate, Shard
 from torch.distributed.tensor.parallel import parallelize_module
@@ -39,6 +41,61 @@ if not torch.cuda.is_available():
 
 if not is_sm_at_least_100():
     pytest.skip("Requires SM100+ hardware", allow_module_level=True)
+
+
+class NVFP4MLP(nn.Module):
+    """Small gated MLP using NVFP4TrainingLinear layers."""
+
+    def __init__(
+        self,
+        size: int,
+        hidden_size: int,
+        *,
+        device: str | torch.device,
+        dtype: torch.dtype,
+    ):
+        super().__init__()
+        self.w1 = NVFP4TrainingLinear(
+            size,
+            hidden_size,
+            bias=True,
+            kernel_preference=KernelPreference.TRITON,
+            device=device,
+            dtype=dtype,
+        )
+        self.w2 = NVFP4TrainingLinear(
+            size,
+            hidden_size,
+            bias=True,
+            kernel_preference=KernelPreference.TRITON,
+            device=device,
+            dtype=dtype,
+        )
+        self.out_proj = NVFP4TrainingLinear(
+            hidden_size,
+            size,
+            bias=True,
+            kernel_preference=KernelPreference.TRITON,
+            device=device,
+            dtype=dtype,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        hidden = F.silu(self.w1(x)) * self.w2(x)
+        return self.out_proj(hidden)
+
+
+def _fp32_mlp_reference(
+    x: torch.Tensor,
+    weights: dict[str, torch.Tensor],
+) -> torch.Tensor:
+    w1 = F.linear(x.float(), weights["w1.weight"].float(), weights["w1.bias"].float())
+    w2 = F.linear(x.float(), weights["w2.weight"].float(), weights["w2.bias"].float())
+    return F.linear(
+        F.silu(w1) * w2,
+        weights["out_proj.weight"].float(),
+        weights["out_proj.bias"].float(),
+    )
 
 
 @pytest.fixture(scope="module")
@@ -362,7 +419,9 @@ def test_column_parallelize_module(distributed_env: DeviceMesh):
     y_sqnr = compute_error(y_ref_shard, y.float())
     dx_sqnr = compute_error(dx_ref, x_local.grad.float())
     dw_sqnr = compute_error(dw_ref, weight_grad.float())
-    assert y_sqnr >= SQNR_THRESHOLD, f"Forward SQNR {y_sqnr:.2f} dB < {SQNR_THRESHOLD} dB"
+    assert (
+        y_sqnr >= SQNR_THRESHOLD
+    ), f"Forward SQNR {y_sqnr:.2f} dB < {SQNR_THRESHOLD} dB"
     assert (
         dx_sqnr >= DX_SQNR_THRESHOLD
     ), f"dx SQNR {dx_sqnr:.2f} dB < {DX_SQNR_THRESHOLD} dB"
@@ -608,7 +667,9 @@ def test_row_parallelize_module(distributed_env: DeviceMesh):
     y_sqnr = compute_error(y_ref_shard, y.float())
     dx_sqnr = compute_error(dx_ref, x_local.grad.float())
     dw_sqnr = compute_error(dw_ref, weight_grad.float())
-    assert y_sqnr >= SQNR_THRESHOLD, f"Forward SQNR {y_sqnr:.2f} dB < {SQNR_THRESHOLD} dB"
+    assert (
+        y_sqnr >= SQNR_THRESHOLD
+    ), f"Forward SQNR {y_sqnr:.2f} dB < {SQNR_THRESHOLD} dB"
     assert (
         dx_sqnr >= DX_SQNR_THRESHOLD
     ), f"dx SQNR {dx_sqnr:.2f} dB < {DX_SQNR_THRESHOLD} dB"
@@ -616,3 +677,81 @@ def test_row_parallelize_module(distributed_env: DeviceMesh):
         dw_sqnr >= DW_SQNR_THRESHOLD
     ), f"dw SQNR {dw_sqnr:.2f} dB < {DW_SQNR_THRESHOLD} dB"
     torch.testing.assert_close(bias_grad, db_ref, atol=0, rtol=0)
+
+
+def test_mlp_colwise_rowwise_parallelize_module(distributed_env: DeviceMesh):
+    """Verify colwise-to-rowwise NVFP4 MLP composition through parallelize_module."""
+    mesh = distributed_env
+    device = mesh.device_type
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    M, K, H = 512, 256, 512
+
+    assert M % world_size == 0 and H % world_size == 0
+    M_per_rank = M // world_size
+    H_per_rank = H // world_size
+
+    torch.manual_seed(37)
+    model = NVFP4MLP(K, H, device=device, dtype=torch.bfloat16)
+    weights = {name: param.detach().clone() for name, param in model.named_parameters()}
+    model = parallelize_module(
+        model,
+        mesh,
+        {
+            "w1": NVFP4ColwiseParallel(use_local_output=False),
+            "w2": NVFP4ColwiseParallel(use_local_output=False),
+            "out_proj": NVFP4RowwiseParallel(),
+        },
+    )
+
+    assert model.w1.tensor_parallel_style == "colwise"
+    assert model.w2.tensor_parallel_style == "colwise"
+    assert model.out_proj.tensor_parallel_style == "rowwise"
+    assert model.w1.weight.placements == (Shard(0),)
+    assert model.w2.weight.placements == (Shard(0),)
+    assert model.out_proj.weight.placements == (Shard(1),)
+    assert model.w1.bias.placements == (Shard(0),)
+    assert model.w2.bias.placements == (Shard(0),)
+    assert model.out_proj.bias.placements == (Replicate(),)
+
+    x_full = torch.randn(M, K, dtype=torch.bfloat16, device=device)
+    x_local = x_full[rank * M_per_rank : (rank + 1) * M_per_rank, :].contiguous()
+
+    y = model(x_local)
+
+    assert y.shape == (
+        M_per_rank,
+        K,
+    ), f"Rank {rank}: expected ({M_per_rank}, {K}), got {y.shape}"
+    dy = torch.randn_like(y)
+    y.backward(dy)
+
+    assert y.dtype == torch.bfloat16
+    assert not y.isnan().any(), "MLP output contains NaN"
+
+    local_grads = {
+        "w1.weight": model.w1.weight.grad.to_local(),
+        "w1.bias": model.w1.bias.grad.to_local(),
+        "w2.weight": model.w2.weight.grad.to_local(),
+        "w2.bias": model.w2.bias.grad.to_local(),
+        "out_proj.weight": model.out_proj.weight.grad.to_local(),
+        "out_proj.bias": model.out_proj.bias.grad.to_local(),
+    }
+    expected_grad_shapes = {
+        "w1.weight": (H_per_rank, K),
+        "w1.bias": (H_per_rank,),
+        "w2.weight": (H_per_rank, K),
+        "w2.bias": (H_per_rank,),
+        "out_proj.weight": (K, H_per_rank),
+        "out_proj.bias": (K,),
+    }
+    for name, grad in local_grads.items():
+        assert grad is not None, f"{name}.grad is None"
+        assert grad.shape == expected_grad_shapes[name]
+        assert not grad.isnan().any(), f"{name}.grad contains NaN"
+
+    y_ref = _fp32_mlp_reference(x_full, weights)
+    y_ref_shard = y_ref[rank * M_per_rank : (rank + 1) * M_per_rank, :]
+    sqnr = compute_error(y_ref_shard, y.float())
+    SQNR_THRESHOLD = 10.0
+    assert sqnr >= SQNR_THRESHOLD, f"MLP SQNR {sqnr:.2f} dB < {SQNR_THRESHOLD} dB"
