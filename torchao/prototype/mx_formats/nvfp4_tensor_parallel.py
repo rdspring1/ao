@@ -329,7 +329,7 @@ class nvfp4_col_parallel_mm(torch.autograd.Function):
         )
 
         # --- Reduce-scatter dgrad along sequence dim → dx [m/w, k] ---
-        # TODO TE accumulates in bf16. Perhaps there should be an option for fp32
+        # TODO Perhaps there should be an option for fp32
         # accumulation.
         dx = reduce_scatter_tensor(dx_hat, "SUM", scatter_dim=0, group=tp_group)
         if isinstance(dx, AsyncCollectiveTensor):
@@ -483,7 +483,7 @@ class nvfp4_row_parallel_mm(torch.autograd.Function):
 
         # --- Reduce-scatter outer product output along sequence dim
         # → output [m/w, n] ---
-        # TODO TE accumulates in bf16. Perhaps there should be an option for fp32
+        # TODO Perhaps there should be an option for fp32
         # accumulation.
         output = reduce_scatter_tensor(output_hat, "SUM", scatter_dim=0, group=tp_group)
 

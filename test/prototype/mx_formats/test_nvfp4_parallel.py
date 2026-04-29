@@ -213,7 +213,7 @@ def test_column_single_rank_equivalence(distributed_env: DeviceMesh):
 
     # Single-GPU reference
     sr_seed_ref = sr_seed.clone()
-    y_ref = nvfp4_mm_triton.apply(x.clone(), w.clone(), bias.clone(), None, sr_seed_ref)
+    y_ref = nvfp4_mm_triton.apply(x.clone(), w.clone(), bias.clone(), sr_seed_ref)
 
     # Column-parallel with world_size=1 (no actual distributed calls needed,
     # but we use a trivial group with just rank 0)
@@ -466,7 +466,7 @@ def test_row_single_rank_equivalence(distributed_env: DeviceMesh):
     )
 
     sr_seed_ref = sr_seed.clone()
-    y_ref = nvfp4_mm_triton.apply(x.clone(), w.clone(), bias.clone(), None, sr_seed_ref)
+    y_ref = nvfp4_mm_triton.apply(x.clone(), w.clone(), bias.clone(), sr_seed_ref)
 
     sr_seed_tp = sr_seed.clone()
     y_tp = nvfp4_row_parallel_mm.apply(

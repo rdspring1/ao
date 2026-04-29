@@ -40,18 +40,15 @@ class NVFP4TrainingConfig(AOBaseConfig):
 
     Args:
         kernel_preference: Backend for quantization kernels.
-            TORCH: TorchAO native (round-to-nearest, no RHT).
-            TE: TransformerEngine NVFP4Quantizer (stochastic rounding + RHT).
-            AUTO: Use TE if available, else TORCH.
             TRITON: Pure-Triton RHT + stochastic rounding path.
-            Default: TORCH.
+            Default: TRITON.
         process_group: Optional ProcessGroup for tensor-parallel TP.
             When set with kernel_preference=TRITON, forward dispatches to
             the selected NVFP4 tensor-parallel path.
         world_size: TP world size.  Inferred from process_group if None.
     """
 
-    kernel_preference: KernelPreference = KernelPreference.TORCH
+    kernel_preference: KernelPreference = KernelPreference.TRITON
     process_group: Optional[object] = field(default=None, compare=False)
     world_size: Optional[int] = None
 
@@ -72,7 +69,7 @@ class NVFP4TrainingLinear(nn.Linear):
         in_features: int,
         out_features: int,
         bias: bool = False,
-        kernel_preference: KernelPreference = KernelPreference.TORCH,
+        kernel_preference: KernelPreference = KernelPreference.TRITON,
         process_group=None,
         world_size: Optional[int] = None,
         device=None,
@@ -131,7 +128,7 @@ class NVFP4TrainingLinear(nn.Linear):
     def from_linear(
         cls,
         mod: nn.Linear,
-        kernel_preference: KernelPreference = KernelPreference.TORCH,
+        kernel_preference: KernelPreference = KernelPreference.TRITON,
         process_group=None,
         world_size: Optional[int] = None,
     ) -> "NVFP4TrainingLinear":

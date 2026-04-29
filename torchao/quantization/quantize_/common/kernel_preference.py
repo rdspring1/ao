@@ -41,16 +41,10 @@ class KernelPreference(str, Enum):
     2. Debugging kernel numerics issues.
     """
 
-    TE = "te"
-    """Use TransformerEngine quantize kernels as a backend. Enables features
-    not yet available natively in TorchAO (e.g., stochastic rounding, RHT
-    for NVFP4 training). Requires the transformer_engine package.
-    """
-
     TRITON = "triton"
     """Use pure-triton RHT + stochastic rounding kernels already in TorchAO.
-    No TransformerEngine dependency. Full NVFP4 training recipe: RHT on forward
-    activations, stochastic rounding + RHT on backward gradients.
+    Full NVFP4 training recipe: RHT on forward activations,
+    stochastic rounding + RHT on backward gradients.
     Requires bfloat16 input; M, K, N all divisible by 128.
     """
 
