@@ -182,8 +182,6 @@ class nvfp4_col_parallel_mm(torch.autograd.Function):
         world_size: int,
     ) -> torch.Tensor:
         M_local = x.shape[0]
-        K = x.shape[1]
-        N_local = w.shape[0]
 
         if x.dtype != torch.bfloat16:
             x = x.to(torch.bfloat16)
@@ -424,8 +422,6 @@ class nvfp4_row_parallel_mm(torch.autograd.Function):
         world_size: int,
     ) -> torch.Tensor:
         M_local = x.shape[0]
-        K = x.shape[1]
-        N_local = w.shape[0]
 
         if x.dtype != torch.bfloat16:
             x = x.to(torch.bfloat16)

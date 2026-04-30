@@ -1,4 +1,5 @@
 """Tests for triton_rht_amax (SM90+ kernel)."""
+
 import pytest
 import torch
 
@@ -8,7 +9,6 @@ from torchao.prototype.mx_formats.hadamard_utils import (
     get_wgrad_sign_vector,
 )
 from torchao.utils import is_sm_at_least_90
-
 
 _HARDCODED_SIGN_VECTOR = (
     1,

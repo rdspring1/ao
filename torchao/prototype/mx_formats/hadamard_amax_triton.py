@@ -6,16 +6,19 @@ the post-RHT output without materializing the full (N, M) output tensor. Uses a
 persistent warp-specialized TMA kernel with per-CTA cumulative max and one atomic_max
 per CTA into a caller-provided scalar buffer.
 """
+
 import itertools
 from typing import List, Tuple
-import triton
-import triton.language as tl
+
 import torch
 import torch.nn.functional as F
+import triton
+import triton.language as tl
+
 from torchao.prototype.mx_formats.hadamard_utils import (
+    _compute_pid,
     get_rht_matrix,
     prepare_for_cuda_graph,
-    _compute_pid,
 )
 from torchao.utils import is_sm_at_least_90
 

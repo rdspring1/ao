@@ -94,12 +94,13 @@ class NVFP4TrainingLinear(nn.Linear):
             self.process_group is not None
             and self.kernel_preference == KernelPreference.TRITON
         ):
+            import torch.distributed as dist
+            from torch.distributed.tensor import DTensor
+
             from torchao.prototype.mx_formats.nvfp4_tensor_parallel import (
                 nvfp4_col_parallel_linear,
                 nvfp4_row_parallel_linear,
             )
-            import torch.distributed as dist
-            from torch.distributed.tensor import DTensor
 
             ws = self.world_size
             if ws is None:

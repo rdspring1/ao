@@ -32,16 +32,15 @@ from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.parallel import parallelize_module
 
-from torchao.quantization.quantize_.common.kernel_preference import KernelPreference
 from torchao.prototype.mx_formats.hadamard_utils import prepare_for_cuda_graph
 from torchao.prototype.mx_formats.nvfp4_tensor_parallel import (
+    _TP_RHT_SIGN_VECTOR,
     NVFP4ColwiseParallel,
     NVFP4RowwiseParallel,
-    _TP_RHT_SIGN_VECTOR,
 )
 from torchao.prototype.mx_formats.nvfp4_training import NVFP4TrainingLinear
+from torchao.quantization.quantize_.common.kernel_preference import KernelPreference
 from torchao.utils import is_sm_at_least_100, torch_version_at_least
-
 
 if not torch.cuda.is_available():
     pytest.skip("Requires CUDA", allow_module_level=True)

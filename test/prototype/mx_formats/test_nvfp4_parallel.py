@@ -23,20 +23,19 @@ from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed.tensor import DTensor, Replicate, Shard
 from torch.distributed.tensor.parallel import parallelize_module
 
-from torchao.quantization.quantize_.common.kernel_preference import KernelPreference
-from torchao.quantization.utils import compute_error
 from torchao.prototype.mx_formats.hadamard_utils import prepare_for_cuda_graph
 from torchao.prototype.mx_formats.nvfp4_tensor_parallel import (
+    _TP_RHT_SIGN_VECTOR,
     NVFP4ColwiseParallel,
     NVFP4RowwiseParallel,
-    _TP_RHT_SIGN_VECTOR,
     nvfp4_col_parallel_mm,
     nvfp4_row_parallel_mm,
     swap_first_dims,
 )
 from torchao.prototype.mx_formats.nvfp4_training import NVFP4TrainingLinear
+from torchao.quantization.quantize_.common.kernel_preference import KernelPreference
+from torchao.quantization.utils import compute_error
 from torchao.utils import is_sm_at_least_100, torch_version_at_least
-
 
 if not torch.cuda.is_available():
     pytest.skip("Requires CUDA", allow_module_level=True)
@@ -163,9 +162,9 @@ def test_swap_first_dims(distributed_env: DeviceMesh):
 
     result = swap_first_dims(nccl_result, world_size)  # [K, M//2]
 
-    assert (
-        result.shape == ground_truth.shape
-    ), f"Expected {ground_truth.shape}, got {result.shape}"
+    assert result.shape == ground_truth.shape, (
+        f"Expected {ground_truth.shape}, got {result.shape}"
+    )
     torch.testing.assert_close(result, ground_truth, atol=0, rtol=0)
 
     # Also test 4-D scale tensor
@@ -187,9 +186,9 @@ def test_swap_first_dims(distributed_env: DeviceMesh):
         scale_parts, dim=0
     )  # [K_blocks*W, M_blocks_per_rank, 32, 16]
     scale_result = swap_first_dims(scale_nccl, world_size)
-    assert (
-        scale_result.shape == scale_truth.shape
-    ), f"Expected {scale_truth.shape}, got {scale_result.shape}"
+    assert scale_result.shape == scale_truth.shape, (
+        f"Expected {scale_truth.shape}, got {scale_result.shape}"
+    )
     torch.testing.assert_close(scale_result, scale_truth, atol=0, rtol=0)
 
 
@@ -210,9 +209,7 @@ def test_column_single_rank_equivalence(distributed_env: DeviceMesh):
     x = torch.randn(M, K, dtype=torch.bfloat16, device=device)
     w = torch.randn(N, K, dtype=torch.bfloat16, device=device)
     bias = torch.randn(N, dtype=torch.bfloat16, device=device)
-    sr_seed = torch.randint(
-        -(2**63), 2**63 - 1, (1,), dtype=torch.int64, device=device
-    )
+    sr_seed = torch.randint(-(2**63), 2**63 - 1, (1,), dtype=torch.int64, device=device)
 
     # Single-GPU reference
     sr_seed_ref = sr_seed.clone()
@@ -250,9 +247,7 @@ def test_column_forward(distributed_env: DeviceMesh):
     x_local = x_full[rank * M_per_rank : (rank + 1) * M_per_rank, :]
     w_local = w_full[rank * N_per_rank : (rank + 1) * N_per_rank, :]
     bias_local = bias_full[rank * N_per_rank : (rank + 1) * N_per_rank]
-    sr_seed = torch.randint(
-        -(2**63), 2**63 - 1, (1,), dtype=torch.int64, device=device
-    )
+    sr_seed = torch.randint(-(2**63), 2**63 - 1, (1,), dtype=torch.int64, device=device)
 
     y = nvfp4_col_parallel_mm.apply(
         x_local, w_local, bias_local, sr_seed, tp_group, world_size
@@ -310,9 +305,7 @@ def test_column_backward(distributed_env: DeviceMesh):
         .requires_grad_(True)
     )
     dy_local = dy_full[:, rank * N_per_rank : (rank + 1) * N_per_rank].contiguous()
-    sr_seed = torch.randint(
-        -(2**63), 2**63 - 1, (1,), dtype=torch.int64, device=device
-    )
+    sr_seed = torch.randint(-(2**63), 2**63 - 1, (1,), dtype=torch.int64, device=device)
 
     y = nvfp4_col_parallel_mm.apply(
         x_local, w_local, bias_local, sr_seed, tp_group, world_size
@@ -331,9 +324,9 @@ def test_column_backward(distributed_env: DeviceMesh):
         N_per_rank,
         K,
     ), f"Rank {rank}: dw shape expected ({N_per_rank}, {K}), got {w_local.grad.shape}"
-    assert bias_local.grad.shape == (
-        N_per_rank,
-    ), f"Rank {rank}: db shape expected ({N_per_rank},), got {bias_local.grad.shape}"
+    assert bias_local.grad.shape == (N_per_rank,), (
+        f"Rank {rank}: db shape expected ({N_per_rank},), got {bias_local.grad.shape}"
+    )
     assert not x_local.grad.isnan().any(), "dx contains NaN"
     assert not w_local.grad.isnan().any(), "dw contains NaN"
     assert not bias_local.grad.isnan().any(), "db contains NaN"
@@ -351,12 +344,12 @@ def test_column_backward(distributed_env: DeviceMesh):
     dw_sqnr = compute_error(dw_ref, w_local.grad.float())
     DX_SQNR_THRESHOLD = 14.0
     DW_SQNR_THRESHOLD = 14.0
-    assert (
-        dx_sqnr >= DX_SQNR_THRESHOLD
-    ), f"dx SQNR {dx_sqnr:.2f} dB < {DX_SQNR_THRESHOLD} dB"
-    assert (
-        dw_sqnr >= DW_SQNR_THRESHOLD
-    ), f"dw SQNR {dw_sqnr:.2f} dB < {DW_SQNR_THRESHOLD} dB"
+    assert dx_sqnr >= DX_SQNR_THRESHOLD, (
+        f"dx SQNR {dx_sqnr:.2f} dB < {DX_SQNR_THRESHOLD} dB"
+    )
+    assert dw_sqnr >= DW_SQNR_THRESHOLD, (
+        f"dw SQNR {dw_sqnr:.2f} dB < {DW_SQNR_THRESHOLD} dB"
+    )
     torch.testing.assert_close(bias_local.grad, db_ref, atol=0, rtol=0)
 
 
@@ -435,15 +428,15 @@ def test_column_parallelize_module(distributed_env: DeviceMesh):
     y_sqnr = compute_error(y_ref_shard, y.float())
     dx_sqnr = compute_error(dx_ref, x_local.grad.float())
     dw_sqnr = compute_error(dw_ref, weight_grad.float())
-    assert (
-        y_sqnr >= SQNR_THRESHOLD
-    ), f"Forward SQNR {y_sqnr:.2f} dB < {SQNR_THRESHOLD} dB"
-    assert (
-        dx_sqnr >= DX_SQNR_THRESHOLD
-    ), f"dx SQNR {dx_sqnr:.2f} dB < {DX_SQNR_THRESHOLD} dB"
-    assert (
-        dw_sqnr >= DW_SQNR_THRESHOLD
-    ), f"dw SQNR {dw_sqnr:.2f} dB < {DW_SQNR_THRESHOLD} dB"
+    assert y_sqnr >= SQNR_THRESHOLD, (
+        f"Forward SQNR {y_sqnr:.2f} dB < {SQNR_THRESHOLD} dB"
+    )
+    assert dx_sqnr >= DX_SQNR_THRESHOLD, (
+        f"dx SQNR {dx_sqnr:.2f} dB < {DX_SQNR_THRESHOLD} dB"
+    )
+    assert dw_sqnr >= DW_SQNR_THRESHOLD, (
+        f"dw SQNR {dw_sqnr:.2f} dB < {DW_SQNR_THRESHOLD} dB"
+    )
     torch.testing.assert_close(bias_grad, db_ref, atol=0, rtol=0)
 
 
@@ -464,9 +457,7 @@ def test_row_single_rank_equivalence(distributed_env: DeviceMesh):
     x = torch.randn(M, K, dtype=torch.bfloat16, device=device)
     w = torch.randn(N, K, dtype=torch.bfloat16, device=device)
     bias = torch.randn(N, dtype=torch.bfloat16, device=device)
-    sr_seed = torch.randint(
-        -(2**63), 2**63 - 1, (1,), dtype=torch.int64, device=device
-    )
+    sr_seed = torch.randint(-(2**63), 2**63 - 1, (1,), dtype=torch.int64, device=device)
 
     sr_seed_ref = sr_seed.clone()
     y_ref = nvfp4_mm_triton.apply(x.clone(), w.clone(), bias.clone(), sr_seed_ref)
@@ -500,9 +491,7 @@ def test_row_forward(distributed_env: DeviceMesh):
 
     x_local = x_full[:, rank * K_per_rank : (rank + 1) * K_per_rank].contiguous()
     w_local = w_full[:, rank * K_per_rank : (rank + 1) * K_per_rank].contiguous()
-    sr_seed = torch.randint(
-        -(2**63), 2**63 - 1, (1,), dtype=torch.int64, device=device
-    )
+    sr_seed = torch.randint(-(2**63), 2**63 - 1, (1,), dtype=torch.int64, device=device)
 
     y = nvfp4_row_parallel_mm.apply(
         x_local, w_local, bias, sr_seed, tp_group, world_size
@@ -554,9 +543,7 @@ def test_row_backward(distributed_env: DeviceMesh):
         .requires_grad_(True)
     )
     dy_local = dy_full[rank * M_per_rank : (rank + 1) * M_per_rank, :].contiguous()
-    sr_seed = torch.randint(
-        -(2**63), 2**63 - 1, (1,), dtype=torch.int64, device=device
-    )
+    sr_seed = torch.randint(-(2**63), 2**63 - 1, (1,), dtype=torch.int64, device=device)
 
     y = nvfp4_row_parallel_mm.apply(
         x_local, w_local, bias, sr_seed, tp_group, world_size
@@ -575,9 +562,9 @@ def test_row_backward(distributed_env: DeviceMesh):
         N,
         K_per_rank,
     ), f"Rank {rank}: dw shape expected ({N}, {K_per_rank}), got {w_local.grad.shape}"
-    assert bias.grad.shape == (
-        N,
-    ), f"Rank {rank}: db shape expected ({N},), got {bias.grad.shape}"
+    assert bias.grad.shape == (N,), (
+        f"Rank {rank}: db shape expected ({N},), got {bias.grad.shape}"
+    )
     assert not x_local.grad.isnan().any(), "dx contains NaN"
     assert not w_local.grad.isnan().any(), "dw contains NaN"
     assert not bias.grad.isnan().any(), "db contains NaN"
@@ -597,12 +584,12 @@ def test_row_backward(distributed_env: DeviceMesh):
     dw_sqnr = compute_error(dw_ref, w_local.grad.float())
     DX_SQNR_THRESHOLD = 14.0
     DW_SQNR_THRESHOLD = 14.0
-    assert (
-        dx_sqnr >= DX_SQNR_THRESHOLD
-    ), f"dx SQNR {dx_sqnr:.2f} dB < {DX_SQNR_THRESHOLD} dB"
-    assert (
-        dw_sqnr >= DW_SQNR_THRESHOLD
-    ), f"dw SQNR {dw_sqnr:.2f} dB < {DW_SQNR_THRESHOLD} dB"
+    assert dx_sqnr >= DX_SQNR_THRESHOLD, (
+        f"dx SQNR {dx_sqnr:.2f} dB < {DX_SQNR_THRESHOLD} dB"
+    )
+    assert dw_sqnr >= DW_SQNR_THRESHOLD, (
+        f"dw SQNR {dw_sqnr:.2f} dB < {DW_SQNR_THRESHOLD} dB"
+    )
     torch.testing.assert_close(bias.grad, db_ref, atol=0, rtol=0)
 
 
@@ -683,15 +670,15 @@ def test_row_parallelize_module(distributed_env: DeviceMesh):
     y_sqnr = compute_error(y_ref_shard, y.float())
     dx_sqnr = compute_error(dx_ref, x_local.grad.float())
     dw_sqnr = compute_error(dw_ref, weight_grad.float())
-    assert (
-        y_sqnr >= SQNR_THRESHOLD
-    ), f"Forward SQNR {y_sqnr:.2f} dB < {SQNR_THRESHOLD} dB"
-    assert (
-        dx_sqnr >= DX_SQNR_THRESHOLD
-    ), f"dx SQNR {dx_sqnr:.2f} dB < {DX_SQNR_THRESHOLD} dB"
-    assert (
-        dw_sqnr >= DW_SQNR_THRESHOLD
-    ), f"dw SQNR {dw_sqnr:.2f} dB < {DW_SQNR_THRESHOLD} dB"
+    assert y_sqnr >= SQNR_THRESHOLD, (
+        f"Forward SQNR {y_sqnr:.2f} dB < {SQNR_THRESHOLD} dB"
+    )
+    assert dx_sqnr >= DX_SQNR_THRESHOLD, (
+        f"dx SQNR {dx_sqnr:.2f} dB < {DX_SQNR_THRESHOLD} dB"
+    )
+    assert dw_sqnr >= DW_SQNR_THRESHOLD, (
+        f"dw SQNR {dw_sqnr:.2f} dB < {DW_SQNR_THRESHOLD} dB"
+    )
     torch.testing.assert_close(bias_grad, db_ref, atol=0, rtol=0)
 
 
@@ -781,9 +768,7 @@ def test_mlp_colwise_rowwise_parallelize_module_cuda_graph_compile(
     assert M % world_size == 0
     M_per_rank = M // world_size
 
-    prepare_for_cuda_graph(
-        torch.device(device), sign_vectors=(_TP_RHT_SIGN_VECTOR,)
-    )
+    prepare_for_cuda_graph(torch.device(device), sign_vectors=(_TP_RHT_SIGN_VECTOR,))
     torch.manual_seed(41)
     model = NVFP4MLP(K, H, device=device, dtype=torch.bfloat16)
     model = _parallelize_nvfp4_mlp(model, mesh)

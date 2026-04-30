@@ -42,8 +42,7 @@ class Experiment:
 
 def get_configs() -> List[ExperimentConfig]:
     return [
-        ExperimentConfig(m=m, n=n)
-        for m, n in itertools.product(M_SHAPES, N_SHAPES)
+        ExperimentConfig(m=m, n=n) for m, n in itertools.product(M_SHAPES, N_SHAPES)
     ]
 
 
@@ -59,9 +58,9 @@ def run_experiment(config: ExperimentConfig) -> ExperimentResult | None:
     except NotImplementedError:
         return None
 
-    read_bytes = m * n * 2                  # bf16 input
-    write_fp4 = m * (n // 2)               # packed FP4 output
-    write_scales = m * (n // 16)            # FP8 scale factors (non-swizzled layout)
+    read_bytes = m * n * 2  # bf16 input
+    write_fp4 = m * (n // 2)  # packed FP4 output
+    write_scales = m * (n // 16)  # FP8 scale factors (non-swizzled layout)
     gbps = ((read_bytes + write_fp4 + write_scales) / 1e9) / (time_us / 1e6)
 
     return ExperimentResult(time_us=time_us, gbps=gbps)

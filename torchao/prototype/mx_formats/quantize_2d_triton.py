@@ -2,17 +2,18 @@
 
 import itertools
 from typing import Tuple
+
+import torch
 import triton
 import triton.language as tl
-import torch
+
 from torchao.prototype.mx_formats.hadamard_utils import (
     _compute_pid,
-    convert_8xfp32_to_4xfp4_packed,
     _swizzle_scales,
+    convert_8xfp32_to_4xfp4_packed,
     prepare_for_cuda_graph,
 )
 from torchao.utils import is_sm_at_least_100
-
 
 # SM100+ autotune configs. BLOCK_M=256 enables col TMA sf store; BLOCK_N=256 enables row TMA.
 QUANTIZE_2D_CONFIGS: list[triton.Config] = [

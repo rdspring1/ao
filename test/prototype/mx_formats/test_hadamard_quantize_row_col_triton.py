@@ -21,6 +21,7 @@ Coverage:
   RS=T, RW=F  — rs_midpoint_distribution (col) + rs_at_most_one_fp4_step_from_rtne (col+row)
   RS=T, RW=T  — rs_midpoint_distribution (row) + rs_at_most_one_fp4_step_from_rtne (col+row)
 """
+
 import pytest
 import torch
 
@@ -441,13 +442,13 @@ def test_triton_rht_quantize_rs_at_most_one_fp4_step_from_rtne():
 
         # Columnwise: sign must match RTNE and magnitude must be at most 1 step away
         col_nonzero = (col_rs_mag != 0) | (col_rn_mag != 0)
-        assert (
-            (col_rs_sign == col_rn_sign) | ~col_nonzero
-        ).all(), "Col RS changed sign relative to RTNE"
+        assert ((col_rs_sign == col_rn_sign) | ~col_nonzero).all(), (
+            "Col RS changed sign relative to RTNE"
+        )
         col_mag_diff = (col_rs_mag - col_rn_mag).abs()
-        assert (
-            col_mag_diff <= 1
-        ).all(), f"Col RS magnitude index differs by {col_mag_diff.max().item()} from RTNE (must be ≤1)"
+        assert (col_mag_diff <= 1).all(), (
+            f"Col RS magnitude index differs by {col_mag_diff.max().item()} from RTNE (must be ≤1)"
+        )
 
         row_rs_nibs = _unpack(row_rs)
         row_rs_sign = row_rs_nibs >> 3
@@ -455,13 +456,13 @@ def test_triton_rht_quantize_rs_at_most_one_fp4_step_from_rtne():
 
         # Rowwise: same invariants
         row_nonzero = (row_rs_mag != 0) | (row_rn_mag != 0)
-        assert (
-            (row_rs_sign == row_rn_sign) | ~row_nonzero
-        ).all(), "Row RS changed sign relative to RTNE"
+        assert ((row_rs_sign == row_rn_sign) | ~row_nonzero).all(), (
+            "Row RS changed sign relative to RTNE"
+        )
         row_mag_diff = (row_rs_mag - row_rn_mag).abs()
-        assert (
-            row_mag_diff <= 1
-        ).all(), f"Row RS magnitude index differs by {row_mag_diff.max().item()} from RTNE (must be ≤1)"
+        assert (row_mag_diff <= 1).all(), (
+            f"Row RS magnitude index differs by {row_mag_diff.max().item()} from RTNE (must be ≤1)"
+        )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -529,12 +530,12 @@ def test_triton_rht_quantize_row_col_cuda_graph_compile():
     # SR output should differ when seed bufs are updated between replays
     col_r1, row_r1 = [x.clone() for x in compiled(A)]
     col_r2, row_r2 = [x.clone() for x in compiled(A)]
-    assert not torch.equal(
-        col_r1, col_r2
-    ), "Col SR outputs should differ with different seeds"
-    assert not torch.equal(
-        row_r1, row_r2
-    ), "Row SR outputs should differ with different seeds"
+    assert not torch.equal(col_r1, col_r2), (
+        "Col SR outputs should differ with different seeds"
+    )
+    assert not torch.equal(row_r1, row_r2), (
+        "Row SR outputs should differ with different seeds"
+    )
 
     # SR IS applied: output should differ from round-to-nearest reference
     rtne_col_amax, rtne_row_amax = triton_rht_amax(A)
@@ -544,9 +545,9 @@ def test_triton_rht_quantize_row_col_cuda_graph_compile():
         col_global_amax=rtne_col_amax,
         row_global_amax=rtne_row_amax,
     )
-    assert not torch.equal(
-        col_r1, rtne_col_ref
-    ), "Col SR should produce different output than RTNE"
-    assert not torch.equal(
-        row_r1, rtne_row_ref
-    ), "Row SR should produce different output than RTNE"
+    assert not torch.equal(col_r1, rtne_col_ref), (
+        "Col SR should produce different output than RTNE"
+    )
+    assert not torch.equal(row_r1, rtne_row_ref), (
+        "Row SR should produce different output than RTNE"
+    )

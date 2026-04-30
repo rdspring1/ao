@@ -4,8 +4,9 @@ Provides get_wgrad_sign_vector, get_hadamard_matrix, get_rht_matrix, cast_to_fp4
 _compute_pid, and the NVFP4 quantization / scale-factor store helpers (formerly fp4_triton_ops).
 """
 
-import math
 import functools
+import math
+
 import torch
 import triton
 import triton.language as tl
@@ -121,8 +122,7 @@ def get_rht_matrix(
         signs = get_wgrad_sign_vector(hadamard_dimension, device=device, dtype=dtype)
     else:
         assert len(sign_vector) == hadamard_dimension, (
-            f"Expected sign_vector length {hadamard_dimension}, "
-            f"got {len(sign_vector)}"
+            f"Expected sign_vector length {hadamard_dimension}, got {len(sign_vector)}"
         )
         signs = torch.tensor(sign_vector, dtype=dtype, device=device)
     sign_matrix = signs * torch.eye(hadamard_dimension, dtype=dtype, device=device)
@@ -217,9 +217,8 @@ def _pack_fp4(
         local_n = tl.arange(0, BLOCK_N)[:, None]
         local_m = tl.arange(0, BLOCK_M_PACKED)[None, :]
         local_pos = local_n * BLOCK_M_PACKED + local_m
-        linear_idx = (
-            tl.cast(tile_id, tl.int64) * (BLOCK_N * BLOCK_M_PACKED)
-            + tl.cast(local_pos, tl.int64)
+        linear_idx = tl.cast(tile_id, tl.int64) * (BLOCK_N * BLOCK_M_PACKED) + tl.cast(
+            local_pos, tl.int64
         )
         offset = (linear_idx << 32) | offset_base
         rbits = tl.randint(seed, offset)
@@ -284,8 +283,14 @@ def _swizzle_scales(scale_inv, BLOCK_OUTER: tl.constexpr, BLOCK_INNER: tl.conste
 
 @triton.jit
 def _store_scales_swizzle(
-    scale_inv, sf_ptr, pid_outer, pid_inner, OUTER, INNER,
-    BLOCK_OUTER: tl.constexpr, BLOCK_INNER: tl.constexpr,
+    scale_inv,
+    sf_ptr,
+    pid_outer,
+    pid_inner,
+    OUTER,
+    INNER,
+    BLOCK_OUTER: tl.constexpr,
+    BLOCK_INNER: tl.constexpr,
 ):
     """Store pre-swizzled scale factors in tile-major layout (OUTER//128, INNER//64, 32, 16).
 

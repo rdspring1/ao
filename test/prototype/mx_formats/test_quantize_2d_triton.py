@@ -1,12 +1,13 @@
 """Tests for triton_weight_quantize_2d (SM100+ kernel).
 
-  test_triton_weight_quantize_2d_scales_vs_reference:
-    FP8 scale factors must match the PyTorch reference bitwise for both
-    non-swizzled (M, N//16) and swizzled (M//128, N//64, 32, 16) layouts.
+test_triton_weight_quantize_2d_scales_vs_reference:
+  FP8 scale factors must match the PyTorch reference bitwise for both
+  non-swizzled (M, N//16) and swizzled (M//128, N//64, 32, 16) layouts.
 
-  test_triton_weight_quantize_2d_sqnr:
-    Dequantized output must reconstruct A with SQNR >= 20 dB.
+test_triton_weight_quantize_2d_sqnr:
+  Dequantized output must reconstruct A with SQNR >= 20 dB.
 """
+
 import pytest
 import torch
 
@@ -22,7 +23,6 @@ if is_sm_at_least_100():
         triton_weight_quantize_2d,
     )
 from torchao.prototype.mx_formats.hadamard_utils import prepare_for_cuda_graph
-
 
 # BLOCK_M minimum is 128; N must be a multiple of BLOCK_N=256.
 _M_VALUES = [128, 256, 512, 1024]

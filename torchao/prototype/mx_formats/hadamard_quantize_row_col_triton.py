@@ -1,17 +1,19 @@
 import itertools
 from typing import List, Tuple
-import triton
-import triton.language as tl
+
 import torch
 import torch.nn.functional as F
+import triton
+import triton.language as tl
+
 from torchao.prototype.mx_formats.hadamard_utils import (
-    get_rht_matrix,
-    prepare_for_cuda_graph,
     _compute_pid,
     _nvfp4_quantize,
     _pack_fp4,
-    _swizzle_scales,
     _store_scales_swizzle,
+    _swizzle_scales,
+    get_rht_matrix,
+    prepare_for_cuda_graph,
 )
 from torchao.utils import is_sm_at_least_100
 

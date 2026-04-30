@@ -41,8 +41,7 @@ class Experiment:
 
 def get_configs() -> List[ExperimentConfig]:
     return [
-        ExperimentConfig(m=m, n=n)
-        for m, n in itertools.product(M_SHAPES, N_SHAPES)
+        ExperimentConfig(m=m, n=n) for m, n in itertools.product(M_SHAPES, N_SHAPES)
     ]
 
 
