@@ -29,6 +29,7 @@ from torchao.prototype.mx_formats.hadamard_utils import prepare_for_cuda_graph
 from torchao.prototype.mx_formats.nvfp4_tensor_parallel import (
     NVFP4ColwiseParallel,
     NVFP4RowwiseParallel,
+    _TP_RHT_SIGN_VECTOR,
     nvfp4_col_parallel_mm,
     nvfp4_row_parallel_mm,
     swap_first_dims,
@@ -133,6 +134,8 @@ def distributed_env() -> DeviceMesh:
     torch.cuda.set_device(local_rank)
     device_mesh = init_device_mesh("cuda", (world_size,), mesh_dim_names=("tp",))
     yield device_mesh
+    torch.cuda.synchronize()
+    torch._dynamo.reset()
     dist.destroy_process_group()
 
 
@@ -778,7 +781,9 @@ def test_mlp_colwise_rowwise_parallelize_module_cuda_graph_compile(
     assert M % world_size == 0
     M_per_rank = M // world_size
 
-    prepare_for_cuda_graph(torch.device(device))
+    prepare_for_cuda_graph(
+        torch.device(device), sign_vectors=(_TP_RHT_SIGN_VECTOR,)
+    )
     torch.manual_seed(41)
     model = NVFP4MLP(K, H, device=device, dtype=torch.bfloat16)
     model = _parallelize_nvfp4_mlp(model, mesh)

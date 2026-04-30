@@ -37,6 +37,7 @@ from torchao.prototype.mx_formats.hadamard_utils import prepare_for_cuda_graph
 from torchao.prototype.mx_formats.nvfp4_tensor_parallel import (
     NVFP4ColwiseParallel,
     NVFP4RowwiseParallel,
+    _TP_RHT_SIGN_VECTOR,
 )
 from torchao.prototype.mx_formats.nvfp4_training import NVFP4TrainingLinear
 from torchao.utils import is_sm_at_least_100, torch_version_at_least
@@ -112,6 +113,8 @@ def setup_distributed() -> DeviceMesh:
 def distributed_env() -> DeviceMesh:
     device_mesh = setup_distributed()
     yield device_mesh
+    torch.cuda.synchronize()
+    torch._dynamo.reset()
     if dist.is_initialized():
         dist.destroy_process_group()
 
@@ -170,7 +173,9 @@ def _test_nvfp4_mlp_fsdp2_tp_smoke(
     M, K, H = 512, 256, 512
 
     if compile_model:
-        prepare_for_cuda_graph(torch.device(device))
+        prepare_for_cuda_graph(
+            torch.device(device), sign_vectors=(_TP_RHT_SIGN_VECTOR,)
+        )
 
     model = NVFP4MLP(K, H, device=device, dtype=torch.bfloat16)
     model = _parallelize_nvfp4_mlp(model, tp_mesh)

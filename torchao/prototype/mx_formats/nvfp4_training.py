@@ -82,6 +82,13 @@ class NVFP4TrainingLinear(nn.Linear):
         self.tensor_parallel_style = "colwise"
         self._sr_seed: Optional[torch.Tensor] = None
 
+    def _ensure_sr_seed(self, device: torch.device | str) -> torch.Tensor:
+        if self._sr_seed is None:
+            self._sr_seed = torch.randint(
+                -(2**63), 2**63 - 1, (1,), dtype=torch.int64, device=device
+            )
+        return self._sr_seed
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if (
             self.process_group is not None
@@ -97,10 +104,7 @@ class NVFP4TrainingLinear(nn.Linear):
             ws = self.world_size
             if ws is None:
                 ws = dist.get_world_size(self.process_group)
-            if self._sr_seed is None:
-                self._sr_seed = torch.randint(
-                    -(2**63), 2**63 - 1, (1,), dtype=torch.int64, device=x.device
-                )
+            sr_seed = self._ensure_sr_seed(x.device)
             w = self.weight
             if isinstance(w, DTensor):
                 w = w.to_local()
@@ -116,7 +120,7 @@ class NVFP4TrainingLinear(nn.Linear):
                 x,
                 w,
                 bias,
-                sr_seed=self._sr_seed,
+                sr_seed=sr_seed,
                 tp_group=self.process_group,
                 world_size=ws,
             )
