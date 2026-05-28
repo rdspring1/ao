@@ -13,7 +13,6 @@ if torch_version_at_least("2.10.0") and has_triton():
 
     from torchao.prototype.moe_training.nvfp4_training.hadamard_utils import (
         _swizzle_scales,
-        convert_8xfp32_to_4xfp4_packed,
         prepare_for_cuda_graph,
     )
     from torchao.utils import is_sm_at_least_100
@@ -25,19 +24,18 @@ if torch_version_at_least("2.10.0") and has_triton():
     ]
 
     @triton.jit
-    def _nvfp4_2d_quantize(
-        a_tile, tile_max, global_amax, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr
+    def _nvfp4_2d_scale_factors(
+        tile_max, global_amax, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr
     ):
-        """Compute per-16x16-block FP8 scale factors and scaled FP32 values for FP4 packing.
+        """Compute per-16x16-block FP8 scale factors and FP4 encode scales.
 
         Args:
-            a_tile: (BLOCK_M//16, 16, BLOCK_N//16, 16) tensor.
             tile_max: (BLOCK_M//16, 1, BLOCK_N//16, 1) max abs value per 16x16 tile.
             global_amax: scalar float32 global amax.
 
         Returns:
             scale_inv: (BLOCK_M // 16, BLOCK_N // 16) float8e4nv per-block decode scales.
-            scaled:    (BLOCK_M, BLOCK_N) float32 values scaled and clamped to FP4 range.
+            encode_scale: (BLOCK_M//16, 1, BLOCK_N//16, 1) float32 per-block encode scales.
         """
         FP8_E4M3_EPS: tl.constexpr = torch.finfo(torch.float8_e4m3fn).tiny
         FP8_E4M3_MAX: tl.constexpr = 448.0
@@ -59,23 +57,66 @@ if torch_version_at_least("2.10.0") and has_triton():
         encode_scale = tl.minimum(
             1.0 / (pvscale_fp8.to(tl.float32) * global_decode_scale), FP32_MAX
         )
-
-        scaled = a_tile * encode_scale
-        scaled = tl.clamp(scaled, -FP4_E2M1_MAX, FP4_E2M1_MAX)
-        scaled = tl.reshape(scaled, [BLOCK_M, BLOCK_N])
-        return scale_inv, scaled
+        return scale_inv, encode_scale
 
     @triton.jit
-    def _pack_fp4_at(
-        scaled,
+    def _convert_8xbf16_scaled_to_4xfp4_packed(x_pairs, scale):
+        x_fp4x2 = tl.inline_asm_elementwise(
+            asm="""
+            {
+            .reg .b16 e0, e1, e2, e3, o0, o1, o2, o3;
+            .reg .b32 fe0, fe1, fe2, fe3, fo0, fo1, fo2, fo3;
+            .reg .b8 byte0, byte1, byte2, byte3;
+            mov.b32 {e0, e1}, $1;
+            mov.b32 {e2, e3}, $2;
+            mov.b32 {o0, o1}, $3;
+            mov.b32 {o2, o3}, $4;
+            cvt.f32.bf16 fe0, e0;
+            cvt.f32.bf16 fe1, e1;
+            cvt.f32.bf16 fe2, e2;
+            cvt.f32.bf16 fe3, e3;
+            cvt.f32.bf16 fo0, o0;
+            cvt.f32.bf16 fo1, o1;
+            cvt.f32.bf16 fo2, o2;
+            cvt.f32.bf16 fo3, o3;
+            mul.f32 fe0, fe0, $5;
+            mul.f32 fo0, fo0, $5;
+            mul.f32 fe1, fe1, $6;
+            mul.f32 fo1, fo1, $6;
+            mul.f32 fe2, fe2, $7;
+            mul.f32 fo2, fo2, $7;
+            mul.f32 fe3, fe3, $8;
+            mul.f32 fo3, fo3, $8;
+            cvt.rn.satfinite.e2m1x2.f32 byte0, fo0, fe0;
+            cvt.rn.satfinite.e2m1x2.f32 byte1, fo1, fe1;
+            cvt.rn.satfinite.e2m1x2.f32 byte2, fo2, fe2;
+            cvt.rn.satfinite.e2m1x2.f32 byte3, fo3, fe3;
+            mov.b32 $0, {byte0, byte1, byte2, byte3};
+            }
+            """,
+            constraints="=r,r,r,r,r,r,r,r,r",
+            args=[x_pairs[0], x_pairs[1], scale],
+            dtype=tl.uint8,
+            is_pure=True,
+            pack=4,
+        )
+        return x_fp4x2
+
+    @triton.jit
+    def _pack_fp4_scaled_at(
+        a_tile,
+        encode_scale,
         out_desc,
         offset_m,
         offset_n,
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
     ):
-        scaled_pairs = scaled.reshape(BLOCK_M, BLOCK_N // 2, 2).split()
-        scaled_fp4x2 = convert_8xfp32_to_4xfp4_packed(scaled_pairs)
+        a_pairs = tl.reshape(a_tile, [BLOCK_M, BLOCK_N // 2, 2]).split()
+        scale_pairs = encode_scale.broadcast_to(
+            [BLOCK_M // 16, 16, BLOCK_N // 16, 8]
+        ).reshape(BLOCK_M, BLOCK_N // 2)
+        scaled_fp4x2 = _convert_8xbf16_scaled_to_4xfp4_packed(a_pairs, scale_pairs)
         out_desc.store([offset_m, offset_n], scaled_fp4x2)
 
     @triton.jit
@@ -126,11 +167,12 @@ if torch_version_at_least("2.10.0") and has_triton():
         tile_max = tl.max(abs_a_tile, axis=-1, keep_dims=True)
         tile_max = tl.max(tile_max, axis=-3, keep_dims=True)
 
-        a_sf, a_fp4 = _nvfp4_2d_quantize(
-            a_tile, tile_max, global_amax, STAGE_M, BLOCK_N
+        a_sf, encode_scale = _nvfp4_2d_scale_factors(
+            tile_max, global_amax, STAGE_M, BLOCK_N
         )
-        _pack_fp4_at(
-            a_fp4,
+        _pack_fp4_scaled_at(
+            a_tile,
+            encode_scale,
             a_fp4_desc,
             stage_m,
             pid_n * BLOCK_N // 2,
@@ -139,12 +181,17 @@ if torch_version_at_least("2.10.0") and has_triton():
         )
 
         a_t_tile = tl.permute(a_tile, [2, 3, 0, 1])
-        tile_max_t = tl.permute(tile_max, [2, 3, 0, 1])
-        a_t_sf, a_t_fp4 = _nvfp4_2d_quantize(
-            a_t_tile, tile_max_t, global_amax, BLOCK_N, STAGE_M
+        encode_scale_t = tl.permute(encode_scale, [2, 3, 0, 1])
+        a_t_sf = tl.reshape(
+            tl.permute(
+                tl.reshape(a_sf, [STAGE_M // 16, 1, BLOCK_N // 16, 1]),
+                [2, 3, 0, 1],
+            ),
+            [BLOCK_N // 16, STAGE_M // 16],
         )
-        _pack_fp4_at(
-            a_t_fp4,
+        _pack_fp4_scaled_at(
+            a_t_tile,
+            encode_scale_t,
             a_t_fp4_desc,
             pid_n * BLOCK_N,
             pid_m * BLOCK_M // 2 + stage * STAGE_M // 2,
@@ -313,7 +360,11 @@ if torch_version_at_least("2.10.0") and has_triton():
             raise ValueError(f"N must be divisible by 128 for swizzling, got N={N}")
 
         if hasattr(triton, "set_allocator"):
-            _ws = prepare_for_cuda_graph(A.device)
+            _ws_nbytes = max(
+                131072,
+                triton.cdiv(M, 128) * triton.cdiv(N, 128) * 640,
+            )
+            _ws = prepare_for_cuda_graph(A.device, nbytes=_ws_nbytes)
             triton.set_allocator(lambda size, align, stream: _ws[: max(size, 1)])
 
         a_fp4 = torch.zeros((M, N // 2), dtype=torch.uint8, device=A.device)

@@ -52,7 +52,7 @@ def prepare_for_cuda_graph(
     sign_vectors so those cache entries are allocated before capture.
     """
     key = _device_key(device)
-    if key not in _TMA_WORKSPACES:
+    if key not in _TMA_WORKSPACES or _TMA_WORKSPACES[key].numel() < nbytes:
         _TMA_WORKSPACES[key] = torch.empty(nbytes, dtype=torch.uint8, device=device)
     # Pre-warm every call because tests and callers may clear get_rht_matrix's
     # cache after the workspace has already been initialized. Use the same
