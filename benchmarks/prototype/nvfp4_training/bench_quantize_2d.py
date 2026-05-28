@@ -23,7 +23,7 @@ from torchao.utils import is_sm_at_least_100
 device = torch.device("cuda")
 
 M_SHAPES = [128, 256, 1024, 8192]
-# N must be a multiple of BLOCK_N=256
+# N must be a multiple of the kernel's 128-wide tile.
 N_SHAPES = [256, 512, 1024, 2048, 4096, 8192, 16384, 32768]
 
 LLAMA_BATCH_SIZE = 1
@@ -94,10 +94,13 @@ def run_experiment(config: ExperimentConfig) -> ExperimentResult | None:
     a_t_sf = torch.empty(
         (n // 128, m // 64, 32, 16), dtype=torch.float8_e4m3fn, device=x.device
     )
-    num_sms = torch.cuda.get_device_properties(x.device).multi_processor_count
+    grid = lambda meta: (
+        triton.cdiv(m, meta["BLOCK_M"]),
+        triton.cdiv(n, meta["BLOCK_N"]),
+    )
 
     def run_kernel():
-        triton_quantize_2d_weight[(num_sms,)](
+        triton_quantize_2d_weight[grid](
             x,
             a_fp4,
             a_sf,
@@ -106,8 +109,6 @@ def run_experiment(config: ExperimentConfig) -> ExperimentResult | None:
             global_amax,
             m,
             n,
-            GROUP_SIZE_N=8,
-            NUM_SMS=num_sms,
         )
 
     time_us = benchmark_cuda_function_in_microseconds(run_kernel)

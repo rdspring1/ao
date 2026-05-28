@@ -6,49 +6,33 @@ from torch.utils._triton import has_triton
 from torchao.utils import torch_version_at_least
 
 if torch_version_at_least("2.10.0") and has_triton():
-    import itertools
     from typing import Tuple
 
     import triton
     import triton.language as tl
 
     from torchao.prototype.moe_training.nvfp4_training.hadamard_utils import (
-        _compute_pid,
         _swizzle_scales,
         convert_8xfp32_to_4xfp4_packed,
         prepare_for_cuda_graph,
     )
     from torchao.utils import is_sm_at_least_100
 
-    # SM100+ autotune configs.
-    QUANTIZE_2D_TILE_SHAPES: list[tuple[int, int]] = [
-        (128, 128),
-        (128, 256),
-        (256, 128),
-        (256, 256),
-    ]
-
+    # TE-style wave tile: one CTA owns a 128x128 chunk and processes it as
+    # four 32x128 panels.
     QUANTIZE_2D_CONFIGS: list[triton.Config] = [
-        triton.Config(
-            {"BLOCK_M": bm, "BLOCK_N": bn, "NUM_STAGES": ns},
-            num_warps=nw,
-            num_stages=ns,
-        )
-        for (bm, bn), ns, nw in itertools.product(
-            QUANTIZE_2D_TILE_SHAPES,
-            [1, 2, 3],  # NUM_STAGES
-            [2, 4, 8],  # NUM_WARPS
-        )
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128}, num_warps=4, num_stages=2)
     ]
 
     @triton.jit
     def _nvfp4_2d_quantize(
-        a, global_amax, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr
+        a_tile, tile_max, global_amax, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr
     ):
-        """Compute per-16×16-block FP8 scale factors and scaled FP32 values for FP4 packing.
+        """Compute per-16x16-block FP8 scale factors and scaled FP32 values for FP4 packing.
 
         Args:
-            a: (BLOCK_M, BLOCK_N) bfloat16 tensor.
+            a_tile: (BLOCK_M//16, 16, BLOCK_N//16, 16) tensor.
+            tile_max: (BLOCK_M//16, 1, BLOCK_N//16, 1) max abs value per 16x16 tile.
             global_amax: scalar float32 global amax.
 
         Returns:
@@ -59,15 +43,6 @@ if torch_version_at_least("2.10.0") and has_triton():
         FP8_E4M3_MAX: tl.constexpr = 448.0
         FP4_E2M1_MAX: tl.constexpr = 6.0
         FP32_MAX: tl.constexpr = torch.finfo(torch.float32).max
-
-        a_tile = tl.reshape(a, [BLOCK_M // 16, 16, BLOCK_N // 16, 16])
-        abs_a_tile = tl.abs(a_tile)  # (BLOCK_M//16, 16, BLOCK_N//16, 16)
-        tile_max = tl.max(
-            abs_a_tile, axis=-1, keep_dims=True
-        )  # (BLOCK_M//16, 16, BLOCK_N//16, 1)
-        tile_max = tl.max(
-            tile_max, axis=-3, keep_dims=True
-        )  # (BLOCK_M//16, 1, BLOCK_N//16, 1)
 
         is_global_amax = global_amax == 0
         safe_global_amax = tl.where(is_global_amax, 1.0, global_amax)
@@ -90,9 +65,99 @@ if torch_version_at_least("2.10.0") and has_triton():
         scaled = tl.reshape(scaled, [BLOCK_M, BLOCK_N])
         return scale_inv, scaled
 
+    @triton.jit
+    def _pack_fp4_at(
+        scaled,
+        out_desc,
+        offset_m,
+        offset_n,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+    ):
+        scaled_pairs = scaled.reshape(BLOCK_M, BLOCK_N // 2, 2).split()
+        scaled_fp4x2 = convert_8xfp32_to_4xfp4_packed(scaled_pairs)
+        out_desc.store([offset_m, offset_n], scaled_fp4x2)
+
+    @triton.jit
+    def _swizzle_scale_factors(
+        scale_inv,
+        sf_desc,
+        pid_outer,
+        pid_inner,
+        BLOCK_OUTER: tl.constexpr,
+        BLOCK_INNER: tl.constexpr,
+    ):
+        expand_sf = (
+            tl.expand_dims(scale_inv, axis=1)
+            .broadcast_to([BLOCK_OUTER // 16, 16, BLOCK_INNER // 16])
+            .reshape(BLOCK_OUTER, BLOCK_INNER // 16)
+        )
+        swizzle_expand_sf = _swizzle_scales(expand_sf, BLOCK_OUTER, BLOCK_INNER)
+        sf_desc.store(
+            [
+                pid_outer * BLOCK_OUTER // 128,
+                pid_inner * BLOCK_INNER // 64,
+                0,
+                0,
+            ],
+            swizzle_expand_sf,
+        )
+
+    @triton.jit
+    def _process_stage_32x128(
+        a_desc,
+        a_fp4_desc,
+        a_t_fp4_desc,
+        pid_m,
+        pid_n,
+        stage: tl.constexpr,
+        global_amax,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        STAGE_M: tl.constexpr,
+    ):
+        stage_m = pid_m * BLOCK_M + stage * STAGE_M
+        tile_n = pid_n * BLOCK_N
+
+        a = a_desc.load([stage_m, tile_n])
+        a_tile = tl.reshape(a, [STAGE_M // 16, 16, BLOCK_N // 16, 16])
+
+        abs_a_tile = tl.abs(a_tile)
+        tile_max = tl.max(abs_a_tile, axis=-1, keep_dims=True)
+        tile_max = tl.max(tile_max, axis=-3, keep_dims=True)
+
+        a_sf, a_fp4 = _nvfp4_2d_quantize(
+            a_tile, tile_max, global_amax, STAGE_M, BLOCK_N
+        )
+        _pack_fp4_at(
+            a_fp4,
+            a_fp4_desc,
+            stage_m,
+            pid_n * BLOCK_N // 2,
+            STAGE_M,
+            BLOCK_N,
+        )
+
+        a_t_tile = tl.permute(a_tile, [2, 3, 0, 1])
+        tile_max_t = tl.permute(tile_max, [2, 3, 0, 1])
+        a_t_sf, a_t_fp4 = _nvfp4_2d_quantize(
+            a_t_tile, tile_max_t, global_amax, BLOCK_N, STAGE_M
+        )
+        _pack_fp4_at(
+            a_t_fp4,
+            a_t_fp4_desc,
+            pid_n * BLOCK_N,
+            pid_m * BLOCK_M // 2 + stage * STAGE_M // 2,
+            BLOCK_N,
+            STAGE_M,
+        )
+
+        return a_sf, a_t_sf
+
     @triton.autotune(
         configs=QUANTIZE_2D_CONFIGS,
         key=["M", "N"],
+        cache_results=True,
     )
     @triton.jit
     def triton_quantize_2d_weight(
@@ -106,23 +171,22 @@ if torch_version_at_least("2.10.0") and has_triton():
         N,
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
-        GROUP_SIZE_N: tl.constexpr,
-        NUM_SMS: tl.constexpr,
-        NUM_STAGES: tl.constexpr,
     ):
         """2D (16×16) NVFP4 E2M1 weight quantization — one tile per CTA."""
+        STAGE_M: tl.constexpr = 32
+
         # Create TMA descriptors in-kernel from raw pointers, shape, and stride
         a_desc = tl.make_tensor_descriptor(
             a_ptr,
             shape=[M, N],
             strides=[N, 1],
-            block_shape=[BLOCK_M, BLOCK_N],
+            block_shape=[STAGE_M, BLOCK_N],
         )
         out_desc = tl.make_tensor_descriptor(
             out_ptr,
             shape=[M, N // 2],
             strides=[N // 2, 1],
-            block_shape=[BLOCK_M, BLOCK_N // 2],
+            block_shape=[STAGE_M, BLOCK_N // 2],
         )
         sf_desc = tl.make_tensor_descriptor(
             scales_ptr,
@@ -134,7 +198,7 @@ if torch_version_at_least("2.10.0") and has_triton():
             a_t_fp4_ptr,
             shape=[N, M // 2],
             strides=[M // 2, 1],
-            block_shape=[BLOCK_N, BLOCK_M // 2],
+            block_shape=[BLOCK_N, STAGE_M // 2],
         )
         a_t_sf_desc = tl.make_tensor_descriptor(
             a_t_sf_ptr,
@@ -143,69 +207,72 @@ if torch_version_at_least("2.10.0") and has_triton():
             block_shape=[BLOCK_N // 128, BLOCK_M // 64, 32, 16],
         )
 
-        # Persistent grid-stride loop
-        start_pid = tl.program_id(0)
-        num_pid_m = tl.cdiv(M, BLOCK_M)
-        num_pid_n = tl.cdiv(N, BLOCK_N)
-        num_pid_in_group = GROUP_SIZE_N * num_pid_m
-        num_tiles = num_pid_m * num_pid_n
+        pid_m = tl.program_id(0)
+        pid_n = tl.program_id(1)
 
         # Load global amax scalar once
         global_amax = tl.load(global_amax_ptr)
 
-        for tile_id in tl.range(
-            start_pid,
-            num_tiles,
-            NUM_SMS,
-            flatten=False,
-            num_stages=NUM_STAGES,
-        ):
-            pid_n, pid_m = _compute_pid(
-                tile_id, num_pid_in_group, num_pid_n, GROUP_SIZE_N
-            )
+        # Match TE's chunk structure: a 128x128 CTA is processed as four
+        # 32x128 panels, while scale tensors are concatenated and swizzled once.
+        a_sf0, a_t_sf0 = _process_stage_32x128(
+            a_desc,
+            out_desc,
+            a_t_fp4_desc,
+            pid_m,
+            pid_n,
+            0,
+            global_amax,
+            BLOCK_M,
+            BLOCK_N,
+            STAGE_M,
+        )
+        a_sf1, a_t_sf1 = _process_stage_32x128(
+            a_desc,
+            out_desc,
+            a_t_fp4_desc,
+            pid_m,
+            pid_n,
+            1,
+            global_amax,
+            BLOCK_M,
+            BLOCK_N,
+            STAGE_M,
+        )
+        a_sf2, a_t_sf2 = _process_stage_32x128(
+            a_desc,
+            out_desc,
+            a_t_fp4_desc,
+            pid_m,
+            pid_n,
+            2,
+            global_amax,
+            BLOCK_M,
+            BLOCK_N,
+            STAGE_M,
+        )
+        a_sf3, a_t_sf3 = _process_stage_32x128(
+            a_desc,
+            out_desc,
+            a_t_fp4_desc,
+            pid_m,
+            pid_n,
+            3,
+            global_amax,
+            BLOCK_M,
+            BLOCK_N,
+            STAGE_M,
+        )
 
-            # Load A (BLOCK_M, BLOCK_N)
-            a = a_desc.load([pid_m * BLOCK_M, pid_n * BLOCK_N])
+        a_sf = tl.cat(tl.cat(a_sf0, a_sf1, dim=0), tl.cat(a_sf2, a_sf3, dim=0), dim=0)
+        _swizzle_scale_factors(a_sf, sf_desc, pid_m, pid_n, BLOCK_M, BLOCK_N)
 
-            # Compute per-16×16-block scales and scaled values
-            scale_inv, scaled = _nvfp4_2d_quantize(a, global_amax, BLOCK_M, BLOCK_N)
-
-            # Pack FP4 values into uint8 — non-transposed: (BLOCK_M, BLOCK_N//2, 2)
-            scaled_pairs = scaled.reshape(BLOCK_M, BLOCK_N // 2, 2).split()
-            scaled_fp4x2 = convert_8xfp32_to_4xfp4_packed(scaled_pairs)
-            out_desc.store([pid_m * BLOCK_M, pid_n * BLOCK_N // 2], scaled_fp4x2)
-
-            # Expand scales: (BLOCK_M//16, BLOCK_N//16) → (BLOCK_M, BLOCK_N//16)
-            expand_sf = (
-                tl.expand_dims(scale_inv, axis=1)
-                .broadcast_to([BLOCK_M // 16, 16, BLOCK_N // 16])
-                .reshape(BLOCK_M, BLOCK_N // 16)
-            )
-            swizzle_expand_sf = _swizzle_scales(expand_sf, BLOCK_M, BLOCK_N)
-            sf_desc.store(
-                [pid_m * BLOCK_M // 128, pid_n * BLOCK_N // 64, 0, 0], swizzle_expand_sf
-            )
-
-            # Colwise path: quantize transposed tile (rowwise W.T) — always swizzled
-            a_t = tl.trans(a)  # (BLOCK_N, BLOCK_M)
-            t_scale_inv, t_scaled = _nvfp4_2d_quantize(
-                a_t, global_amax, BLOCK_N, BLOCK_M
-            )
-
-            t_scaled_pairs = t_scaled.reshape(BLOCK_N, BLOCK_M // 2, 2).split()
-            t_scaled_fp4x2 = convert_8xfp32_to_4xfp4_packed(t_scaled_pairs)
-            a_t_fp4_desc.store([pid_n * BLOCK_N, pid_m * BLOCK_M // 2], t_scaled_fp4x2)
-
-            # Expand and swizzle colwise scales: (BLOCK_N//16, BLOCK_M//16) → (N//128, M//64, 32, 16)
-            t_expand_sf = (
-                tl.expand_dims(t_scale_inv, axis=1)
-                .broadcast_to([BLOCK_N // 16, 16, BLOCK_M // 16])
-                .reshape(BLOCK_N, BLOCK_M // 16)
-            )
-            t_swizzle_sf = _swizzle_scales(t_expand_sf, BLOCK_N, BLOCK_M)
-            a_t_sf_desc.store(
-                [pid_n * BLOCK_N // 128, pid_m * BLOCK_M // 64, 0, 0], t_swizzle_sf
-            )
+        a_t_sf = tl.cat(
+            tl.cat(a_t_sf0, a_t_sf1, dim=1),
+            tl.cat(a_t_sf2, a_t_sf3, dim=1),
+            dim=1,
+        )
+        _swizzle_scale_factors(a_t_sf, a_t_sf_desc, pid_n, pid_m, BLOCK_N, BLOCK_M)
 
     @torch.library.custom_op("torchao::triton_weight_quantize_2d", mutates_args=())
     def triton_weight_quantize_2d(
@@ -259,11 +326,13 @@ if torch_version_at_least("2.10.0") and has_triton():
             (N // 128, M // 64, 32, 16), dtype=torch.float8_e4m3fn, device=A.device
         )
 
-        NUM_SMS = torch.cuda.get_device_properties(A.device).multi_processor_count
-        GROUP_SIZE_N: int = 8
+        grid = lambda meta: (
+            triton.cdiv(M, meta["BLOCK_M"]),
+            triton.cdiv(N, meta["BLOCK_N"]),
+        )
 
         try:
-            triton_quantize_2d_weight[(NUM_SMS,)](
+            triton_quantize_2d_weight[grid](
                 A,
                 a_fp4,
                 a_sf,
@@ -272,8 +341,6 @@ if torch_version_at_least("2.10.0") and has_triton():
                 global_amax,
                 M,
                 N,
-                GROUP_SIZE_N=GROUP_SIZE_N,
-                NUM_SMS=NUM_SMS,
             )
         finally:
             if hasattr(triton, "set_allocator"):
