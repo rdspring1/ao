@@ -23,6 +23,7 @@ if torch_version_at_least("2.10.0") and has_triton():
         _store_scales_swizzle,
         _swizzle_scales,
         get_rht_matrix,
+        make_tma_workspace_allocator,
         prepare_for_cuda_graph,
     )
     from torchao.utils import is_sm_at_least_100
@@ -337,7 +338,7 @@ if torch_version_at_least("2.10.0") and has_triton():
 
         if hasattr(triton, "set_allocator"):
             _ws = prepare_for_cuda_graph(A.device, sign_vectors=(sv,))
-            triton.set_allocator(lambda size, align, stream: _ws[: max(size, 1)])
+            triton.set_allocator(make_tma_workspace_allocator(_ws))
 
         # Resolve SR seeds: use caller-provided seeds for correct CUDA-graph SR behavior;
         # fall back to generating internally for eager callers that omit them.

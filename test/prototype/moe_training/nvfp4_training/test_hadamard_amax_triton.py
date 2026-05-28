@@ -8,6 +8,7 @@ from torchao.prototype.moe_training.nvfp4_training.hadamard_utils import (
     get_hadamard_matrix,
     get_rht_matrix,
     get_wgrad_sign_vector,
+    make_tma_workspace_allocator,
 )
 from torchao.utils import is_sm_at_least_100, torch_version_at_least
 
@@ -59,6 +60,16 @@ def test_get_rht_matrix_with_generated_sign_matches_sampled_signs():
 
     expected = torch.diag(expected_signs) @ get_hadamard_matrix(16, device="cpu")
     torch.testing.assert_close(rht_matrix, expected, atol=0, rtol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_tma_workspace_allocator_rejects_oversized_request():
+    workspace = torch.empty(16, dtype=torch.uint8, device="cuda")
+    allocator = make_tma_workspace_allocator(workspace)
+
+    assert allocator(8, 1, None).numel() == 8
+    with pytest.raises(RuntimeError, match="NVFP4 TMA workspace is too small"):
+        allocator(17, 1, None)
 
 
 @pytest.mark.parametrize(

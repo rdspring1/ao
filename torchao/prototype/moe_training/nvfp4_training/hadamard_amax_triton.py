@@ -28,6 +28,7 @@ if torch_version_at_least("2.10.0") and has_triton():
         _compute_pid,
         _device_key,
         get_rht_matrix,
+        make_tma_workspace_allocator,
         prepare_for_cuda_graph,
     )
     from torchao.utils import is_sm_at_least_100
@@ -208,7 +209,7 @@ if torch_version_at_least("2.10.0") and has_triton():
         sv = tuple(sign_vector)
         if hasattr(triton, "set_allocator"):
             _ws = prepare_for_cuda_graph(A.device, sign_vectors=(sv,))
-            triton.set_allocator(lambda size, align, stream: _ws[: max(size, 1)])
+            triton.set_allocator(make_tma_workspace_allocator(_ws))
 
         NUM_SMS = torch.cuda.get_device_properties(A.device).multi_processor_count
         GROUP_SIZE_N: int = 8  # L2 reuse grouping along M

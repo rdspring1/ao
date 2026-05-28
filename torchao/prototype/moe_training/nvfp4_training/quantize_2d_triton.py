@@ -13,6 +13,7 @@ if torch_version_at_least("2.10.0") and has_triton():
 
     from torchao.prototype.moe_training.nvfp4_training.hadamard_utils import (
         _swizzle_scales,
+        make_tma_workspace_allocator,
         prepare_for_cuda_graph,
     )
     from torchao.utils import is_sm_at_least_100
@@ -365,7 +366,7 @@ if torch_version_at_least("2.10.0") and has_triton():
                 triton.cdiv(M, 128) * triton.cdiv(N, 128) * 640,
             )
             _ws = prepare_for_cuda_graph(A.device, nbytes=_ws_nbytes)
-            triton.set_allocator(lambda size, align, stream: _ws[: max(size, 1)])
+            triton.set_allocator(make_tma_workspace_allocator(_ws))
 
         a_fp4 = torch.zeros((M, N // 2), dtype=torch.uint8, device=A.device)
         a_sf = torch.empty(

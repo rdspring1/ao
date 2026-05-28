@@ -10,6 +10,7 @@ import math
 import torch
 from torch.utils._triton import has_triton
 
+_DEFAULT_TMA_WORKSPACE_NBYTES = 16 * 1024 * 1024
 _TMA_WORKSPACES: dict = {}
 
 
@@ -36,24 +37,30 @@ def _prewarm_rht_matrix(
 
 def prepare_for_cuda_graph(
     device,
-    nbytes: int = 131072,
+    nbytes: int = _DEFAULT_TMA_WORKSPACE_NBYTES,
     *,
     sign_vectors: tuple[tuple[int, ...], ...] | None = None,
 ) -> torch.Tensor:
     """Pre-allocate per-device persistent state required for torch.compile CUDA graphs.
 
-    Must be called once per device before torch.compile to ensure allocations
-    happen outside the CUDA graph pool. Subsequent calls return the cached TMA
-    workspace (no new allocation). Kernels run sequentially in the same CUDA stream
-    and safely alias the TMA buffer.
+    Must be called before torch.compile to ensure allocations happen outside the
+    CUDA graph pool. Subsequent calls return the cached TMA workspace. Kernels
+    run sequentially in the same CUDA stream and safely alias the TMA buffer.
 
     Also pre-warms get_rht_matrix (lru_cache) to prevent pool-allocation errors
     during graph capture. Pass any RHT sign vectors used by the graph through
     sign_vectors so those cache entries are allocated before capture.
     """
     key = _device_key(device)
-    if key not in _TMA_WORKSPACES or _TMA_WORKSPACES[key].numel() < nbytes:
+    nbytes = max(nbytes, _DEFAULT_TMA_WORKSPACE_NBYTES)
+    if key not in _TMA_WORKSPACES:
         _TMA_WORKSPACES[key] = torch.empty(nbytes, dtype=torch.uint8, device=device)
+    elif _TMA_WORKSPACES[key].numel() < nbytes:
+        raise RuntimeError(
+            "NVFP4 TMA workspace is too small for this request. Call "
+            f"prepare_for_cuda_graph(device, nbytes={nbytes}) before graph "
+            "capture and before any NVFP4 kernels initialize the workspace."
+        )
     # Pre-warm every call because tests and callers may clear get_rht_matrix's
     # cache after the workspace has already been initialized. Use the same
     # canonical device-key string as runtime callers so the lru_cache key
@@ -61,6 +68,21 @@ def prepare_for_cuda_graph(
     for sign_vector in sign_vectors or ():
         _prewarm_rht_matrix(tuple(sign_vector), key)
     return _TMA_WORKSPACES[key]
+
+
+def make_tma_workspace_allocator(workspace: torch.Tensor):
+    def _allocator(size, align, stream):
+        if size > workspace.numel():
+            raise RuntimeError(
+                "NVFP4 TMA workspace is too small for this request. "
+                f"Requested {size} bytes, but only {workspace.numel()} bytes "
+                "are available. Call prepare_for_cuda_graph(device, nbytes=...) "
+                "with a larger value before graph capture and before any NVFP4 "
+                "kernels initialize the workspace."
+            )
+        return workspace[: max(size, 1)]
+
+    return _allocator
 
 
 def get_wgrad_sign_vector(
