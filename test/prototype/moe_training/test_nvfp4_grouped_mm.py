@@ -36,10 +36,57 @@ from torchao.testing.utils import skip_if_rocm
 
 if has_triton() and is_sm_at_least_100() and torch_version_at_least("2.10.0"):
     from torchao.prototype.moe_training.nvfp4_training.nvfp4_grouped_mm import (
+        _scaled_grouped_mm,
         _to_nvfp4_then_scaled_grouped_mm,
     )
 
 BLOCK_SIZE = 16
+
+
+@skip_if_rocm("ROCm not supported")
+@pytest.mark.skipif(not has_triton(), reason="unsupported without triton")
+@pytest.mark.skipif(not is_sm_at_least_100(), reason="Requires SM100+")
+@pytest.mark.skipif(
+    not torch_version_at_least("2.10.0"), reason="requires PyTorch 2.10+"
+)
+def test_nvfp4_scaled_grouped_mm_fake_tensor():
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    M = K = N = 128
+    with FakeTensorMode():
+        mat_a = torch.empty((M, K // 2), dtype=torch.uint8, device="cuda").view(
+            torch.float4_e2m1fn_x2
+        )
+        mat_b = (
+            torch.empty((1, N, K // 2), dtype=torch.uint8, device="cuda")
+            .view(torch.float4_e2m1fn_x2)
+            .transpose(-2, -1)
+        )
+        block_scale_a = torch.empty(
+            (M, K // BLOCK_SIZE), dtype=torch.float8_e4m3fn, device="cuda"
+        )
+        block_scale_b = torch.empty(
+            (1, N * K // BLOCK_SIZE),
+            dtype=torch.float8_e4m3fn,
+            device="cuda",
+        )
+        global_amax_a = torch.empty(1, dtype=torch.float32, device="cuda")
+        global_amax_b = torch.empty(1, dtype=torch.float32, device="cuda")
+        offs = torch.empty(1, dtype=torch.int32, device="cuda")
+
+        output = _scaled_grouped_mm(
+            mat_a,
+            mat_b,
+            block_scale_a,
+            global_amax_a,
+            block_scale_b,
+            global_amax_b,
+            offs,
+        )
+
+    assert output.shape == (M, N)
+    assert output.stride() == (N, 1)
+    assert output.dtype == torch.bfloat16
 
 
 def _quantize_for_test(x: torch.Tensor):
@@ -195,6 +242,45 @@ def test_nvfp4_grouped_gemm_fwd_bwd(M, K, N, num_experts):
     assert weight_grad_sqnr >= min_weight_grad_sqnr, (
         f"Weight grad SQNR {weight_grad_sqnr} is below {min_weight_grad_sqnr}"
     )
+
+
+@skip_if_rocm("ROCm not supported")
+@pytest.mark.skipif(not has_triton(), reason="unsupported without triton")
+@pytest.mark.skipif(not is_sm_at_least_100(), reason="Requires SM100+")
+@pytest.mark.skipif(
+    not torch_version_at_least("2.10.0"), reason="requires PyTorch 2.10+"
+)
+def test_nvfp4_grouped_gemm_compile_fwd_bwd():
+    M = K = N = 128
+    sign_vector = tuple(1 if i % 2 == 0 else -1 for i in range(16))
+
+    def fn(x, weight, sr_seed, offs):
+        return _to_nvfp4_then_scaled_grouped_mm(
+            x,
+            weight,
+            sign_vector,
+            sr_seed,
+            offs=offs,
+            pad_token_groups_for_grouped_mm=False,
+        )
+
+    torch.manual_seed(42)
+    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda", requires_grad=True)
+    weight = torch.randn(
+        1, N, K, dtype=torch.bfloat16, device="cuda", requires_grad=True
+    )
+    sr_seed = torch.tensor([1234], dtype=torch.int64, device="cuda")
+    offs = torch.tensor([M], dtype=torch.int32, device="cuda")
+
+    expected = fn(x.detach(), weight.detach(), sr_seed, offs)
+    actual = torch.compile(fn, fullgraph=True)(x, weight, sr_seed, offs)
+    torch.testing.assert_close(actual, expected)
+
+    F.mse_loss(actual, torch.ones_like(actual)).backward()
+    assert x.grad.shape == (M, K)
+    assert weight.grad.shape == (1, N, K)
+    assert torch.isfinite(x.grad).all()
+    assert torch.isfinite(weight.grad).all()
 
 
 @skip_if_rocm("ROCm not supported")

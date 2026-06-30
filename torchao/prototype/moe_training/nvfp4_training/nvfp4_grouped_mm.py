@@ -32,6 +32,84 @@ from torchao.prototype.mx_formats.nvfp4_tensor import per_tensor_amax_to_scale
 from torchao.quantization.quantize_.common import KernelPreference
 from torchao.utils import is_sm_at_least_100
 
+if not torch._C._dispatch_has_kernel_for_dispatch_key(
+    "aten::_scaled_grouped_mm_v2", "Meta"
+):
+
+    @torch.library.register_fake("aten::_scaled_grouped_mm_v2")
+    def _fake_scaled_grouped_mm_v2(
+        mat_a: torch.Tensor,
+        mat_b: torch.Tensor,
+        scale_a: list[torch.Tensor],
+        recipe_a: list[int],
+        swizzle_a: list[int],
+        scale_b: list[torch.Tensor],
+        recipe_b: list[int],
+        swizzle_b: list[int],
+        offs: Optional[torch.Tensor] = None,
+        bias: Optional[torch.Tensor] = None,
+        out_dtype: Optional[torch.dtype] = None,
+        contraction_dim: list[int] = [],
+        use_fast_accum: bool = False,
+    ) -> torch.Tensor:
+        torch._check(
+            mat_a.ndim in (2, 3) and mat_b.ndim in (2, 3),
+            lambda: "mat_a and mat_b must be 2D or 3D",
+        )
+        mat_a_is_2d = mat_a.ndim == 2
+        mat_b_is_2d = mat_b.ndim == 2
+        if mat_a_is_2d or mat_b_is_2d:
+            torch._check(offs is not None, lambda: "offs must be provided")
+            torch._check(offs.ndim == 1, lambda: "offs must be 1D")
+            torch._check(offs.dtype == torch.int32, lambda: "offs must be int32")
+        else:
+            torch._check(offs is None, lambda: "offs must not be provided")
+        torch._check(bias is None, lambda: "bias is not supported")
+        torch._check(
+            out_dtype is None or out_dtype == torch.bfloat16,
+            lambda: "out_dtype must be torch.bfloat16",
+        )
+        torch._check(
+            len(contraction_dim) == 0 or contraction_dim == [-1, -2],
+            lambda: "contraction_dim must be empty or [-1, -2]",
+        )
+
+        if mat_a_is_2d and mat_b_is_2d:
+            out_shape = (offs.shape[0], mat_a.shape[0], mat_b.shape[1])
+        elif mat_a_is_2d:
+            torch._check(
+                offs.shape[0] == mat_b.shape[0],
+                lambda: "matrix batch sizes must match",
+            )
+            out_shape = (mat_a.shape[0], mat_b.shape[-1])
+        elif mat_b_is_2d:
+            torch._check(
+                offs.shape[0] == mat_a.shape[0],
+                lambda: "matrix batch sizes must match",
+            )
+            out_shape = (mat_a.shape[1], mat_b.shape[1])
+        else:
+            torch._check(
+                mat_a.shape[0] == mat_b.shape[0],
+                lambda: "matrix batch sizes must match",
+            )
+            out_shape = (mat_a.shape[0], mat_a.shape[1], mat_b.shape[-1])
+
+        output_dtype = out_dtype or torch.bfloat16
+        alignment = 16 // output_dtype.itemsize
+        padded_cols = (out_shape[-1] + alignment - 1) // alignment * alignment
+        if mat_a_is_2d == mat_b_is_2d:
+            out_stride = (out_shape[1] * padded_cols, padded_cols, 1)
+        else:
+            out_stride = (padded_cols, 1)
+        return torch.empty_strided(
+            out_shape,
+            out_stride,
+            dtype=output_dtype,
+            device=mat_a.device,
+        )
+
+
 _ALIGNMENT = 128
 _SCALE_RECIPE = [F.ScalingType.BlockWise1x16, F.ScalingType.TensorWise]
 _SWIZZLE = [F.SwizzleType.SWIZZLE_32_4_4, F.SwizzleType.NO_SWIZZLE]
