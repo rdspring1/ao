@@ -63,7 +63,10 @@ def _to_mxfp8_then_scaled_mm(
     grad_elem_dtype = torch.float8_e4m3fn
     block_size = 32
     mxfp8_dim0_cast_kernel_choice = MXFP8Dim0CastKernelChoice.TRITON
-    mxfp8_dim1_cast_kernel_choice = MXFP8Dim1CastKernelChoice.CUDA
+    # dim1 CUDA kernel requires torchao's _C extension, which is not built in this
+    # (Python-only editable) install. TRITON is numerically equivalent and needs no
+    # compiled kernel. See run_logs/smoke_fixed_batch_size_results notes.
+    mxfp8_dim1_cast_kernel_choice = MXFP8Dim1CastKernelChoice.TRITON
 
     return mx_mm.apply(
         input_hp,
