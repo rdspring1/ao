@@ -24,7 +24,6 @@ from torchao.prototype.moe_training.nvfp4_training.group_rht_quantize_row_col_tr
     triton_group_rht_quantize_row_col,
 )
 from torchao.prototype.moe_training.utils import (
-    conditional_nostrict_trace,
     pad_token_groups,
     unpad_token_groups,
 )
@@ -37,7 +36,34 @@ _SCALE_RECIPE = [F.ScalingType.BlockWise1x16, F.ScalingType.TensorWise]
 _SWIZZLE = [F.SwizzleType.SWIZZLE_32_4_4, F.SwizzleType.NO_SWIZZLE]
 
 
-@conditional_nostrict_trace
+@torch.library.register_fake("aten::_scaled_grouped_mm_v2")
+def _scaled_grouped_mm_v2_fake(
+    mat_a: torch.Tensor,
+    mat_b: torch.Tensor,
+    scale_a: list[torch.Tensor],
+    scale_recipe_a: list[int],
+    swizzle_a: list[int],
+    scale_b: list[torch.Tensor],
+    scale_recipe_b: list[int],
+    swizzle_b: list[int],
+    offs: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None,
+    contraction_dim: tuple[int, ...] | list[int] = (),
+    use_fast_accum: bool = False,
+) -> torch.Tensor:
+    if mat_a.ndim == 2 and mat_b.ndim == 3:
+        shape = (mat_a.shape[0], mat_b.shape[-1])
+    elif mat_a.ndim == 3 and mat_b.ndim == 3:
+        shape = (mat_a.shape[0], mat_a.shape[1], mat_b.shape[-1])
+    elif mat_a.ndim == 2:
+        shape = (offs.shape[0], mat_a.shape[0], mat_b.shape[-1])
+    else:
+        shape = (mat_a.shape[1], mat_b.shape[-1])
+    return mat_a.new_empty(shape, dtype=out_dtype or torch.bfloat16)
+
+
+@torch._dynamo.allow_in_graph
 def _to_nvfp4_rht_rs_then_scaled_grouped_mm(
     A: torch.Tensor,
     B: torch.Tensor,
