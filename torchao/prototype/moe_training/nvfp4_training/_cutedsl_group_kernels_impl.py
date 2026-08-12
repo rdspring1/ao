@@ -784,6 +784,7 @@ class _Tcgen05GroupRowColFused(_GroupRhtMainloop):
             t0 = r_local // cutlass.Int32(ROW_HB)  # token within a pass
 
             blk = cute.make_rmem_tensor((16,), cutlass.Float32)
+            rBlk = cute.make_rmem_tensor((16,), cutlass.BFloat16)
             ab_consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, MAINLOOP_STAGES
             )
@@ -808,9 +809,14 @@ class _Tcgen05GroupRowColFused(_GroupRhtMainloop):
                     )
                     for p in cutlass.range_constexpr(ROW_PASSES):
                         tok = p * cutlass.Int32(ROW_TOK_PER_PASS) + t0
+                        cute.autovec_copy(
+                            cute.local_tile(
+                                sA_clean[(None, tok, stage)], (16,), (hb,)
+                            ),
+                            rBlk,
+                        )
                         for j in cutlass.range_constexpr(16):
-                            h = hb * cutlass.Int32(16) + cutlass.Int32(j)
-                            blk[j] = sA_clean[(h, tok, stage)].to(cutlass.Float32)
+                            blk[j] = rBlk[j].to(cutlass.Float32)
                         row_rng = None
                         if cutlass.const_expr(self.sr):
                             row_rng = _sr_base(
@@ -1385,6 +1391,7 @@ class _Tcgen05GroupRhtAmax(_GroupRhtMainloop):
             hb = r_local % cutlass.Int32(ROW_HB)
             t0 = r_local // cutlass.Int32(ROW_HB)
 
+            rBlk = cute.make_rmem_tensor((16,), cutlass.BFloat16)
             ab_consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, MAINLOOP_STAGES
             )
@@ -1404,11 +1411,15 @@ class _Tcgen05GroupRhtAmax(_GroupRhtMainloop):
                     tile_max = cutlass.Float32(0.0)
                     for p in cutlass.range_constexpr(ROW_PASSES):
                         tok = p * cutlass.Int32(ROW_TOK_PER_PASS) + t0
+                        cute.autovec_copy(
+                            cute.local_tile(
+                                sA_clean[(None, tok, stage)], (16,), (hb,)
+                            ),
+                            rBlk,
+                        )
                         for j in cutlass.range_constexpr(16):
-                            h = hb * cutlass.Int32(16) + cutlass.Int32(j)
                             tile_max = _max_f32(
-                                tile_max,
-                                _abs_f32(sA_clean[(h, tok, stage)].to(cutlass.Float32)),
+                                tile_max, _abs_f32(rBlk[j].to(cutlass.Float32))
                             )
                     ab_pipeline.consumer_release(
                         ab_consumer_state, pipeline.PipelineOp.AsyncThread
