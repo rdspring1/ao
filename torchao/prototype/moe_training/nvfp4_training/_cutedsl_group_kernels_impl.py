@@ -902,9 +902,16 @@ def _compile_group_fused_kernel(device_idx: int, swizzle: bool, sr: bool):
     fake_b = make_fake_tensor(
         cutlass.BFloat16, (HADAMARD_DIM, HADAMARD_DIM, 1), stride=(HADAMARD_DIM, 1, 1)
     )
+    # The columnwise epilogue stores a thread's 16 contiguous u32 with one
+    # autovec_copy, which widens only as far as it can prove alignment: the u32
+    # default is 4B, so it lowers to sixteen scalar STG. The allocation is
+    # torch.empty (256B) and tokens % TOKEN_TILE == 0 makes the row stride a
+    # multiple of TOKEN_TILE // 8 u32 = 64B, so every row start is 16B aligned.
     fake_col_fp4 = make_fake_tensor(
-        cutlass.Uint32, (h_sym, cute.sym_int(divisibility=TOKEN_TILE // 8)),
-        stride=(free(), 1),
+        cutlass.Uint32,
+        (h_sym, cute.sym_int(divisibility=TOKEN_TILE // 8)),
+        stride=(cute.sym_int(divisibility=TOKEN_TILE // 8), 1),
+        assumed_align=16,
     )
     fake_col_sf = make_fake_tensor(cutlass.Uint32, (free(),), stride=(1,))
     fake_row_fp4 = make_fake_tensor(
