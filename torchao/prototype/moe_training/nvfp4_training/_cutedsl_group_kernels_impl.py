@@ -137,6 +137,19 @@ def _group_idx(token, offsets_t, num_groups):
     return lo
 
 
+def _group_at_work_item(tile_n_base, offsets_t, num_groups):
+    """Group of a work item's first tile, with that group's end offset.
+
+    A work item is K_TILE_MAX consecutive token tiles, so one search covers all
+    of them unless a tile crosses out of the returned group; the epilogues
+    re-search on that crossing rather than stepping ``g``, which keeps the
+    result identical to a per-tile lookup even when a group is empty. Searching
+    ``offsets_t`` in place keeps the group count unbounded.
+    """
+    g = _group_idx(tile_n_base * cutlass.Int32(TOKEN_TILE), offsets_t, num_groups)
+    return g, offsets_t[g]
+
+
 def _global_scale(amax):
     """NVFP4 two-level scale scalars from a global amax (TE :779-785).
 
@@ -687,16 +700,15 @@ class _Tcgen05GroupRowColFused(_GroupRhtMainloop):
                 tile_m, tile_n_base = _work_tile_coord(work_tile)
                 n_all = _k_tile_count(tile_n_base, tiles_in_n)
                 n_cnt = _valid_tile_count(tile_n_base, n_all, tiles_in_n_valid)
+                g, g_end = _group_at_work_item(tile_n_base, offsets_t, num_tensors)
+                _, dec, enc_over_fp4max = _global_scale(col_amax_t[g])
                 for k_tile in cutlass.range(n_cnt, unroll=1):
                     tile_n = tile_n_base + k_tile
-                    # Group lookup and scale scalars are recomputed per tile
-                    # rather than cached against a previous group id: a handful
-                    # of cached broadcast loads against a 32 KB tile, and it
-                    # keeps the epilogue free of loop-carried state.
-                    g = _group_idx(
-                        tile_n * cutlass.Int32(TOKEN_TILE), offsets_t, num_tensors
-                    )
-                    _, dec, enc_over_fp4max = _global_scale(col_amax_t[g])
+                    token = tile_n * cutlass.Int32(TOKEN_TILE)
+                    if token >= g_end:
+                        g = _group_idx(token, offsets_t, num_tensors)
+                        g_end = offsets_t[g]
+                        _, dec, enc_over_fp4max = _global_scale(col_amax_t[g])
                     h_global = tile_m * cutlass.Int32(M_TILE) + h_local
 
                     acc_pipeline.consumer_wait(acc_consumer_state)
@@ -779,13 +791,14 @@ class _Tcgen05GroupRowColFused(_GroupRhtMainloop):
                 tile_m, tile_n_base = _work_tile_coord(work_tile)
                 n_all = _k_tile_count(tile_n_base, tiles_in_n)
                 n_cnt = _valid_tile_count(tile_n_base, n_all, tiles_in_n_valid)
+                g, g_end = _group_at_work_item(tile_n_base, offsets_t, num_tensors)
+                _, r_dec, r_enc_over_fp4max = _global_scale(row_amax_t[g])
                 for k_tile in cutlass.range(n_cnt, unroll=1):
-                    g = _group_idx(
-                        (tile_n_base + k_tile) * cutlass.Int32(TOKEN_TILE),
-                        offsets_t,
-                        num_tensors,
-                    )
-                    _, r_dec, r_enc_over_fp4max = _global_scale(row_amax_t[g])
+                    token = (tile_n_base + k_tile) * cutlass.Int32(TOKEN_TILE)
+                    if token >= g_end:
+                        g = _group_idx(token, offsets_t, num_tensors)
+                        g_end = offsets_t[g]
+                        _, r_dec, r_enc_over_fp4max = _global_scale(row_amax_t[g])
 
                     ab_pipeline.consumer_wait(ab_consumer_state)
                     stage = ab_consumer_state.index
@@ -1324,12 +1337,12 @@ class _Tcgen05GroupRhtAmax(_GroupRhtMainloop):
                 n_cnt = _valid_tile_count(
                     tile_n_base, _k_tile_count(tile_n_base, tiles_in_n), tiles_in_n_valid
                 )
+                g, g_end = _group_at_work_item(tile_n_base, offsets_t, num_tensors)
                 for k_tile in cutlass.range(n_cnt, unroll=1):
-                    g = _group_idx(
-                        (tile_n_base + k_tile) * cutlass.Int32(TOKEN_TILE),
-                        offsets_t,
-                        num_tensors,
-                    )
+                    token = (tile_n_base + k_tile) * cutlass.Int32(TOKEN_TILE)
+                    if token >= g_end:
+                        g = _group_idx(token, offsets_t, num_tensors)
+                        g_end = offsets_t[g]
                     acc_pipeline.consumer_wait(acc_consumer_state)
                     tile_max = cutlass.Float32(0.0)
                     for u in cutlass.range_constexpr(EPI_UNROLL):
@@ -1380,12 +1393,12 @@ class _Tcgen05GroupRhtAmax(_GroupRhtMainloop):
                 n_cnt = _valid_tile_count(
                     tile_n_base, _k_tile_count(tile_n_base, tiles_in_n), tiles_in_n_valid
                 )
+                g, g_end = _group_at_work_item(tile_n_base, offsets_t, num_tensors)
                 for k_tile in cutlass.range(n_cnt, unroll=1):
-                    g = _group_idx(
-                        (tile_n_base + k_tile) * cutlass.Int32(TOKEN_TILE),
-                        offsets_t,
-                        num_tensors,
-                    )
+                    token = (tile_n_base + k_tile) * cutlass.Int32(TOKEN_TILE)
+                    if token >= g_end:
+                        g = _group_idx(token, offsets_t, num_tensors)
+                        g_end = offsets_t[g]
                     ab_pipeline.consumer_wait(ab_consumer_state)
                     stage = ab_consumer_state.index
                     tile_max = cutlass.Float32(0.0)
