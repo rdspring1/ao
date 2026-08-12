@@ -137,6 +137,26 @@ def _group_idx(token, offsets_t, num_groups):
     return lo
 
 
+@cute.jit
+def _flush_group_max(run_max, amax_t, g, lane):
+    """Reduce a warp's running max and commit it to ``amax_t[g]``.
+
+    The epilogues carry ``run_max`` across every tile that shares a group, so
+    this runs once per group per work item rather than once per tile. A zero
+    flush -- an empty work item, or one whose first tile already crossed -- is a
+    no-op against the pre-zeroed buffer.
+
+    Needs ``@cute.jit``: the lane predicate is a dynamic branch, which only
+    lowers inside an AST-preprocessed function.
+    """
+    for offset in range(5):
+        run_max = _max_f32(
+            run_max, cute.arch.shuffle_sync_bfly(run_max, 1 << (4 - offset))
+        )
+    if lane == cutlass.Int32(0):
+        _atom_max_f32_nonneg(amax_t.iterator + g, run_max)
+
+
 def _group_at_work_item(tile_n_base, offsets_t, num_groups):
     """Group of a work item's first tile, with that group's end offset.
 
@@ -1344,9 +1364,15 @@ class _Tcgen05GroupRhtAmax(_GroupRhtMainloop):
                     tile_n_base, _k_tile_count(tile_n_base, tiles_in_n), tiles_in_n_valid
                 )
                 g, g_end = _group_at_work_item(tile_n_base, offsets_t, num_tensors)
+                run_max = cutlass.Float32(0.0)
                 for k_tile in cutlass.range(n_cnt, unroll=1):
                     token = (tile_n_base + k_tile) * cutlass.Int32(TOKEN_TILE)
                     if token >= g_end:
+                        # Crossing out of the cached group is the only point the
+                        # running max has to reach memory: everything before it
+                        # belongs to `g`, everything after to the next group.
+                        _flush_group_max(run_max, col_amax_t, g, lane)
+                        run_max = cutlass.Float32(0.0)
                         g = _group_idx(token, offsets_t, num_tensors)
                         g_end = offsets_t[g]
                     acc_pipeline.consumer_wait(acc_consumer_state)
@@ -1367,13 +1393,8 @@ class _Tcgen05GroupRhtAmax(_GroupRhtMainloop):
                         acc_pipeline.consumer_release(acc_consumer_state)
                     acc_consumer_state.advance()
 
-                    for offset in cutlass.range_constexpr(5):
-                        tile_max = _max_f32(
-                            tile_max,
-                            cute.arch.shuffle_sync_bfly(tile_max, 1 << (4 - offset)),
-                        )
-                    if lane == cutlass.Int32(0):
-                        _atom_max_f32_nonneg(col_amax_t.iterator + g, tile_max)
+                    run_max = _max_f32(run_max, tile_max)
+                _flush_group_max(run_max, col_amax_t, g, lane)
 
                 clc_pipeline.consumer_wait(clc_consumer_state)
                 work_tile = tile_sched.get_current_work()
@@ -1401,9 +1422,12 @@ class _Tcgen05GroupRhtAmax(_GroupRhtMainloop):
                     tile_n_base, _k_tile_count(tile_n_base, tiles_in_n), tiles_in_n_valid
                 )
                 g, g_end = _group_at_work_item(tile_n_base, offsets_t, num_tensors)
+                run_max = cutlass.Float32(0.0)
                 for k_tile in cutlass.range(n_cnt, unroll=1):
                     token = (tile_n_base + k_tile) * cutlass.Int32(TOKEN_TILE)
                     if token >= g_end:
+                        _flush_group_max(run_max, row_amax_t, g, lane)
+                        run_max = cutlass.Float32(0.0)
                         g = _group_idx(token, offsets_t, num_tensors)
                         g_end = offsets_t[g]
                     ab_pipeline.consumer_wait(ab_consumer_state)
@@ -1426,13 +1450,8 @@ class _Tcgen05GroupRhtAmax(_GroupRhtMainloop):
                     )
                     ab_consumer_state.advance()
 
-                    for offset in cutlass.range_constexpr(5):
-                        tile_max = _max_f32(
-                            tile_max,
-                            cute.arch.shuffle_sync_bfly(tile_max, 1 << (4 - offset)),
-                        )
-                    if lane == cutlass.Int32(0):
-                        _atom_max_f32_nonneg(row_amax_t.iterator + g, tile_max)
+                    run_max = _max_f32(run_max, tile_max)
+                _flush_group_max(run_max, row_amax_t, g, lane)
 
                 clc_pipeline.consumer_wait(clc_consumer_state)
                 work_tile = tile_sched.get_current_work()
