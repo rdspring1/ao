@@ -1,11 +1,15 @@
-"""Tests for triton_group_rht_amax (SM100+ grouped RHT amax).
+"""Tests for the grouped RHT amax kernels (SM100+), triton and cutedsl.
 
-These tests compare the grouped kernel against per-expert calls to the non-grouped
-triton_rht_amax and verify the grouped custom op's fake output shapes and shared
+These tests compare the grouped kernels against per-expert calls to the non-grouped
+triton_rht_amax and verify the grouped custom ops' fake output shapes and shared
 input validation.
 
 Semantics match the non-grouped triton_rht_amax (single sign vector):
   col_amax[g] = max|RHT(A_g.T)|, row_amax[g] = max|A_g|.
+
+triton reduces the RHT output in bfloat16, so it matches the bf16-rounded oracle
+bitwise; cutedsl reduces the tcgen05 accumulator in float32, so it matches only to
+a small tolerance. The plain rowwise amax is exact for both.
 """
 
 from __future__ import annotations
@@ -18,6 +22,9 @@ from torch.utils._triton import has_triton
 from benchmarks.prototype.nvfp4_training.deepseek_v3_shapes import (
     get_deepseek_v3_weight_shapes,
 )
+from torchao.prototype.moe_training.nvfp4_training.hadamard_cutedsl_utils import (
+    cutedsl_nvfp4_kernels_available,
+)
 from torchao.utils import is_sm_at_least_100, torch_version_at_least
 
 if has_triton() and is_sm_at_least_100() and torch_version_at_least("2.10.0"):
@@ -29,6 +36,10 @@ if has_triton() and is_sm_at_least_100() and torch_version_at_least("2.10.0"):
     )
     from torchao.prototype.moe_training.nvfp4_training.hadamard_utils import (
         get_rht_matrix,
+    )
+if cutedsl_nvfp4_kernels_available():
+    from torchao.prototype.moe_training.nvfp4_training.group_hadamard_amax_cutedsl import (
+        cutedsl_group_rht_amax,
     )
 
 _HARDCODED_SIGN_VECTOR = (
@@ -59,11 +70,37 @@ requires_sm100 = [
     ),
 ]
 
+_skip_no_cutedsl = pytest.mark.skipif(
+    not cutedsl_nvfp4_kernels_available(),
+    reason="requires SM100 (Blackwell) + CuteDSL runtime (cuda-python, nvidia-cutlass-dsl)",
+)
+
+_KERNELS = [
+    pytest.param("triton", id="triton"),
+    pytest.param("cutedsl", marks=_skip_no_cutedsl, id="cutedsl"),
+]
+
+# cutedsl reduces the RHT in float32 where triton rounds to bfloat16 first, so the
+# columnwise amax only agrees to a small tolerance; the rowwise amax is exact.
+_COL_TOL = {"triton": {"atol": 0, "rtol": 0}, "cutedsl": {"atol": 5e-3, "rtol": 5e-3}}
+
 
 def _maybe_sm100(fn):
     for mark in requires_sm100:
         fn = mark(fn)
     return fn
+
+
+def _group_rht_amax(kernel, A, sign_vector, offsets, num_tensors, psl, hidden, rep):
+    """Dispatch to a backend's grouped RHT amax op; returns ``(col_amax, row_amax)``."""
+    op = triton_group_rht_amax if kernel == "triton" else cutedsl_group_rht_amax
+    return op(A, list(sign_vector), offsets, num_tensors, psl, hidden, rep)
+
+
+def _skip_if_unsupported_groups(kernel: str, num_tensors: int) -> None:
+    """The cutedsl group lookup is a fixed-depth binary search capped at 64 groups."""
+    if kernel == "cutedsl" and num_tensors > 64:
+        pytest.skip("cutedsl grouped kernel supports at most 64 groups")
 
 
 def _build_packed(groups, hidden_size, device, seed):
@@ -97,9 +134,10 @@ def _group_rht_amax_reference(A, offsets, num_tensors, sign_vector):
 
 
 @_maybe_sm100
+@pytest.mark.parametrize("kernel", _KERNELS)
 @torch.no_grad()
-def test_group_rht_amax_matches_per_group_kernel_bitwise():
-    """Grouped outputs exactly match per-expert triton_rht_amax outputs."""
+def test_group_rht_amax_matches_per_group_kernel(kernel):
+    """Grouped outputs match per-expert triton_rht_amax outputs."""
     device = torch.device("cuda", 0)
     groups = (128, 256)
     hidden_size = 256
@@ -119,9 +157,10 @@ def test_group_rht_amax_matches_per_group_kernel_bitwise():
     )
     torch_row = torch.stack([A_g.abs().amax().float() for A_g in group_tensors])
 
-    actual_col, actual_row = triton_group_rht_amax(
+    actual_col, actual_row = _group_rht_amax(
+        kernel,
         A,
-        list(_HARDCODED_SIGN_VECTOR),
+        _HARDCODED_SIGN_VECTOR,
         offsets,
         len(groups),
         A.shape[0],
@@ -129,9 +168,9 @@ def test_group_rht_amax_matches_per_group_kernel_bitwise():
         1,
     )
 
-    assert torch.equal(actual_col, expected_col)
+    torch.testing.assert_close(actual_col, expected_col, **_COL_TOL[kernel])
     assert torch.equal(actual_row, expected_row)
-    torch.testing.assert_close(actual_col, torch_col, atol=0, rtol=0)
+    torch.testing.assert_close(actual_col, torch_col, **_COL_TOL[kernel])
     torch.testing.assert_close(actual_row, torch_row, atol=0, rtol=0)
 
 
@@ -165,14 +204,16 @@ def test_group_rht_amax_persistent_path_bitwise():
 
 
 @_maybe_sm100
+@pytest.mark.parametrize("kernel", _KERNELS)
 @pytest.mark.parametrize(
     "shape",
     get_deepseek_v3_weight_shapes(factorized_experts=2),
     ids=lambda shape: f"{shape.model}-{shape.projection}",
 )
 @torch.no_grad()
-def test_group_rht_amax_deepseek_dimensions_bitwise(shape):
+def test_group_rht_amax_deepseek_dimensions(kernel, shape):
     """Real TorchTitan M/N dimensions with E factorized to two experts."""
+    _skip_if_unsupported_groups(kernel, shape.experts)
     device = torch.device("cuda", 0)
     groups = (shape.m,) * shape.experts
     A, offsets, _ = _build_packed(groups, shape.n, device, seed=223)
@@ -180,9 +221,10 @@ def test_group_rht_amax_deepseek_dimensions_bitwise(shape):
         A, offsets, shape.experts, _HARDCODED_SIGN_VECTOR
     )
 
-    actual_col, actual_row = triton_group_rht_amax(
+    actual_col, actual_row = _group_rht_amax(
+        kernel,
         A,
-        list(_HARDCODED_SIGN_VECTOR),
+        _HARDCODED_SIGN_VECTOR,
         offsets,
         shape.experts,
         A.shape[0],
@@ -190,8 +232,47 @@ def test_group_rht_amax_deepseek_dimensions_bitwise(shape):
         0,
     )
 
-    assert torch.equal(actual_col, expected_col)
+    torch.testing.assert_close(actual_col, expected_col, **_COL_TOL[kernel])
     assert torch.equal(actual_row, expected_row)
+
+
+@_maybe_sm100
+@_skip_no_cutedsl
+@torch.no_grad()
+def test_cutedsl_group_rht_amax_matches_triton():
+    """Ragged 128-aligned groups: rowwise amax is bitwise, columnwise within tolerance."""
+    device = torch.device("cuda", 0)
+    groups = (128, 256, 384, 128)
+    hidden_size = 1024
+    A, offsets, _ = _build_packed(groups, hidden_size, device, seed=225)
+
+    args = (A, _HARDCODED_SIGN_VECTOR, offsets, len(groups), A.shape[0], hidden_size, 1)
+    triton_col, triton_row = _group_rht_amax("triton", *args)
+    cutedsl_col, cutedsl_row = _group_rht_amax("cutedsl", *args)
+
+    assert torch.equal(cutedsl_row, triton_row)
+    torch.testing.assert_close(cutedsl_col, triton_col, atol=5e-3, rtol=5e-3)
+
+
+@_maybe_sm100
+@_skip_no_cutedsl
+@torch.no_grad()
+def test_cutedsl_group_rht_amax_rejects_too_many_groups():
+    """The fixed-depth group search caps the group count; exceeding it must raise."""
+    device = torch.device("cuda", 0)
+    groups = (128,) * 65
+    A, offsets, _ = _build_packed(groups, 128, device, seed=11)
+    with pytest.raises(ValueError, match="num_tensors must be <= 64"):
+        _group_rht_amax(
+            "cutedsl",
+            A,
+            _HARDCODED_SIGN_VECTOR,
+            offsets,
+            len(groups),
+            A.shape[0],
+            128,
+            1,
+        )
 
 
 @_maybe_sm100

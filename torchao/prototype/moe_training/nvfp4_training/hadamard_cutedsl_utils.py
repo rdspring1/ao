@@ -119,3 +119,13 @@ def cutedsl_prepare_for_cuda_graph(device, *, sign_vectors=None) -> None:
     for sr in (False, True):
         _compile_fused_kernel(idx, True, sr, apply_rht=True)
     _compile_fused_kernel(idx, True, False, apply_rht=False)
+
+    # Same for the grouped (per-expert MoE) kernels.
+    from ._cutedsl_group_kernels_impl import (
+        _compile_group_amax_kernel,
+        _compile_group_fused_kernel,
+    )
+
+    _compile_group_amax_kernel(idx)
+    for sr in (False, True):
+        _compile_group_fused_kernel(idx, True, sr)

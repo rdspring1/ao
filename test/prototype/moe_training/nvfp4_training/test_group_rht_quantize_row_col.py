@@ -1,4 +1,4 @@
-"""Tests for triton_group_rht_quantize_row_col (SM100+ grouped RHT kernel).
+"""Tests for the grouped RHT quantize kernels (SM100+), triton and cutedsl.
 
 Pure-torch oracle (no TransformerEngine), mirroring
 test_hadamard_quantize_row_col_triton.py:
@@ -34,6 +34,9 @@ from torchao.prototype.mx_formats.nvfp4_tensor import (
     nvfp4_quantize,
     per_tensor_amax_to_scale,
 )
+from torchao.prototype.moe_training.nvfp4_training.hadamard_cutedsl_utils import (
+    cutedsl_nvfp4_kernels_available,
+)
 from torchao.prototype.mx_formats.utils import from_blocked, to_blocked
 from torchao.utils import is_sm_at_least_100, torch_version_at_least
 
@@ -48,6 +51,10 @@ if has_triton() and is_sm_at_least_100() and torch_version_at_least("2.10.0"):
     )
     from torchao.prototype.moe_training.nvfp4_training.hadamard_utils import (
         get_rht_matrix,
+    )
+if cutedsl_nvfp4_kernels_available():
+    from torchao.prototype.moe_training.nvfp4_training.group_rht_quantize_row_col_cutedsl import (
+        cutedsl_group_rht_quantize_row_col,
     )
 
 _HARDCODED_SIGN_VECTOR = (
@@ -79,10 +86,37 @@ requires_sm100 = [
 ]
 
 
+_skip_no_cutedsl = pytest.mark.skipif(
+    not cutedsl_nvfp4_kernels_available(),
+    reason="requires SM100 (Blackwell) + CuteDSL runtime (cuda-python, nvidia-cutlass-dsl)",
+)
+
+_KERNELS = [
+    pytest.param("triton", id="triton"),
+    pytest.param("cutedsl", marks=_skip_no_cutedsl, id="cutedsl"),
+]
+
+
 def _maybe_sm100(fn):
     for mark in requires_sm100:
         fn = mark(fn)
     return fn
+
+
+def _group_quantize(kernel, *args, **kwargs):
+    """Dispatch to a backend's grouped RHT quantize op."""
+    op = (
+        triton_group_rht_quantize_row_col
+        if kernel == "triton"
+        else cutedsl_group_rht_quantize_row_col
+    )
+    return op(*args, **kwargs)
+
+
+def _skip_if_unsupported_groups(kernel: str, num_tensors: int) -> None:
+    """The cutedsl group lookup is a fixed-depth binary search capped at 64 groups."""
+    if kernel == "cutedsl" and num_tensors > 64:
+        pytest.skip("cutedsl grouped kernel supports at most 64 groups")
 
 
 @dataclass(frozen=True)
@@ -302,12 +336,14 @@ def triton_group_rht_quantize_row_col_ref(
     _assert_scales_adjacent(sfa, to_blocked(expected_row_sf), "row sf swizzled")
 
 
-def _assert_group_rht_correctness(graph_case):
+def _assert_group_rht_correctness(graph_case, kernel):
     spec, A, B, offsets, amax_row, amax_col, group_tensors, rht_groups = graph_case
     psl, hs = A.shape
     num_groups = len(spec.groups)
+    _skip_if_unsupported_groups(kernel, num_groups)
 
-    qa, sfa, qd, sfd = triton_group_rht_quantize_row_col(
+    qa, sfa, qd, sfd = _group_quantize(
+        kernel,
         A,
         list(_HARDCODED_SIGN_VECTOR),
         offsets,
@@ -336,21 +372,24 @@ def _assert_group_rht_correctness(graph_case):
 
 
 @_maybe_sm100
+@pytest.mark.parametrize("kernel", _KERNELS)
 @torch.no_grad()
-def test_group_rht_correctness(graph_case):
-    _assert_group_rht_correctness(graph_case)
+def test_group_rht_correctness(graph_case, kernel):
+    _assert_group_rht_correctness(graph_case, kernel)
 
 
 @_maybe_sm100
+@pytest.mark.parametrize("kernel", _KERNELS)
 @torch.no_grad()
-def test_group_rht_deepseek_dimensions_correctness(deepseek_graph_case):
+def test_group_rht_deepseek_dimensions_correctness(deepseek_graph_case, kernel):
     """Real TorchTitan M/N dimensions with E factorized to two experts."""
-    _assert_group_rht_correctness(deepseek_graph_case)
+    _assert_group_rht_correctness(deepseek_graph_case, kernel)
 
 
 @_maybe_sm100
+@pytest.mark.parametrize("kernel", _KERNELS)
 @torch.no_grad()
-def test_group_rht_padded_capacity_masks_spare_rows():
+def test_group_rht_padded_capacity_masks_spare_rows(kernel):
     """Capacity rows do not affect amax and flush to zero during quantization."""
     device = torch.device("cuda", 0)
     logical_rows, capacity_rows, hidden_size = 128, 256, 128
@@ -388,7 +427,8 @@ def test_group_rht_padded_capacity_masks_spare_rows():
     assert torch.equal(actual_col_amax, expected_col_amax)
     assert torch.equal(actual_row_amax, expected_row_amax)
 
-    expected = triton_group_rht_quantize_row_col(
+    expected = _group_quantize(
+        kernel,
         valid,
         list(_HARDCODED_SIGN_VECTOR),
         offsets,
@@ -401,7 +441,8 @@ def test_group_rht_padded_capacity_masks_spare_rows():
         None,
         False,
     )
-    actual = triton_group_rht_quantize_row_col(
+    actual = _group_quantize(
+        kernel,
         capacity,
         list(_HARDCODED_SIGN_VECTOR),
         offsets,
@@ -441,13 +482,16 @@ def test_group_rht_padded_capacity_masks_spare_rows():
 
 
 @_maybe_sm100
+@pytest.mark.parametrize("kernel", _KERNELS)
 @torch.no_grad()
-def test_group_rht_stochastic_rounding_launches(graph_case):
+def test_group_rht_stochastic_rounding_launches(graph_case, kernel):
     spec, A, B, offsets, amax_row, amax_col, _, _ = graph_case
     psl, hs = A.shape
     num_groups = len(spec.groups)
+    _skip_if_unsupported_groups(kernel, num_groups)
 
-    qa, sfa, qd, sfd = triton_group_rht_quantize_row_col(
+    qa, sfa, qd, sfd = _group_quantize(
+        kernel,
         A,
         list(_HARDCODED_SIGN_VECTOR),
         offsets,
@@ -465,10 +509,11 @@ def test_group_rht_stochastic_rounding_launches(graph_case):
     assert torch.isfinite(sfd.float()).all()
 
 
-def _run_sr(graph_case, rng_state):
+def _run_sr(graph_case, rng_state, kernel="triton"):
     spec, A, B, offsets, amax_row, amax_col, _, _ = graph_case
     psl, hs = A.shape
-    return triton_group_rht_quantize_row_col(
+    return _group_quantize(
+        kernel,
         A,
         list(_HARDCODED_SIGN_VECTOR),
         offsets,
@@ -484,41 +529,46 @@ def _run_sr(graph_case, rng_state):
 
 
 @_maybe_sm100
+@pytest.mark.parametrize("kernel", _KERNELS)
 @torch.no_grad()
-def test_group_rht_rng_state_controls_stochastic_rounding(graph_case):
+def test_group_rht_rng_state_controls_stochastic_rounding(graph_case, kernel):
     """Same rng_state -> identical packed codes; advanced state -> codes differ."""
+    _skip_if_unsupported_groups(kernel, len(graph_case[0].groups))
     qa1, _, qd1, _ = _run_sr(
-        graph_case, _make_rng_state(graph_case[1].device, (11, 22, 33, 44))
+        graph_case, _make_rng_state(graph_case[1].device, (11, 22, 33, 44)), kernel
     )
     qa2, _, qd2, _ = _run_sr(
-        graph_case, _make_rng_state(graph_case[1].device, (11, 22, 33, 44))
+        graph_case, _make_rng_state(graph_case[1].device, (11, 22, 33, 44)), kernel
     )
     assert torch.equal(qa1, qa2), "Same rng_state must yield identical row FP4 codes"
     assert torch.equal(qd1, qd2), "Same rng_state must yield identical col FP4 codes"
 
     qa3, _, qd3, _ = _run_sr(
-        graph_case, _make_rng_state(graph_case[1].device, (11, 9999, 33, 8888))
+        graph_case, _make_rng_state(graph_case[1].device, (11, 9999, 33, 8888)), kernel
     )
     assert not torch.equal(qa1, qa3), "Advanced rng_state must change row FP4 codes"
     assert not torch.equal(qd1, qd3), "Advanced rng_state must change col FP4 codes"
 
 
 @_maybe_sm100
+@pytest.mark.parametrize("kernel", _KERNELS)
 @torch.no_grad()
-def test_group_rht_rng_state_validation(graph_case):
+def test_group_rht_rng_state_validation(graph_case, kernel):
     """SR enabled requires a valid int64 rng_state; SR disabled ignores it."""
     spec, A, B, offsets, amax_row, amax_col, _, _ = graph_case
     psl, hs = A.shape
     num_groups = len(spec.groups)
+    _skip_if_unsupported_groups(kernel, num_groups)
 
     with pytest.raises(TypeError, match="rng_state must be a torch.Tensor"):
-        _run_sr(graph_case, None)
+        _run_sr(graph_case, None, kernel)
 
     with pytest.raises(ValueError, match="at least 4 elements"):
-        _run_sr(graph_case, _make_rng_state(A.device, (1, 2)))
+        _run_sr(graph_case, _make_rng_state(A.device, (1, 2)), kernel)
 
     # SR disabled: rng_state is ignored, so None is accepted.
-    triton_group_rht_quantize_row_col(
+    _group_quantize(
+        kernel,
         A,
         list(_HARDCODED_SIGN_VECTOR),
         offsets,
@@ -534,6 +584,7 @@ def test_group_rht_rng_state_validation(graph_case):
 
 
 @_maybe_sm100
+@pytest.mark.parametrize("kernel", _KERNELS)
 @pytest.mark.parametrize(
     ("invalid_amax", "error"),
     [
@@ -541,8 +592,9 @@ def test_group_rht_rng_state_validation(graph_case):
         ("noncontiguous", "a_global_amax must be contiguous"),
     ],
 )
-def test_group_rht_amax_storage_validation(graph_case, invalid_amax, error):
+def test_group_rht_amax_storage_validation(graph_case, invalid_amax, error, kernel):
     spec, A, _, offsets, _, amax_col, _, _ = graph_case
+    _skip_if_unsupported_groups(kernel, len(spec.groups))
     if invalid_amax == "2d":
         amax_row = torch.empty(
             (1, len(spec.groups)), dtype=torch.float32, device=A.device
@@ -554,7 +606,8 @@ def test_group_rht_amax_storage_validation(graph_case, invalid_amax, error):
         )[::2]
 
     with pytest.raises(ValueError, match=error):
-        triton_group_rht_quantize_row_col(
+        _group_quantize(
+            kernel,
             A,
             list(_HARDCODED_SIGN_VECTOR),
             offsets,
