@@ -265,21 +265,19 @@ class _NVFP4GroupedMM(torch.autograd.Function):
             VARYING_FIRST_DIM,
             logical_packed_length=logical_packed_length,
         )
-        x_row_codes, x_row_sf, x_col_codes, x_col_sf = (
-            group_rht_quantize_row_col(
-                input_act,
-                sign_vector_list,
-                padded_group_end_offsets,
-                num_experts,
-                packed_sequence_length,
-                K,
-                VARYING_FIRST_DIM,
-                x_row_amax,
-                x_col_amax,
-                rng_state=None,
-                enable_stochastic_rounding=False,
-                logical_packed_length=logical_packed_length,
-            )
+        x_row_codes, x_row_sf, x_col_codes, x_col_sf = group_rht_quantize_row_col(
+            input_act,
+            sign_vector_list,
+            padded_group_end_offsets,
+            num_experts,
+            packed_sequence_length,
+            K,
+            VARYING_FIRST_DIM,
+            x_row_amax,
+            x_col_amax,
+            rng_state=None,
+            enable_stochastic_rounding=False,
+            logical_packed_length=logical_packed_length,
         )
 
         weight_amax = triton_group_weight_amax(weight, num_experts)
@@ -288,8 +286,8 @@ class _NVFP4GroupedMM(torch.autograd.Function):
             if use_cutedsl_weight
             else triton_group_weight_quantize_2d
         )
-        weight_codes, weight_sf, weight_t_codes, weight_t_sf = (
-            group_weight_quantize_2d(weight, weight_amax, num_experts)
+        weight_codes, weight_sf, weight_t_codes, weight_t_sf = group_weight_quantize_2d(
+            weight, weight_amax, num_experts
         )
         output = F.scaled_grouped_mm(
             x_row_codes.view(torch.float4_e2m1fn_x2),
@@ -387,21 +385,19 @@ class _NVFP4GroupedMM(torch.autograd.Function):
             0, 2**32, (1,), dtype=torch.int64, device=grad_output.device
         )
         rng_state = torch.cat((sr_seed, col_offset, sr_seed ^ 1, row_offset))
-        dy_row_codes, dy_row_sf, dy_col_codes, dy_col_sf = (
-            group_rht_quantize_row_col(
-                grad_output,
-                sign_vector_list,
-                padded_group_end_offsets,
-                num_experts,
-                packed_sequence_length,
-                N,
-                VARYING_FIRST_DIM,
-                dy_row_amax,
-                dy_col_amax,
-                rng_state,
-                enable_stochastic_rounding=True,
-                logical_packed_length=logical_packed_length,
-            )
+        dy_row_codes, dy_row_sf, dy_col_codes, dy_col_sf = group_rht_quantize_row_col(
+            grad_output,
+            sign_vector_list,
+            padded_group_end_offsets,
+            num_experts,
+            packed_sequence_length,
+            N,
+            VARYING_FIRST_DIM,
+            dy_row_amax,
+            dy_col_amax,
+            rng_state,
+            enable_stochastic_rounding=True,
+            logical_packed_length=logical_packed_length,
         )
 
         grad_input = F.scaled_grouped_mm(

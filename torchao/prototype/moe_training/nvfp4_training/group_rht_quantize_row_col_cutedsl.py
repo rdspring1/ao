@@ -39,9 +39,7 @@ def _fold_rng_state(rng_state: torch.Tensor) -> torch.Tensor:
     return folded
 
 
-@torch.library.custom_op(
-    "torchao::cutedsl_group_rht_quantize_row_col", mutates_args=()
-)
+@torch.library.custom_op("torchao::cutedsl_group_rht_quantize_row_col", mutates_args=())
 def cutedsl_group_rht_quantize_row_col(
     A: torch.Tensor,
     sign_vector: List[int],
@@ -140,9 +138,7 @@ def _(
     enable_stochastic_rounding,
     logical_packed_length=None,
 ):
-    qa_base = A.new_empty(
-        (packed_sequence_length, hidden_size // 2), dtype=torch.uint8
-    )
+    qa_base = A.new_empty((packed_sequence_length, hidden_size // 2), dtype=torch.uint8)
     sfa = A.new_empty(
         (packed_sequence_length, hidden_size // 16), dtype=torch.float8_e4m3fn
     )

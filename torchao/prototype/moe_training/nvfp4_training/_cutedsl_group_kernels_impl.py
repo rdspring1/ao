@@ -272,9 +272,9 @@ class _GroupRhtMainloop:
         tiles_in_n = tokens // cutlass.Int32(TOKEN_TILE)
         # One work item = up to K_TILE_MAX consecutive token tiles at a fixed
         # hidden slab, reproducing TE's tile_n_base = q * K_TILE_MAX (TE :301-306).
-        tiles_in_n_outer = (tiles_in_n + cutlass.Int32(K_TILE_MAX - 1)) // cutlass.Int32(
-            K_TILE_MAX
-        )
+        tiles_in_n_outer = (
+            tiles_in_n + cutlass.Int32(K_TILE_MAX - 1)
+        ) // cutlass.Int32(K_TILE_MAX)
         tile_sched_params = utils.ClcDynamicPersistentTileSchedulerParams(
             (tiles_in_m, tiles_in_n_outer, cutlass.Int32(1)),
             (1, 1, 1),
@@ -467,7 +467,8 @@ class _Tcgen05GroupRowColFused(_GroupRhtMainloop):
             num_stages=CLC_STAGES,
             producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
             consumer_group=pipeline.CooperativeGroup(
-                pipeline.Agent.Thread, TPB - 32  # 480
+                pipeline.Agent.Thread,
+                TPB - 32,  # 480
             ),
             tx_count=16,
             cta_layout_vmnk=cluster_layout_vmnk,
@@ -589,7 +590,9 @@ class _Tcgen05GroupRowColFused(_GroupRhtMainloop):
             while work_tile.is_valid_tile:
                 tile_m, tile_n_base = _work_tile_coord(work_tile)
                 n_cnt = _valid_tile_count(
-                    tile_n_base, _k_tile_count(tile_n_base, tiles_in_n), tiles_in_n_valid
+                    tile_n_base,
+                    _k_tile_count(tile_n_base, tiles_in_n),
+                    tiles_in_n_valid,
                 )
                 for k_tile in cutlass.range(n_cnt, unroll=1):
                     ab_pipeline.producer_acquire(ab_producer_state)
@@ -650,7 +653,9 @@ class _Tcgen05GroupRowColFused(_GroupRhtMainloop):
             while work_tile.is_valid_tile:
                 _, tile_n_base = _work_tile_coord(work_tile)
                 n_cnt = _valid_tile_count(
-                    tile_n_base, _k_tile_count(tile_n_base, tiles_in_n), tiles_in_n_valid
+                    tile_n_base,
+                    _k_tile_count(tile_n_base, tiles_in_n),
+                    tiles_in_n_valid,
                 )
                 for k_tile in cutlass.range(n_cnt, unroll=1):
                     ab_pipeline.consumer_wait(ab_consumer_state)
@@ -830,9 +835,7 @@ class _Tcgen05GroupRowColFused(_GroupRhtMainloop):
                     for p in cutlass.range_constexpr(ROW_PASSES):
                         tok = p * cutlass.Int32(ROW_TOK_PER_PASS) + t0
                         cute.autovec_copy(
-                            cute.local_tile(
-                                sA_clean[(None, tok, stage)], (16,), (hb,)
-                            ),
+                            cute.local_tile(sA_clean[(None, tok, stage)], (16,), (hb,)),
                             rBlk,
                         )
                         for j in cutlass.range_constexpr(16):
@@ -898,7 +901,9 @@ def _compile_group_fused_kernel(device_idx: int, swizzle: bool, sr: bool):
     h_sym = cute.sym_int(divisibility=M_TILE)
     t_sym = cute.sym_int(divisibility=TOKEN_TILE)
 
-    fake_a = make_fake_tensor(cutlass.BFloat16, (h_sym, t_sym, 1), stride=(1, free(), 1))
+    fake_a = make_fake_tensor(
+        cutlass.BFloat16, (h_sym, t_sym, 1), stride=(1, free(), 1)
+    )
     fake_b = make_fake_tensor(
         cutlass.BFloat16, (HADAMARD_DIM, HADAMARD_DIM, 1), stride=(HADAMARD_DIM, 1, 1)
     )
@@ -915,7 +920,8 @@ def _compile_group_fused_kernel(device_idx: int, swizzle: bool, sr: bool):
     )
     fake_col_sf = make_fake_tensor(cutlass.Uint32, (free(),), stride=(1,))
     fake_row_fp4 = make_fake_tensor(
-        cutlass.Uint32, (t_sym, cute.sym_int(divisibility=M_TILE // 8)),
+        cutlass.Uint32,
+        (t_sym, cute.sym_int(divisibility=M_TILE // 8)),
         stride=(free(), 1),
     )
     fake_row_sf = make_fake_tensor(
@@ -990,9 +996,7 @@ def _cutedsl_group_rht_quantize_row_col_impl(
     logical_packed_length = logical_packed_length.clone()
 
     stream = cuda.CUstream(int(torch.cuda.current_stream(dev).cuda_stream))
-    compiled = _compile_group_fused_kernel(
-        dev.index, True, bool(stochastic_rounding)
-    )
+    compiled = _compile_group_fused_kernel(dev.index, True, bool(stochastic_rounding))
     compiled(
         A.t().unsqueeze(-1),
         rht_nk,
@@ -1252,7 +1256,9 @@ class _Tcgen05GroupRhtAmax(_GroupRhtMainloop):
             while work_tile.is_valid_tile:
                 tile_m, tile_n_base = _work_tile_coord(work_tile)
                 n_cnt = _valid_tile_count(
-                    tile_n_base, _k_tile_count(tile_n_base, tiles_in_n), tiles_in_n_valid
+                    tile_n_base,
+                    _k_tile_count(tile_n_base, tiles_in_n),
+                    tiles_in_n_valid,
                 )
                 for k_tile in cutlass.range(n_cnt, unroll=1):
                     ab_pipeline.producer_acquire(ab_producer_state)
@@ -1308,7 +1314,9 @@ class _Tcgen05GroupRhtAmax(_GroupRhtMainloop):
             while work_tile.is_valid_tile:
                 _, tile_n_base = _work_tile_coord(work_tile)
                 n_cnt = _valid_tile_count(
-                    tile_n_base, _k_tile_count(tile_n_base, tiles_in_n), tiles_in_n_valid
+                    tile_n_base,
+                    _k_tile_count(tile_n_base, tiles_in_n),
+                    tiles_in_n_valid,
                 )
                 for k_tile in cutlass.range(n_cnt, unroll=1):
                     ab_pipeline.consumer_wait(ab_consumer_state)
@@ -1368,7 +1376,9 @@ class _Tcgen05GroupRhtAmax(_GroupRhtMainloop):
             while work_tile.is_valid_tile:
                 _, tile_n_base = _work_tile_coord(work_tile)
                 n_cnt = _valid_tile_count(
-                    tile_n_base, _k_tile_count(tile_n_base, tiles_in_n), tiles_in_n_valid
+                    tile_n_base,
+                    _k_tile_count(tile_n_base, tiles_in_n),
+                    tiles_in_n_valid,
                 )
                 g, g_end = _group_at_work_item(tile_n_base, offsets_t, num_tensors)
                 run_max = cutlass.Float32(0.0)
@@ -1426,7 +1436,9 @@ class _Tcgen05GroupRhtAmax(_GroupRhtMainloop):
             while work_tile.is_valid_tile:
                 _, tile_n_base = _work_tile_coord(work_tile)
                 n_cnt = _valid_tile_count(
-                    tile_n_base, _k_tile_count(tile_n_base, tiles_in_n), tiles_in_n_valid
+                    tile_n_base,
+                    _k_tile_count(tile_n_base, tiles_in_n),
+                    tiles_in_n_valid,
                 )
                 g, g_end = _group_at_work_item(tile_n_base, offsets_t, num_tensors)
                 run_max = cutlass.Float32(0.0)
@@ -1443,9 +1455,7 @@ class _Tcgen05GroupRhtAmax(_GroupRhtMainloop):
                     for p in cutlass.range_constexpr(ROW_PASSES):
                         tok = p * cutlass.Int32(ROW_TOK_PER_PASS) + t0
                         cute.autovec_copy(
-                            cute.local_tile(
-                                sA_clean[(None, tok, stage)], (16,), (hb,)
-                            ),
+                            cute.local_tile(sA_clean[(None, tok, stage)], (16,), (hb,)),
                             rBlk,
                         )
                         for j in cutlass.range_constexpr(16):
