@@ -414,7 +414,11 @@ def _quant16(vals, enc_over_fp4max, dec, sr: cutlass.Constexpr = False, rng_base
 
 class _Tcgen05RowColFused:
     def __init__(
-        self, swizzle_sf: bool = True, sr: bool = False, apply_rht: bool = True
+        self,
+        swizzle_sf: bool = True,
+        sr: bool = False,
+        apply_rht: bool = True,
+        grouped: bool = False,
     ):
         # swizzle_sf=True: cutlass NVFP4 swizzled SF (GEMM-ready, TMA-coalesced store).
         # False: plain (N,M//16)/(M,N//16) SF (row SF falls back to a strided SIMT store).
@@ -425,9 +429,17 @@ class _Tcgen05RowColFused:
         # emits 2D 16x16 block scaling.
         # Activations (apply_rht=True) keep the standard 1x16 scaling. The RHT path is compiled
         # separately, so its codegen is unchanged.
+        # grouped=True: A is E equal-sized experts stacked into (E*M, N), each with its own
+        # global amax. Experts are uniform and contiguous and M % (N_TILE*U) == 0, so a work tile
+        # never straddles two of them: the rowwise outputs are byte-identical to the ungrouped
+        # (E*M, N) result (the 128x4 SF swizzle is per-128-row-block) and only the columnwise
+        # stores need an expert offset on their tile coordinate. Compiled as its own variant so
+        # the two shipped ungrouped kernels keep their codegen exactly, and so grouped never has
+        # to be crossed with sr (whose col seed would alias across experts) or with apply_rht.
         self.swizzle_sf = swizzle_sf
         self.sr = sr
         self.apply_rht = apply_rht
+        self.grouped = grouped
 
     @cute.jit
     def __call__(
@@ -444,6 +456,7 @@ class _Tcgen05RowColFused:
         M: cutlass.Int32,
         N: cutlass.Int32,
         GRID: cutlass.Int32,
+        NUM_EXPERTS: cutlass.Int32,
         stream: cuda.CUstream,
     ):
         self.c_layout = utils.LayoutEnum.from_tensor(mFP4)
@@ -576,6 +589,9 @@ class _Tcgen05RowColFused:
             N_TILE * U
         )  # M contraction block-groups (K=16U)
         num_super = num_tiles_m * num_tiles_ns
+        # grouped: M is the stacked E*M_expert extent, so pid_ns // tiles_ns_per_expert is the
+        # expert and num_tiles_m is the per-expert stride of the columnwise output's row tiles.
+        tiles_ns_per_expert = num_tiles_ns // NUM_EXPERTS
 
         self.kernel(
             tiled_mma,
@@ -611,6 +627,8 @@ class _Tcgen05RowColFused:
             num_tiles_ns,
             num_super,
             GRID,
+            tiles_ns_per_expert,
+            num_tiles_m,
         ).launch(
             grid=(GRID, 1, 1),
             block=(
@@ -657,6 +675,8 @@ class _Tcgen05RowColFused:
         num_tiles_ns: cutlass.Int32,
         num_super: cutlass.Int32,
         GRID: cutlass.Int32,
+        tiles_ns_per_expert: cutlass.Int32,
+        col_tiles_per_expert: cutlass.Int32,
     ):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         tidx, _, _ = cute.arch.thread_idx()
@@ -874,8 +894,12 @@ class _Tcgen05RowColFused:
             dec = cutlass.Float32(1.0) / enc
             return enc, dec, enc * cutlass.Float32(1.0 / FP4_E2M1_MAX)
 
-        g_enc, g_dec, enc_over_fp4max = _global_scale(global_amax_t[0])  # col (RHT)
-        r_enc, r_dec, r_enc_over_fp4max = _global_scale(row_amax_t[0])  # row (plain)
+        # Ungrouped: one global scale pair for the whole launch. Grouped: the epilogues overwrite
+        # these per work tile from that tile's expert; the hoisted pair still has to be computed
+        # (and typed) before the loops, since the DSL rejects a name that enters a dynamic `for`
+        # untyped and gains a type inside it.
+        _, g_dec, enc_over_fp4max = _global_scale(global_amax_t[0])  # col (RHT)
+        _, r_dec, r_enc_over_fp4max = _global_scale(row_amax_t[0])  # row (plain)
         sr_rng = cutlass.Uint32(0)
         if cutlass.const_expr(self.sr):
             sr_rng = cutlass.Uint32(
@@ -958,6 +982,12 @@ class _Tcgen05RowColFused:
                 pid_ns = super_id % num_tiles_ns
                 m0 = pid_ns * cutlass.Int32(KW)  # global M-row base
                 buf = local_iter % ROW_FP4_STAGES  # double-buffer index
+                if cutlass.const_expr(self.grouped):
+                    # The rowwise outputs are the stacked (E*M, N) result verbatim, so only the
+                    # scale is expert-dependent here.
+                    _, r_dec, r_enc_over_fp4max = _global_scale(
+                        row_amax_t[pid_ns // tiles_ns_per_expert]
+                    )
 
                 ab_pipeline.consumer_wait(row_ab_state)  # wait sA full
                 stage = row_ab_state.index
@@ -1093,6 +1123,14 @@ class _Tcgen05RowColFused:
                 super_id = start_pid + local_iter * GRID
                 pid_m = super_id // num_tiles_ns
                 pid_ns = super_id % num_tiles_ns
+                pid_m_col, pid_ns_col = pid_m, pid_ns
+                if cutlass.const_expr(self.grouped):
+                    # col outputs are (E*N, M//8) and (E*(N//128), (M//64)*512): shift the row
+                    # tile by this expert's block of N tiles, rebase the col tile inside it.
+                    e = pid_ns // tiles_ns_per_expert
+                    pid_m_col = pid_m + e * col_tiles_per_expert
+                    pid_ns_col = pid_ns - e * tiles_ns_per_expert
+                    _, g_dec, enc_over_fp4max = _global_scale(global_amax_t[e])
                 acc_idx = acc_consumer_state.index
 
                 acc_pipeline.consumer_wait(acc_consumer_state)
@@ -1139,7 +1177,9 @@ class _Tcgen05RowColFused:
                 cute.arch.fence_proxy("async.shared", space="cta")
                 epi_store_barrier.arrive_and_wait()
                 if warp_idx == cutlass.Int32(0):
-                    gFP4 = cute.local_tile(mFP4_tma, (M_TILE, 2 * U), (pid_m, pid_ns))
+                    gFP4 = cute.local_tile(
+                        mFP4_tma, (M_TILE, 2 * U), (pid_m_col, pid_ns_col)
+                    )
                     tSs, tSg = cpasync.tma_partition(
                         tma_atom_fp4,
                         0,
@@ -1150,10 +1190,12 @@ class _Tcgen05RowColFused:
                     cute.copy(tma_atom_fp4, tSs, tSg)
                     if cutlass.const_expr(self.swizzle_sf):
                         gSF = cute.local_tile(
-                            mSF_tma, (1, SF_GCOL * SF_BLK), (pid_m, pid_ns)
+                            mSF_tma, (1, SF_GCOL * SF_BLK), (pid_m_col, pid_ns_col)
                         )
                     else:
-                        gSF = cute.local_tile(mSF_tma, (M_TILE, U), (pid_m, pid_ns))
+                        gSF = cute.local_tile(
+                            mSF_tma, (M_TILE, U), (pid_m_col, pid_ns_col)
+                        )
                     tSFs, tSFg = cpasync.tma_partition(
                         tma_atom_sf,
                         0,
@@ -1188,6 +1230,14 @@ class _Tcgen05RowColFused:
                 super_id = start_pid + local_iter * GRID
                 pid_m = super_id // num_tiles_ns
                 pid_ns = super_id % num_tiles_ns
+                pid_m_col, pid_ns_col = pid_m, pid_ns
+                if cutlass.const_expr(self.grouped):
+                    # col outputs are (E*N, M//8) and (E*(N//128), (M//64)*512): shift the row
+                    # tile by this expert's block of N tiles, rebase the col tile inside it.
+                    e = pid_ns // tiles_ns_per_expert
+                    pid_m_col = pid_m + e * col_tiles_per_expert
+                    pid_ns_col = pid_ns - e * tiles_ns_per_expert
+                    _, g_dec, enc_over_fp4max = _global_scale(global_amax_t[e])
 
                 ab_pipeline.consumer_wait(col_ab_state)  # wait sA full
                 stage = col_ab_state.index
@@ -1238,7 +1288,9 @@ class _Tcgen05RowColFused:
                 cute.arch.fence_proxy("async.shared", space="cta")
                 col_store_barrier.arrive_and_wait()
                 if warp_idx == cutlass.Int32(0):
-                    gFP4 = cute.local_tile(mFP4_tma, (M_TILE, 2 * U), (pid_m, pid_ns))
+                    gFP4 = cute.local_tile(
+                        mFP4_tma, (M_TILE, 2 * U), (pid_m_col, pid_ns_col)
+                    )
                     tSs, tSg = cpasync.tma_partition(
                         tma_atom_fp4,
                         0,
@@ -1249,10 +1301,12 @@ class _Tcgen05RowColFused:
                     cute.copy(tma_atom_fp4, tSs, tSg)
                     if cutlass.const_expr(self.swizzle_sf):
                         gSF = cute.local_tile(
-                            mSF_tma, (1, SF_GCOL * SF_BLK), (pid_m, pid_ns)
+                            mSF_tma, (1, SF_GCOL * SF_BLK), (pid_m_col, pid_ns_col)
                         )
                     else:
-                        gSF = cute.local_tile(mSF_tma, (M_TILE, U), (pid_m, pid_ns))
+                        gSF = cute.local_tile(
+                            mSF_tma, (M_TILE, U), (pid_m_col, pid_ns_col)
+                        )
                     tSFs, tSFg = cpasync.tma_partition(
                         tma_atom_sf,
                         0,
@@ -1785,8 +1839,11 @@ def _cutedsl_rht_amax_impl(A: torch.Tensor, sign_vector=DEFAULT_SIGN_VECTOR):
     return col_amax, row_amax
 
 
-@functools.lru_cache(maxsize=16)
-def _compile_fused_kernel(device_idx, swizzle, sr, apply_rht=True):
+# maxsize=None: the key is (device, swizzle, sr, apply_rht, grouped) and every entry is a
+# compiled kernel that a CUDA-graph capture may depend on. An eviction would force a lazy
+# recompile mid-capture, so the cache must never evict.
+@functools.lru_cache(maxsize=None)
+def _compile_fused_kernel(device_idx, swizzle, sr, apply_rht=True, grouped=False):
     """Compile the fused kernel with symbolic shapes (cached per device+swizzle+sr+apply_rht).
 
     The symbolic (sym_int) shapes make the compiled kernel serve any (M % 256, N % 128); the
@@ -1794,11 +1851,20 @@ def _compile_fused_kernel(device_idx, swizzle, sr, apply_rht=True):
     selects the cutlass-swizzled SF layout (op default) vs the plain (N, M//16)/(M, N//16) layout.
     ``sr`` compiles the stochastic-rounding (cvt.rs) variant as a separate kernel, leaving the RTNE
     forward path untouched. ``apply_rht=False`` compiles the no-MMA weight-quantize variant (the col
-    path reads transposed A from SMEM). Not keyed on the sign vector / RNG (runtime launch buffers).
+    path reads transposed A from SMEM). ``grouped=True`` compiles the dense-expert variant: M is the
+    stacked E*M_expert extent, the amaxes are (E,), and the columnwise stores carry an expert offset.
+    Not keyed on the sign vector / RNG (runtime launch buffers).
     """
+    # The grouped variant is only reachable from the weight quantize: apply_rht would need a
+    # per-expert B operand, and sr's columnwise seed (pid_m, nrow) aliases across experts.
+    assert not (grouped and (apply_rht or sr))
     m_sym = cute.sym_int(divisibility=N_TILE * U)  # M % 256
     n_sym = cute.sym_int(divisibility=M_TILE)  # N % 128
     free = cute.sym_int  # a fresh dynamic stride per call
+    # Reusing a sym_int ties the two extents together in the compiled signature. The col outputs
+    # are as tall as A is wide (N) ungrouped, but E*N grouped, so they need their own symbol
+    # there. The row outputs stay on m_sym: their height is A's width, E*M, either way.
+    cn_sym = cute.sym_int(divisibility=M_TILE) if grouped else n_sym
 
     # aT = A.t().unsqueeze(-1): (N, M, 1), dim0 contiguous; output FP4 tensors row-major.
     fake_aT = make_fake_tensor(
@@ -1809,7 +1875,7 @@ def _compile_fused_kernel(device_idx, swizzle, sr, apply_rht=True):
     )
     # col_fp4 (N, M//8) u32, store box inner = 2*U = 32; row_fp4 (M, N//8) u32, inner = 16.
     fake_cfp4 = make_fake_tensor(
-        cutlass.Uint32, (n_sym, cute.sym_int(divisibility=2 * U)), stride=(free(), 1)
+        cutlass.Uint32, (cn_sym, cute.sym_int(divisibility=2 * U)), stride=(free(), 1)
     )
     fake_rfp4 = make_fake_tensor(
         cutlass.Uint32,
@@ -1833,7 +1899,7 @@ def _compile_fused_kernel(device_idx, swizzle, sr, apply_rht=True):
         # plain SF: col (N, M//16), row (M, N//16).
         fake_csf = make_fake_tensor(
             cutlass.Float8E4M3FN,
-            (n_sym, cute.sym_int(divisibility=U)),
+            (cn_sym, cute.sym_int(divisibility=U)),
             stride=(free(), 1),
         )
         fake_rsf = make_fake_tensor(
@@ -1841,9 +1907,14 @@ def _compile_fused_kernel(device_idx, swizzle, sr, apply_rht=True):
             (m_sym, cute.sym_int(divisibility=M_TILE // 16)),
             stride=(free(), 1),
         )
-    fake_amax = make_fake_tensor(cutlass.Float32, (1,), stride=(1,))
+    # grouped: the amaxes are (E,) rather than a scalar, indexed by the work tile's expert.
+    fake_amax = make_fake_tensor(
+        cutlass.Float32, (free() if grouped else 1,), stride=(1,)
+    )
     fake_sr_rng = make_fake_tensor(cutlass.Int32, (1,), stride=(1,))
-    k = _Tcgen05RowColFused(swizzle_sf=swizzle, sr=sr, apply_rht=apply_rht)
+    k = _Tcgen05RowColFused(
+        swizzle_sf=swizzle, sr=sr, apply_rht=apply_rht, grouped=grouped
+    )
     return cute.compile(
         k,
         fake_aT,
@@ -1855,6 +1926,7 @@ def _compile_fused_kernel(device_idx, swizzle, sr, apply_rht=True):
         fake_amax,
         fake_amax,
         fake_sr_rng,
+        cutlass.Int32(0),
         cutlass.Int32(0),
         cutlass.Int32(0),
         cutlass.Int32(0),
@@ -1993,6 +2065,7 @@ def _cutedsl_rht_quantize_row_col_impl(
         int(M),
         int(N),
         int(GRID),
+        1,  # NUM_EXPERTS
         stream,
     )
 
@@ -2000,3 +2073,64 @@ def _cutedsl_rht_quantize_row_col_impl(
     if compute_rowwise:
         return col_fp4_u8, col_sf, row_fp4.view(torch.uint8), row_sf
     return col_fp4_u8, col_sf, None, None
+
+
+def _cutedsl_group_weight_quantize_2d_impl(
+    A: torch.Tensor,
+    global_amax: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Dense-expert 2D (16x16) NVFP4 E2M1 weight quantize, no RHT.
+
+    Runs the ``apply_rht=False, grouped=True`` variant of the fused kernel once over the whole
+    ``(E, M, N)`` stack. Experts are equal-sized and contiguous, so ``A`` is fed as the ``(E*M, N)``
+    view: the rowwise outputs are then the ungrouped result verbatim (the 128x4 SF swizzle is
+    per-128-row-block and 128 | M), and only the columnwise outputs need the per-expert tile offset
+    the kernel applies. One global amax per expert; the col and row amaxes are the same tensor since
+    ``max|A[e].t()| == max|A[e]|``.
+
+    Args:
+        A: (E, M, N) bfloat16, contiguous. M % 256 == 0, N % 128 == 0.
+        global_amax: (E,) float32 per-expert ``A[e].float().abs().max()``.
+
+    Returns:
+        (E, M, N//2) u8 rowwise codes, (E, M//128, N//64, 32, 16) fp8 rowwise swizzled SF,
+        (E, N, M//2) u8 colwise codes, (E, N//128, M//64, 32, 16) fp8 colwise swizzled SF.
+    """
+    E, M, N = A.shape
+    # Non-differentiable op (autograd owned by the outer Function); detach so the input passed
+    # to the kernel never carries autograd state.
+    A = A.detach()
+    dev = A.device
+
+    row_fp4 = torch.empty((E, M, N // 8), dtype=torch.uint32, device=dev)
+    col_fp4 = torch.empty((E, N, M // 8), dtype=torch.uint32, device=dev)
+    row_sf = torch.empty(
+        (E, M // 128, N // 64, 32, 16), dtype=torch.float8_e4m3fn, device=dev
+    )
+    col_sf = torch.empty(
+        (E, N // 128, M // 64, 32, 16), dtype=torch.float8_e4m3fn, device=dev
+    )
+
+    NUM_SMS = _get_num_sms(dev.index)
+    GRID = min(NUM_SMS, (N // M_TILE) * (E * M // (N_TILE * U)))
+    stream = cuda.CUstream(int(torch.cuda.current_stream(dev).cuda_stream))
+
+    fused = _compile_fused_kernel(dev.index, True, False, apply_rht=False, grouped=True)
+    fused(
+        A.view(E * M, N).t().unsqueeze(-1),
+        _get_identity_buffer(dev.index),  # unused MMA B operand (no MMA on this path)
+        col_fp4.view(E * N, M // 8),
+        col_sf.reshape(E * (N // 128), (M // 64) * 32 * 16),
+        row_fp4.view(E * M, N // 8),
+        row_sf.reshape(E * (M // 128), (N // 64) * 32 * 16),
+        global_amax,
+        global_amax,
+        _get_sr_rng_buffer(dev.index),  # unused (RTNE)
+        int(E * M),
+        int(N),
+        int(GRID),
+        int(E),
+        stream,
+    )
+    # uint32 -> uint8 quadruples the last extent: (E, M, N//8) -> (E, M, N//2).
+    return row_fp4.view(torch.uint8), row_sf, col_fp4.view(torch.uint8), col_sf
