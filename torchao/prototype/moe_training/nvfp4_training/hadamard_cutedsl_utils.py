@@ -114,11 +114,13 @@ def cutedsl_prepare_for_cuda_graph(device, *, sign_vectors=None) -> None:
     for sign_vector in sign_vectors or ():
         _get_rht_buffer(tuple(int(v) for v in sign_vector), idx)
     # Pre-compile the kernels so no lazy compile fires mid-capture: amax; the RHT fused RTNE +
-    # SR variants (apply_rht=True); and the no-MMA weight-quantize variant (apply_rht=False).
+    # SR variants (apply_rht=True); and the no-MMA weight-quantize variant (apply_rht=False), in
+    # both its single-tensor and dense-expert grouped forms.
     _compile_amax_tc_kernel(idx)
     for sr in (False, True):
         _compile_fused_kernel(idx, True, sr, apply_rht=True)
-    _compile_fused_kernel(idx, True, False, apply_rht=False)
+    for grouped in (False, True):
+        _compile_fused_kernel(idx, True, False, apply_rht=False, grouped=grouped)
 
     # Same for the grouped (per-expert MoE) kernels.
     from ._cutedsl_group_kernels_impl import (
