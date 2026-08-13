@@ -122,7 +122,8 @@ def _weight_quantize_2d(x: torch.Tensor, use_cutedsl: bool):
     # The grouped weight amax at E=1. Bit-exact with the inf-norm it replaces --
     # max is exact, and neither materializes the weight in fp32 -- but it keeps
     # enough loads in flight to saturate HBM where the TensorIterator reduce does
-    # not: 1.7-2.0x over 29 MB to 470 MB of weights.
+    # not: 1.5-2.0x over 29 MB to 470 MB of weights in a hot loop, 1.4-1.66x once
+    # L2 is flushed, rising with size as the fixed launch cost amortizes.
     global_amax = triton_group_weight_amax(x.unsqueeze(0), 1)[0]
     quantize = cutedsl_weight_quantize_2d if use_cutedsl else triton_weight_quantize_2d
     codes, sf, t_codes, t_sf = quantize(x, global_amax)
