@@ -316,7 +316,7 @@ def nvfp4_linear(
     bias: Optional[torch.Tensor] = None,
     *,
     sign_vector: tuple[int, ...] | list[int],
-    kernel_preference: KernelPreference = KernelPreference.TRITON,
+    kernel_preference: KernelPreference = KernelPreference.AUTO,
     sr_seed: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Convenience wrapper around the nvfp4_mm_triton autograd function.
@@ -329,23 +329,40 @@ def nvfp4_linear(
         weight_hp: High precision weight [out_features, in_features]
         bias: Optional bias [out_features]
         sign_vector: RHT sign vector used for amax and quantization.
-        kernel_preference: Backend for quantization, TRITON (default) or CUTEDSL.
-            CUTEDSL runs the full path on CuteDSL — the amax, the forward RTNE quantize, the
-            backward SR (cvt.rs) quantize, and the 2D weight quantize (requires out_features % 256).
+        kernel_preference: Backend for quantization, AUTO (default), TRITON, or CUTEDSL.
+            CuteDSL runs the full path — the amax, the forward RTNE quantize, the backward
+            SR (cvt.rs) quantize, and the 2D weight quantize — but needs M and out_features
+            divisible by 256 on top of the path's own %128. AUTO takes CuteDSL when the
+            runtime and the shapes allow and falls back to Triton otherwise; CUTEDSL is the
+            same choice made loudly, raising rather than falling back.
         sr_seed: Fixed int64 seed tensor (size=(1,)) for SR Philox key. Allocated
             fresh if None. For reproducibility, pass a pre-allocated module buffer.
     """
-    if kernel_preference not in (KernelPreference.TRITON, KernelPreference.CUTEDSL):
+    if kernel_preference not in (
+        KernelPreference.AUTO,
+        KernelPreference.TRITON,
+        KernelPreference.CUTEDSL,
+    ):
         raise ValueError(
-            "NVFP4 training linear only supports kernel_preference TRITON or CUTEDSL, "
-            f"got {kernel_preference!r}"
+            "NVFP4 training linear only supports kernel_preference AUTO, TRITON, or "
+            f"CUTEDSL, got {kernel_preference!r}"
         )
-    use_cutedsl = kernel_preference == KernelPreference.CUTEDSL
+    use_cutedsl = kernel_preference != KernelPreference.TRITON
     if use_cutedsl and not cutedsl_nvfp4_kernels_available():
-        raise RuntimeError(
-            f"kernel_preference=CUTEDSL requires {CUTEDSL_NVFP4_REQUIREMENTS} "
-            f"({cutedsl_nvfp4_unavailable_reason()})."
-        )
+        if kernel_preference == KernelPreference.CUTEDSL:
+            raise RuntimeError(
+                f"kernel_preference=CUTEDSL requires {CUTEDSL_NVFP4_REQUIREMENTS} "
+                f"({cutedsl_nvfp4_unavailable_reason()})."
+            )
+        use_cutedsl = False
+    # Under AUTO an unsupported shape falls back; nvfp4_mm_triton.forward still raises
+    # for an explicit CUTEDSL request, so the loud path keeps its error.
+    if (
+        use_cutedsl
+        and kernel_preference == KernelPreference.AUTO
+        and (input_hp.shape[-2] % 256 != 0 or weight_hp.shape[0] % 256 != 0)
+    ):
+        use_cutedsl = False
 
     if sr_seed is None:
         sr_seed = torch.randint(
