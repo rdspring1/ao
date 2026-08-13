@@ -1628,7 +1628,14 @@ def _store_grouped_col_sf_u32(mSF_u32, rSF, r, c_base, g, offsets_t, hidden):
     r_grp = (r % cutlass.Int32(128)) // cutlass.Int32(32)
     # A group has ``hidden * group_len / 64`` u32 scale words.  The preceding
     # concatenated groups cover the same expression with ``group_start``.
-    prefix_words = hidden * group_start // cutlass.Int32(64)
+    # The product is taken in 64 bits: at DeepSeek-V3 671B (hidden 7168) it passes
+    # 2^31 once ``group_start`` reaches 299,593 rows, and an Int32 multiply wraps
+    # negative there, so the store lands far below the buffer. The quotient is at
+    # most ``hidden * tokens / 64``, which is comfortably Int32, so only the
+    # multiply needs widening and the index arithmetic below stays 32-bit.
+    prefix_words = cutlass.Int32(
+        cutlass.Int64(hidden) * cutlass.Int64(group_start) // cutlass.Int64(64)
+    )
     words_per_hidden_block = group_len * cutlass.Int32(2)
     c_local = c_base - group_start // cutlass.Int32(16)
     # Plain Python loops: this helper is not AST-preprocessed, so the trace
