@@ -4,13 +4,16 @@
 # This source code is licensed under the BSD 3-Clause license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Differentiable Triton NVFP4 grouped GEMM for MoE training."""
+"""Differentiable NVFP4 grouped GEMM for MoE training."""
 
 from typing import Optional
 
 import torch
 import torch.nn.functional as F
 
+from torchao.prototype.moe_training.nvfp4_training.group_hadamard_amax_cutedsl import (
+    cutedsl_group_rht_amax,
+)
 from torchao.prototype.moe_training.nvfp4_training.group_hadamard_amax_triton import (
     triton_group_rht_amax,
 )
@@ -18,14 +21,25 @@ from torchao.prototype.moe_training.nvfp4_training.group_hadamard_utils import (
     _DEVICE_ASSERTS,
     VARYING_FIRST_DIM,
 )
+from torchao.prototype.moe_training.nvfp4_training.group_quantize_2d_cutedsl import (
+    cutedsl_group_weight_quantize_2d,
+)
 from torchao.prototype.moe_training.nvfp4_training.group_quantize_2d_triton import (
     triton_group_weight_quantize_2d,
+)
+from torchao.prototype.moe_training.nvfp4_training.group_rht_quantize_row_col_cutedsl import (
+    cutedsl_group_rht_quantize_row_col,
 )
 from torchao.prototype.moe_training.nvfp4_training.group_rht_quantize_row_col_triton import (
     triton_group_rht_quantize_row_col,
 )
 from torchao.prototype.moe_training.nvfp4_training.group_weight_amax_triton import (
     triton_group_weight_amax,
+)
+from torchao.prototype.moe_training.nvfp4_training.hadamard_cutedsl_utils import (
+    CUTEDSL_NVFP4_REQUIREMENTS,
+    cutedsl_nvfp4_kernels_available,
+    cutedsl_nvfp4_unavailable_reason,
 )
 from torchao.prototype.moe_training.utils import (
     conditional_nostrict_trace,
@@ -40,6 +54,63 @@ _ALIGNMENT = 128
 _SCALE_RECIPE = [F.ScalingType.BlockWise1x16, F.ScalingType.TensorWise]
 _SWIZZLE = [F.SwizzleType.SWIZZLE_32_4_4, F.SwizzleType.NO_SWIZZLE]
 
+# cutedsl_group_weight_quantize_2d's super-tile is 256 rows of the per-expert out
+# dimension, stricter than the Triton kernel's 128.
+_CUTEDSL_WEIGHT_ROWS = 256
+
+
+def _resolve_backends(
+    kernel_preference: KernelPreference,
+    num_experts: int,
+    out_features: int,
+) -> tuple[bool, bool]:
+    """``(use_cutedsl_rht, use_cutedsl_weight)`` for this call.
+
+    Under AUTO each op independently takes CuteDSL where it can run and Triton
+    otherwise, so a missing runtime or an unsupported shape costs speed rather than
+    failing. CUTEDSL is the same choice made loudly: an explicit request that cannot
+    be honored raises instead of silently running the slower path.
+    """
+    if kernel_preference not in (
+        KernelPreference.AUTO,
+        KernelPreference.TRITON,
+        KernelPreference.CUTEDSL,
+    ):
+        raise ValueError(
+            "NVFP4 grouped GEMM only supports kernel_preference AUTO, TRITON, or "
+            f"CUTEDSL, got {kernel_preference!r}"
+        )
+    if kernel_preference == KernelPreference.TRITON:
+        return False, False
+
+    if not cutedsl_nvfp4_kernels_available():
+        if kernel_preference == KernelPreference.CUTEDSL:
+            raise RuntimeError(
+                f"kernel_preference=CUTEDSL requires {CUTEDSL_NVFP4_REQUIREMENTS} "
+                f"({cutedsl_nvfp4_unavailable_reason()})."
+            )
+        return False, False
+
+    # Imported here rather than at module scope: _cutedsl_group_kernels_impl pulls in
+    # cutlass at import time, so it is only reachable once availability is known.
+    from torchao.prototype.moe_training.nvfp4_training._cutedsl_group_kernels_impl import (
+        MAX_GROUPS,
+    )
+
+    use_cutedsl_rht = num_experts <= MAX_GROUPS
+    use_cutedsl_weight = out_features % _CUTEDSL_WEIGHT_ROWS == 0
+    if kernel_preference == KernelPreference.CUTEDSL and not use_cutedsl_rht:
+        raise ValueError(
+            f"kernel_preference=CUTEDSL requires at most {MAX_GROUPS} experts, "
+            f"got {num_experts}"
+        )
+    if kernel_preference == KernelPreference.CUTEDSL and not use_cutedsl_weight:
+        raise ValueError(
+            f"kernel_preference=CUTEDSL requires N (out_features) divisible by "
+            f"{_CUTEDSL_WEIGHT_ROWS}, got {out_features}"
+        )
+    return use_cutedsl_rht, use_cutedsl_weight
+
 
 @conditional_nostrict_trace
 def _to_nvfp4_rht_rs_then_scaled_grouped_mm(
@@ -50,12 +121,18 @@ def _to_nvfp4_rht_rs_then_scaled_grouped_mm(
     offs: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
     pad_token_groups_for_grouped_mm: bool = False,
+    kernel_preference: KernelPreference = KernelPreference.AUTO,
 ) -> torch.Tensor:
     """Quantize and multiply grouped activations and expert weights.
 
     ``A`` has shape ``(M, K)``, ``B`` has shape ``(E, N, K)``, and ``offs``
     contains the cumulative row-end offset for each expert. The caller owns the
     persistent RHT sign vector and stochastic-rounding seed.
+
+    ``kernel_preference`` selects the quantization backend. AUTO (default) runs each
+    op on CuteDSL where it can and falls back to Triton per op; TRITON forces Triton;
+    CUTEDSL demands CuteDSL and raises if it cannot run. The per-expert weight amax
+    is Triton on every path -- it has no CuteDSL twin.
     """
     output = _NVFP4GroupedMM.apply(
         A,
@@ -64,6 +141,7 @@ def _to_nvfp4_rht_rs_then_scaled_grouped_mm(
         sr_seed,
         offs,
         pad_token_groups_for_grouped_mm,
+        kernel_preference,
     )
     if bias is not None:
         output = output + bias.to(output.dtype)
@@ -71,7 +149,7 @@ def _to_nvfp4_rht_rs_then_scaled_grouped_mm(
 
 
 class _NVFP4GroupedMM(torch.autograd.Function):
-    """NVFP4 grouped forward, dgrad, and wgrad using Triton quantization."""
+    """NVFP4 grouped forward, dgrad, and wgrad on the selected quantization backend."""
 
     @staticmethod
     def forward(
@@ -82,6 +160,7 @@ class _NVFP4GroupedMM(torch.autograd.Function):
         sr_seed: torch.Tensor,
         group_end_offsets: Optional[torch.Tensor],
         pad_token_groups_for_grouped_mm: bool,
+        kernel_preference: KernelPreference,
     ) -> torch.Tensor:
         if input_act.ndim != 2:
             raise ValueError(f"input_act must be 2D, got {input_act.ndim}D")
@@ -142,6 +221,10 @@ class _NVFP4GroupedMM(torch.autograd.Function):
                     "every token group must be 128-row aligned when padding is disabled",
                 )
 
+        use_cutedsl_rht, use_cutedsl_weight = _resolve_backends(
+            kernel_preference, num_experts, N
+        )
+
         input_act = input_act.to(torch.bfloat16).contiguous()
         # The 2D quantizer consumes logical W (E, N, K), then produces rowwise W
         # and rowwise W.T codes with the scale layouts required by each GEMM.
@@ -164,7 +247,15 @@ class _NVFP4GroupedMM(torch.autograd.Function):
 
         packed_sequence_length = input_act.shape[0]
         logical_packed_length = padded_group_end_offsets[-1:]
-        x_col_amax, x_row_amax = triton_group_rht_amax(
+        group_rht_amax = (
+            cutedsl_group_rht_amax if use_cutedsl_rht else triton_group_rht_amax
+        )
+        group_rht_quantize_row_col = (
+            cutedsl_group_rht_quantize_row_col
+            if use_cutedsl_rht
+            else triton_group_rht_quantize_row_col
+        )
+        x_col_amax, x_row_amax = group_rht_amax(
             input_act,
             sign_vector_list,
             padded_group_end_offsets,
@@ -175,7 +266,7 @@ class _NVFP4GroupedMM(torch.autograd.Function):
             logical_packed_length=logical_packed_length,
         )
         x_row_codes, x_row_sf, x_col_codes, x_col_sf = (
-            triton_group_rht_quantize_row_col(
+            group_rht_quantize_row_col(
                 input_act,
                 sign_vector_list,
                 padded_group_end_offsets,
@@ -192,8 +283,13 @@ class _NVFP4GroupedMM(torch.autograd.Function):
         )
 
         weight_amax = triton_group_weight_amax(weight, num_experts)
+        group_weight_quantize_2d = (
+            cutedsl_group_weight_quantize_2d
+            if use_cutedsl_weight
+            else triton_group_weight_quantize_2d
+        )
         weight_codes, weight_sf, weight_t_codes, weight_t_sf = (
-            triton_group_weight_quantize_2d(weight, weight_amax, num_experts)
+            group_weight_quantize_2d(weight, weight_amax, num_experts)
         )
         output = F.scaled_grouped_mm(
             x_row_codes.view(torch.float4_e2m1fn_x2),
@@ -234,6 +330,7 @@ class _NVFP4GroupedMM(torch.autograd.Function):
         ctx.pad_token_groups_for_grouped_mm = pad_token_groups_for_grouped_mm
         ctx.num_tokens = num_tokens
         ctx.sign_vector = sign_vector
+        ctx.use_cutedsl_rht = use_cutedsl_rht
         return output
 
     @staticmethod
@@ -264,7 +361,15 @@ class _NVFP4GroupedMM(torch.autograd.Function):
         packed_sequence_length, N = grad_output.shape
         logical_packed_length = padded_group_end_offsets[-1:]
         sign_vector_list = list(ctx.sign_vector)
-        dy_col_amax, dy_row_amax = triton_group_rht_amax(
+        group_rht_amax = (
+            cutedsl_group_rht_amax if ctx.use_cutedsl_rht else triton_group_rht_amax
+        )
+        group_rht_quantize_row_col = (
+            cutedsl_group_rht_quantize_row_col
+            if ctx.use_cutedsl_rht
+            else triton_group_rht_quantize_row_col
+        )
+        dy_col_amax, dy_row_amax = group_rht_amax(
             grad_output,
             sign_vector_list,
             padded_group_end_offsets,
@@ -283,7 +388,7 @@ class _NVFP4GroupedMM(torch.autograd.Function):
         )
         rng_state = torch.cat((sr_seed, col_offset, sr_seed ^ 1, row_offset))
         dy_row_codes, dy_row_sf, dy_col_codes, dy_col_sf = (
-            triton_group_rht_quantize_row_col(
+            group_rht_quantize_row_col(
                 grad_output,
                 sign_vector_list,
                 padded_group_end_offsets,
@@ -334,4 +439,4 @@ class _NVFP4GroupedMM(torch.autograd.Function):
                 kernel_preference=KernelPreference.TRITON,
             )
 
-        return grad_input, grad_weight, None, None, None, None
+        return grad_input, grad_weight, None, None, None, None, None
