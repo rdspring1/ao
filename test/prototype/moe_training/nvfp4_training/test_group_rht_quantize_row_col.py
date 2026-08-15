@@ -484,6 +484,66 @@ def test_group_rht_padded_capacity_masks_spare_rows(kernel):
 @_maybe_sm100
 @pytest.mark.parametrize("kernel", _KERNELS)
 @torch.no_grad()
+def test_group_rht_capacity_folded_into_last_group_zeroes_col_scales(kernel):
+    """Capacity rows inside the last group's extent get zeroed columnwise scales.
+
+    The other convention (offsets[-1] == logical rows, covered above) leaves those
+    bytes unaddressed, so nothing writes them. Here offsets[-1] is the capacity, so
+    the spare rows *are* part of the last group's blocked scale buffer and the
+    grouped GEMM reads them -- both backends must flush zeros.
+    """
+    device = torch.device("cuda", 0)
+    logical_rows, capacity_rows, hidden_size = 128, 256, 128
+    torch.manual_seed(228)
+    A = torch.randn((capacity_rows, hidden_size), dtype=torch.bfloat16, device=device)
+    A[logical_rows:].fill_(1000.0)
+    offsets = torch.tensor([capacity_rows], dtype=torch.int32, device=device)
+    logical_packed_length = torch.tensor(
+        [logical_rows], dtype=torch.int32, device=device
+    )
+
+    amax_col, amax_row = triton_group_rht_amax(
+        A,
+        list(_HARDCODED_SIGN_VECTOR),
+        offsets,
+        1,
+        capacity_rows,
+        hidden_size,
+        1,
+        logical_packed_length=logical_packed_length,
+    )
+
+    # The op allocates its own outputs with torch.empty, so an unwritten scale
+    # region would read whatever the caching allocator last held. Dirty a block of
+    # exactly that size first, or "uninitialized" happens to be zero and the
+    # assertion below cannot fail.
+    sf_bytes = hidden_size * (capacity_rows // 16)
+    poison = torch.full((sf_bytes,), 255, dtype=torch.uint8, device=device)
+    del poison
+
+    _, _, _, sfd = _group_quantize(
+        kernel,
+        A,
+        list(_HARDCODED_SIGN_VECTOR),
+        offsets,
+        1,
+        capacity_rows,
+        hidden_size,
+        1,
+        amax_row,
+        amax_col,
+        None,
+        False,
+        logical_packed_length=logical_packed_length,
+    )
+
+    sfd_plain = _from_blocked_grouped(sfd, hidden_size, (capacity_rows,))
+    assert torch.count_nonzero(sfd_plain[:, logical_rows // 16 :]) == 0
+
+
+@_maybe_sm100
+@pytest.mark.parametrize("kernel", _KERNELS)
+@torch.no_grad()
 def test_group_rht_stochastic_rounding_launches(graph_case, kernel):
     spec, A, B, offsets, amax_row, amax_col, _, _ = graph_case
     psl, hs = A.shape

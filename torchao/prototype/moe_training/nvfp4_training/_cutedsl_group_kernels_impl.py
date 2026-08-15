@@ -791,6 +791,25 @@ class _Tcgen05GroupRowColFused(_GroupRhtMainloop):
                         mColFP4, (M_TILE, TOKEN_TILE // 8), (tile_m, tile_n)
                     )
                     cute.autovec_copy(rCol, gCol[(h_local, None)])
+                    # Triton masks its columnwise scale store with
+                    # cb_idx < cdiv(group_len, 64), which admits capacity tiles only
+                    # when the caller folds the pad into the last group
+                    # (offsets[-1] == packed rows). Past offsets[-1] nothing addresses
+                    # these bytes, and storing anyway would run word_col beyond
+                    # words_per_hidden_block and overwrite the next hidden block's
+                    # scales. The tile is 128 tokens and group boundaries are
+                    # 128-aligned, so this per-tile test is that per-word mask.
+                    token = tile_n * cutlass.Int32(TOKEN_TILE)
+                    if token < offsets_t[num_tensors - cutlass.Int32(1)]:
+                        _store_grouped_col_sf_u32(
+                            mColSF,
+                            rColSF,
+                            tile_m * cutlass.Int32(M_TILE) + h_local,
+                            tile_n * cutlass.Int32(TOKEN_TILE // 16),
+                            _group_idx(token, offsets_t, num_tensors),
+                            offsets_t,
+                            hidden,
+                        )
 
                 clc_pipeline.consumer_wait(clc_consumer_state)
                 work_tile = tile_sched.get_current_work()
