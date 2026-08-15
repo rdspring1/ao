@@ -13,15 +13,21 @@ from torchao.float8.float8_utils import compute_error
 from torchao.prototype.moe_training.nvfp4_training.hadamard_cutedsl_utils import (
     cutedsl_nvfp4_kernels_available,
 )
+from test.prototype.moe_training.nvfp4_training._assertions import (
+    assert_codes_bracketed,
+    assert_scales_bitwise,
+    assert_scales_finite,
+    assert_zero_quantized,
+    dequantize as _dequantize,
+)
 from torchao.prototype.moe_training.nvfp4_training.hadamard_utils import (
     prepare_for_cuda_graph,
 )
+from torchao.prototype.moe_training.nvfp4_training.nvfp4_reference import (
+    reference_weight_quantize_2d,
+)
 from torchao.prototype.moe_training.nvfp4_training.quantize_2d_cutedsl import (
     cutedsl_weight_quantize_2d,
-)
-from torchao.prototype.mx_formats.nvfp4_tensor import (
-    NVFP4Tensor,
-    per_tensor_amax_to_scale,
 )
 from torchao.utils import is_sm_at_least_100, torch_version_at_least
 
@@ -79,104 +85,6 @@ def _weight_quantize_2d(kernel, W, amax):
 # ---------------------------------------------------------------------------
 
 
-def _weight_quantize_2d_reference_scales(A: torch.Tensor) -> torch.Tensor:
-    """PyTorch oracle: per-16×16-block FP8 scale factors expanded to (M, N//16).
-
-    Mirrors the two-level scaling in _nvfp4_2d_quantize:
-      1. global encode scale from the tensor-wide amax.
-      2. per-block FP8 scale capped at FP8_MAX (no lower clamp, matching TE).
-      3. Expand each per-block scale to cover 16 consecutive rows.
-
-    Returns:
-        (M, N//16) float8_e4m3fn — the same layout as the kernel's non-swizzled output.
-    """
-    FP8_MAX = 448.0
-    FP4_MAX = 6.0
-    M, N = A.shape
-    x = A.float()
-    global_amax = x.abs().max()
-
-    blocks = x.reshape(M // 16, 16, N // 16, 16)
-    block_amax = blocks.abs().amax(dim=(1, 3))  # (M//16, N//16)
-
-    is_global_amax_zero = global_amax == 0
-    safe_global_amax = torch.where(
-        is_global_amax_zero, torch.ones_like(global_amax), global_amax
-    )
-    enc_g = (FP8_MAX * FP4_MAX / safe_global_amax).clamp(
-        max=torch.finfo(torch.float32).max
-    )
-    enc_g = torch.where(is_global_amax_zero, torch.ones_like(enc_g), enc_g)
-    # amax * (enc/6), not (amax/6) * enc: one rounding rather than two, which is the
-    # association both kernels use (quantize_2d_triton, _quant16_from_amax).
-    pvscale = block_amax * (enc_g * (1.0 / FP4_MAX))
-    pvscale = pvscale.clamp(max=FP8_MAX).to(torch.float8_e4m3fn)  # (M//16, N//16)
-
-    # Expand: each block-row scale repeated 16 times → (M, N//16)
-    return pvscale.repeat_interleave(16, dim=0)
-
-
-def _swizzle_py(scales_expanded: torch.Tensor, M: int, N: int) -> torch.Tensor:
-    """Python equivalent of the kernel's _swizzle_scales(expand_sf, BLOCK_M, BLOCK_N).
-
-    Transforms (M, N//16) float8_e4m3fn → (M//128, N//64, 32, 16).
-    """
-    u8 = scales_expanded.view(torch.uint8)
-    swizzled = (
-        u8.reshape(M // 128, 4, 32, N // 64, 4)
-        .permute(0, 3, 2, 1, 4)
-        .reshape(M // 128, N // 64, 32, 16)
-    )
-    return swizzled.view(torch.float8_e4m3fn)
-
-
-def _dequantize(
-    codes: torch.Tensor,
-    scales: torch.Tensor,
-    global_amax: torch.Tensor,
-) -> torch.Tensor:
-    return (
-        NVFP4Tensor(
-            codes,
-            scales,
-            16,
-            torch.bfloat16,
-            per_tensor_scale=per_tensor_amax_to_scale(global_amax),
-            is_swizzled_scales=True,
-        )
-        .dequantize()
-        .float()
-    )
-
-
-def _assert_scales_finite(scales: torch.Tensor) -> None:
-    # No lower-bound check: TE emits a zero per-block scale for zero/near-zero
-    # blocks, so pinning small scales to a nonzero floor would contradict the
-    # ground truth the kernels are matched against.
-    scales_f32 = scales.to(torch.float32)
-    assert torch.isfinite(scales_f32).all(), "scale factors must be finite"
-
-
-def _assert_zero_quantized(
-    codes: torch.Tensor,
-    scales: torch.Tensor,
-    dequantized: torch.Tensor,
-) -> None:
-    assert torch.count_nonzero(codes).item() == 0, "all-zero input must pack to zero"
-    scales_f32 = scales.to(torch.float32)
-    # TE applies no lower clamp, so a zero block stores a zero scale (not eps).
-    torch.testing.assert_close(
-        scales_f32,
-        torch.zeros_like(scales_f32),
-        atol=0,
-        rtol=0,
-    )
-    assert torch.isfinite(dequantized).all(), "dequantized zero input must be finite"
-    torch.testing.assert_close(
-        dequantized, torch.zeros_like(dequantized), atol=0, rtol=0
-    )
-
-
 def _assert_scales_match_up_to_rounding_ties(
     scales: torch.Tensor, reference: torch.Tensor, what: str
 ) -> None:
@@ -197,16 +105,6 @@ def _assert_scales_match_up_to_rounding_ties(
         )
 
 
-def _assert_scales_vs_reference(
-    kernel: str, scales: torch.Tensor, reference: torch.Tensor, what: str
-) -> None:
-    """Both backends reproduce the PyTorch oracle bitwise: they share the scale chain
-    (div_rn for the global scale, one-rounding association for the block scale) and
-    differ only in how they get the block amax, which is exact."""
-    del kernel, what
-    torch.testing.assert_close(scales, reference, atol=0, rtol=0)
-
-
 # ---------------------------------------------------------------------------
 # Tests — scale factors
 # ---------------------------------------------------------------------------
@@ -216,24 +114,24 @@ def _assert_scales_vs_reference(
 @pytest.mark.parametrize("N", _N_VALUES, ids=lambda n: f"N{n}")
 @pytest.mark.parametrize("M", _M_VALUES, ids=lambda m: f"M{m}")
 @torch.no_grad()
-def test_weight_quantize_2d_scales_vs_reference(kernel, M, N):
-    """Swizzled FP8 scale factors must match the PyTorch 16x16 reference."""
+def test_weight_quantize_2d_vs_transformer_engine_reference(kernel, M, N):
+    """Both backends must reproduce TransformerEngine's 16x16 arithmetic.
+
+    Scales bitwise, codes within the encode-scale bracket. Both directions: rowwise is
+    NVFP4(W), colwise is the same recipe on W.T.
+    """
     _skip_if_unsupported_shape(kernel, M, N)
     torch.manual_seed(42)
     A = torch.randn(M, N, dtype=torch.bfloat16, device="cuda")
+    amax = A.float().abs().max()
 
-    ref_scales_expanded = _weight_quantize_2d_reference_scales(A)  # (M, N//16)
+    codes, scales, t_codes, t_scales = _weight_quantize_2d(kernel, A, amax)
+    ref_row, ref_col = reference_weight_quantize_2d(A, amax)
 
-    _, scales, _, t_scales = _weight_quantize_2d(kernel, A, A.float().abs().max())
-
-    ref_scales = _swizzle_py(ref_scales_expanded, M, N)
-    _assert_scales_vs_reference(kernel, scales, ref_scales, "rowwise SF")
-
-    ref_t_scales_expanded = _weight_quantize_2d_reference_scales(
-        A.T.contiguous()
-    )  # (N, M//16)
-    ref_t_scales = _swizzle_py(ref_t_scales_expanded, N, M)  # (N//128, M//64, 32, 16)
-    _assert_scales_vs_reference(kernel, t_scales, ref_t_scales, "colwise SF")
+    assert_scales_bitwise(scales, ref_row.scales, "rowwise SF")
+    assert_scales_bitwise(t_scales, ref_col.scales, "colwise SF")
+    assert_codes_bracketed(codes, ref_row, amax, "rowwise codes")
+    assert_codes_bracketed(t_codes, ref_col, amax, "colwise codes")
 
 
 @_skip_no_triton
@@ -339,22 +237,22 @@ def test_weight_quantize_2d_zero_and_near_zero_no_nan_or_saturation(kernel, inpu
     if input_kind == "zeros":
         # Zero input packs to zero codes, every block scale clamps to E4M3 eps (not 0),
         # and both layouts dequantize back to zero.
-        _assert_zero_quantized(
+        assert_zero_quantized(
             row_codes, row_sf, _dequantize(row_codes, row_sf, global_amax)
         )
-        _assert_zero_quantized(
+        assert_zero_quantized(
             col_codes, col_sf, _dequantize(col_codes, col_sf, global_amax)
         )
         return
 
-    _assert_scales_finite(row_sf)
+    assert_scales_finite(row_sf)
     row_dequant = _dequantize(row_codes, row_sf, global_amax)
     assert torch.isfinite(row_dequant).all(), (
         "rowwise dequantized values must be finite"
     )
     assert row_dequant.abs().max() <= 1.0
 
-    _assert_scales_finite(col_sf)
+    assert_scales_finite(col_sf)
     col_dequant = _dequantize(col_codes, col_sf, global_amax)
     assert torch.isfinite(col_dequant).all(), (
         "colwise dequantized values must be finite"

@@ -12,6 +12,12 @@ from torch.utils._triton import has_triton
 
 _TMA_WORKSPACES: dict = {}
 
+# The RHT sign vector every NVFP4 path defaults to, matching TransformerEngine's
+# get_wgrad_sign_vector (transformer_engine/pytorch/tensor/nvfp4_tensor.py). Lives here
+# rather than beside the kernels so the reference and the tests can import it without
+# pulling in the Triton or CuteDSL runtime.
+DEFAULT_SIGN_VECTOR = (1, 1, 1, -1, 1, -1, -1, -1, -1, -1, -1, 1, -1, 1, -1, -1)
+
 
 def _device_key(device) -> str:
     """Normalize device to a canonical string key (e.g. 'cuda' and 'cuda:0' → 'cuda:0').

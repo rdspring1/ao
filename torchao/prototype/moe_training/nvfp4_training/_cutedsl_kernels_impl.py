@@ -26,7 +26,9 @@ from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 from cutlass.utils import blackwell_helpers as sm100_utils
 from cutlass.utils.gemm.sm100 import transform_partitioned_tensor_layout
 
-from .hadamard_utils import get_rht_matrix
+# DEFAULT_SIGN_VECTOR is re-exported: several modules import it from here, and
+# hadamard_utils is the runtime-free home so the reference and tests can reach it too.
+from .hadamard_utils import DEFAULT_SIGN_VECTOR, get_rht_matrix  # noqa: F401
 
 FP8_E4M3_MAX = 448.0
 FP4_E2M1_MAX = 6.0
@@ -419,9 +421,6 @@ def _abs_f32(a: cutlass.Float32, *, loc=None, ip=None) -> cutlass.Float32:
 # ---------------------------------------------------------------------------
 # Hadamard matrix
 # ---------------------------------------------------------------------------
-
-
-DEFAULT_SIGN_VECTOR = (1, 1, 1, -1, 1, -1, -1, -1, -1, -1, -1, 1, -1, 1, -1, -1)
 
 
 # ---------------------------------------------------------------------------

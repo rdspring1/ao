@@ -17,30 +17,17 @@ from torchao.prototype.moe_training.nvfp4_training.hadamard_cutedsl_utils import
     cutedsl_nvfp4_kernels_available,
 )
 from torchao.prototype.moe_training.nvfp4_training.hadamard_utils import (
+    DEFAULT_SIGN_VECTOR,
     get_hadamard_matrix,
     get_rht_matrix,
     get_wgrad_sign_vector,
 )
+from torchao.prototype.moe_training.nvfp4_training.nvfp4_reference import (
+    reference_rht_amax,
+)
 from torchao.utils import is_sm_at_least_100, torch_version_at_least
 
-_HARDCODED_SIGN_VECTOR = (
-    1,
-    1,
-    1,
-    -1,
-    1,
-    -1,
-    -1,
-    -1,
-    -1,
-    -1,
-    -1,
-    1,
-    -1,
-    1,
-    -1,
-    -1,
-)
+_HARDCODED_SIGN_VECTOR = DEFAULT_SIGN_VECTOR
 
 _skip_no_triton = pytest.mark.skipif(
     not (has_triton() and is_sm_at_least_100() and torch_version_at_least("2.10.0")),
@@ -120,14 +107,7 @@ def test_rht_amax_vs_reference(kernel, M, N):
     torch.manual_seed(42)
     A = torch.randn(M, N, dtype=torch.bfloat16, device="cuda")
 
-    get_rht_matrix.cache_clear()
-    B = get_rht_matrix(_HARDCODED_SIGN_VECTOR, "cuda", torch.bfloat16, 16)
-    ref_col_amax = (
-        (A.t().reshape(N * M // 16, 16) @ B).to(torch.bfloat16).abs().max().float()
-    )
-    ref_row_amax = A.abs().max().float()
-
-    get_rht_matrix.cache_clear()
+    ref_col_amax, ref_row_amax = reference_rht_amax(A, _HARDCODED_SIGN_VECTOR)
 
     col_amax, row_amax = _rht_amax(kernel, A, _HARDCODED_SIGN_VECTOR)
     torch.testing.assert_close(col_amax, ref_col_amax, atol=0, rtol=0)
@@ -187,11 +167,11 @@ def test_rht_amax_propagates_nan():
 @pytest.mark.parametrize("M", [256, 384, 512], ids=lambda m: f"M{m}")
 @torch.no_grad()
 def test_cutedsl_rht_amax_matches_triton(M, N):
-    """CuteDSL and Triton amaxes agree closely (row is exact; col differs only by RHT
-    reduction precision)."""
+    """CuteDSL and Triton amaxes are bitwise equal: both round the RHT accumulator to
+    bfloat16 before reducing, so nothing is left to differ."""
     torch.manual_seed(0)
     A = torch.randn(M, N, dtype=torch.bfloat16, device="cuda")
     col_c, row_c = _rht_amax("cutedsl", A, _HARDCODED_SIGN_VECTOR)
     col_t, row_t = _rht_amax("triton", A, _HARDCODED_SIGN_VECTOR)
     torch.testing.assert_close(row_c, row_t, rtol=0, atol=0)
-    torch.testing.assert_close(col_c, col_t, rtol=5e-3, atol=5e-3)
+    torch.testing.assert_close(col_c, col_t, rtol=0, atol=0)
