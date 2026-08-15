@@ -7,8 +7,16 @@ from torch.utils._triton import has_triton
 from benchmarks.prototype.nvfp4_training.deepseek_v3_shapes import (
     get_deepseek_v3_weight_shapes,
 )
+from test.prototype.moe_training.nvfp4_training._assertions import (
+    assert_codes_bracketed,
+    assert_scales_bitwise,
+)
 from test.prototype.moe_training.nvfp4_training.test_quantize_2d import (
     _assert_scales_match_up_to_rounding_ties,
+)
+from torchao.prototype.moe_training.nvfp4_training.nvfp4_reference import (
+    nvfp4_reference_quantize,
+    reference_group_weight_quantize_2d,
 )
 from torchao.prototype.moe_training.nvfp4_training.group_quantize_2d_cutedsl import (
     cutedsl_group_weight_quantize_2d,
@@ -156,8 +164,9 @@ def test_group_quantize_2d_matches_torch_oracle(kernel):
     Scales are compared to within one E4M3 step, not bitwise: mx_formats' nvfp4_quantize
     multiplies by a reciprocal and applies an E4M3_EPS floor, where both kernels follow
     TE's correctly-rounded div_rn with no floor. The two are mathematically equal and can
-    land on adjacent representable values. ``test_cutedsl_group_quantize_2d_matches_triton``
-    is what pins the backends to each other bitwise.
+    land on adjacent representable values. ``test_group_quantize_2d_vs_transformer_engine_reference``
+    is the bitwise scale contract; ``test_cutedsl_group_quantize_2d_matches_triton`` pins
+    the backends to each other.
     """
     torch.manual_seed(42)
     E, M, N = 2, 256, 256
@@ -191,6 +200,38 @@ def test_group_quantize_2d_matches_torch_oracle(kernel):
             - (expected_unpacked & 0x7).to(torch.int16)
         ).abs()
         assert magnitude_diff.max().item() <= 1
+
+
+@pytest.mark.parametrize("kernel", _KERNELS)
+@pytest.mark.parametrize("shape", _CORRECTNESS_SHAPES)
+@torch.no_grad()
+def test_group_quantize_2d_vs_transformer_engine_reference(kernel, shape):
+    """Both backends must reproduce TransformerEngine's per-expert 16x16 arithmetic.
+
+    Scales bitwise, codes within the encode-scale bracket, for every expert and both
+    directions.
+    """
+    E, M, N = shape
+    _skip_if_unsupported_shape(kernel, M)
+    torch.manual_seed(11)
+    W = torch.randn((E, M, N), dtype=torch.bfloat16, device="cuda")
+    amax = W.float().abs().amax(dim=(1, 2))
+
+    codes, sf, t_codes, t_sf = _group_quantize(kernel, W, amax, E)
+    ref_codes, ref_sf, ref_t_codes, ref_t_sf = reference_group_weight_quantize_2d(
+        W, amax, E
+    )
+    assert_scales_bitwise(sf, ref_sf, "rowwise SF")
+    assert_scales_bitwise(t_sf, ref_t_sf, "colwise SF")
+    for e in range(E):
+        row_ref = nvfp4_reference_quantize(W[e], amax[e], block="16x16", layout="plain")
+        col_ref = nvfp4_reference_quantize(
+            W[e].t().contiguous(), amax[e], block="16x16", layout="plain"
+        )
+        assert_codes_bracketed(codes[e], row_ref, amax[e], f"expert {e} rowwise codes")
+        assert_codes_bracketed(
+            t_codes[e], col_ref, amax[e], f"expert {e} colwise codes"
+        )
 
 
 @_skip_no_triton

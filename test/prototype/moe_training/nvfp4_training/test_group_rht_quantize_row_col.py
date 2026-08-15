@@ -1,7 +1,8 @@
 """Tests for the grouped RHT quantize kernels (SM100+), triton and cutedsl.
 
-Pure-torch oracle (no TransformerEngine), mirroring
-test_hadamard_quantize_row_col_triton.py:
+Two oracles: the TE-derived reference in ``nvfp4_reference`` (scales bitwise, codes
+bracketed) and an independent mx_formats cross-check at 1 fp8 ULP. Mirrors
+test_hadamard_quantize_row_col.py:
 
   correctness (RTNE):
     - per group, for both columnwise and rowwise swizzled outputs:
@@ -29,8 +30,19 @@ from benchmarks.prototype.nvfp4_training.deepseek_v3_shapes import (
     get_deepseek_v3_weight_shapes,
 )
 from torchao.float8.float8_utils import compute_error
+from test.prototype.moe_training.nvfp4_training._assertions import (
+    assert_codes_bracketed,
+    assert_scales_bitwise,
+)
 from torchao.prototype.moe_training.nvfp4_training.hadamard_cutedsl_utils import (
     cutedsl_nvfp4_kernels_available,
+)
+from torchao.prototype.moe_training.nvfp4_training.hadamard_utils import (
+    DEFAULT_SIGN_VECTOR,
+)
+from torchao.prototype.moe_training.nvfp4_training.nvfp4_reference import (
+    nvfp4_reference_quantize,
+    reference_group_rht_quantize_row_col,
 )
 from torchao.prototype.mx_formats.nvfp4_tensor import (
     NVFP4Tensor,
@@ -57,24 +69,7 @@ if cutedsl_nvfp4_kernels_available():
         cutedsl_group_rht_quantize_row_col,
     )
 
-_HARDCODED_SIGN_VECTOR = (
-    1,
-    1,
-    1,
-    -1,
-    1,
-    -1,
-    -1,
-    -1,
-    -1,
-    -1,
-    -1,
-    1,
-    -1,
-    1,
-    -1,
-    -1,
-)
+_HARDCODED_SIGN_VECTOR = DEFAULT_SIGN_VECTOR
 
 requires_sm100 = [
     pytest.mark.skipif(not has_triton(), reason="unsupported without triton"),
@@ -357,6 +352,29 @@ def _assert_group_rht_correctness(graph_case, kernel):
         False,
     )
     _check_output_shapes(spec, qa, sfa, qd, sfd)
+
+    # TE-derived reference: both packed scale buffers bitwise, codes bracketed.
+    ref_qa, ref_sfa, ref_qd, ref_sfd = reference_group_rht_quantize_row_col(
+        A, offsets, num_groups, amax_col, amax_row, _HARDCODED_SIGN_VECTOR
+    )
+    assert_scales_bitwise(sfa, ref_sfa, "row sf")
+    assert_scales_bitwise(sfd, ref_sfd, "col sf")
+
+    row_offset = 0
+    for g, (m, A_g, rht_g) in enumerate(zip(spec.groups, group_tensors, rht_groups)):
+        rows = slice(row_offset, row_offset + m)
+        cols = slice(row_offset // 2, (row_offset + m) // 2)
+        ref_row = nvfp4_reference_quantize(
+            A_g, amax_row[g], block="1x16", layout="plain"
+        )
+        ref_col = nvfp4_reference_quantize(
+            rht_g, amax_col[g], block="1x16", layout="plain"
+        )
+        assert_codes_bracketed(qa[rows], ref_row, amax_row[g], f"group {g} row codes")
+        assert_codes_bracketed(qd[:, cols], ref_col, amax_col[g], f"group {g} col codes")
+        row_offset += m
+
+    # Independent mx_formats cross-check (reciprocal + E4M3_EPS floor, hence 1 ULP).
     triton_group_rht_quantize_row_col_ref(
         spec,
         A,

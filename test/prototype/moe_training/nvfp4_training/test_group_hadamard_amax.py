@@ -25,6 +25,12 @@ from benchmarks.prototype.nvfp4_training.deepseek_v3_shapes import (
 from torchao.prototype.moe_training.nvfp4_training.hadamard_cutedsl_utils import (
     cutedsl_nvfp4_kernels_available,
 )
+from torchao.prototype.moe_training.nvfp4_training.hadamard_utils import (
+    DEFAULT_SIGN_VECTOR,
+)
+from torchao.prototype.moe_training.nvfp4_training.nvfp4_reference import (
+    reference_group_rht_amax,
+)
 from torchao.utils import is_sm_at_least_100, torch_version_at_least
 
 if has_triton() and is_sm_at_least_100() and torch_version_at_least("2.10.0"):
@@ -34,32 +40,12 @@ if has_triton() and is_sm_at_least_100() and torch_version_at_least("2.10.0"):
     from torchao.prototype.moe_training.nvfp4_training.hadamard_amax_triton import (
         triton_rht_amax,
     )
-    from torchao.prototype.moe_training.nvfp4_training.hadamard_utils import (
-        get_rht_matrix,
-    )
 if cutedsl_nvfp4_kernels_available():
     from torchao.prototype.moe_training.nvfp4_training.group_hadamard_amax_cutedsl import (
         cutedsl_group_rht_amax,
     )
 
-_HARDCODED_SIGN_VECTOR = (
-    1,
-    1,
-    1,
-    -1,
-    1,
-    -1,
-    -1,
-    -1,
-    -1,
-    -1,
-    -1,
-    1,
-    -1,
-    1,
-    -1,
-    -1,
-)
+_HARDCODED_SIGN_VECTOR = DEFAULT_SIGN_VECTOR
 
 requires_sm100 = [
     pytest.mark.skipif(not has_triton(), reason="unsupported without triton"),
@@ -143,16 +129,9 @@ def test_group_rht_amax_matches_per_group_kernel(kernel):
     expected_col, expected_row = _group_rht_amax_reference(
         A, offsets, len(groups), _HARDCODED_SIGN_VECTOR
     )
-    rht = get_rht_matrix(
-        _HARDCODED_SIGN_VECTOR, device, torch.bfloat16, len(_HARDCODED_SIGN_VECTOR)
+    torch_col, torch_row = reference_group_rht_amax(
+        A, offsets, len(groups), _HARDCODED_SIGN_VECTOR
     )
-    torch_col = torch.stack(
-        [
-            (A_g.t().reshape(-1, 16) @ rht).to(torch.bfloat16).abs().amax().float()
-            for A_g in group_tensors
-        ]
-    )
-    torch_row = torch.stack([A_g.abs().amax().float() for A_g in group_tensors])
 
     actual_col, actual_row = _group_rht_amax(
         kernel,
