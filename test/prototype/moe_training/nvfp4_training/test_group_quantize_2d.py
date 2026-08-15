@@ -54,6 +54,8 @@ _CORRECTNESS_SHAPES = [
     pytest.param((1, 128, 256), id="one-tile"),
     pytest.param((3, 256, 512), id="multi-tile"),
     pytest.param((4, 512, 256), id="multi-tile-per-expert"),
+    # M % 128 but not % 256: the 128-row CuteDSL supertile, more than one per expert.
+    pytest.param((2, 384, 256), id="multi-supertile-128row"),
     *[
         pytest.param(
             (shape.experts, shape.m, shape.n),
@@ -65,9 +67,9 @@ _CORRECTNESS_SHAPES = [
 
 
 def _skip_if_unsupported_shape(kernel: str, M: int) -> None:
-    """The CuteDSL super-tile is 256 rows of M; Triton's BLOCK_M minimum is 128."""
-    if kernel == "cutedsl" and M % 256 != 0:
-        pytest.skip("cutedsl group weight quantize requires out_features % 256 == 0")
+    """Both backends need M % 128: Triton's BLOCK_M and the CuteDSL supertile floor."""
+    if M % 128 != 0:
+        pytest.skip("group weight quantize requires out_features % 128 == 0")
 
 
 def _group_quantize(kernel, weights, global_amax, num_tensors):
@@ -267,8 +269,8 @@ def test_group_quantize_2d_validates_global_amax_storage(kernel, invalid_amax):
 
 
 @_skip_no_cutedsl
-def test_cutedsl_group_quantize_2d_requires_out_features_256():
-    weights = torch.empty((2, 384, 256), dtype=torch.bfloat16, device="cuda")
+def test_cutedsl_group_quantize_2d_requires_out_features_128():
+    weights = torch.empty((2, 192, 256), dtype=torch.bfloat16, device="cuda")
     global_amax = torch.ones((2,), dtype=torch.float32, device="cuda")
 
     with pytest.raises(ValueError, match="out_features"):

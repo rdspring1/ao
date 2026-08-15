@@ -33,8 +33,8 @@ def cutedsl_group_weight_quantize_2d(
 
     Args:
         A: Dense ``(E, M, N)`` BF16 weights, contiguous. Each expert is a contiguous 2D matrix.
-            M == out_features must be divisible by 256 and N == in_features by 128 (the fused
-            kernel's tiling constraints, stricter than the Triton kernel's M % 128).
+            M == out_features and N == in_features must both be divisible by 128 (the fused
+            kernel's tiling constraints, the same shapes the Triton kernel accepts).
         global_amax: ``(E,)`` float32 per-expert absolute maxima. The caller computes
             ``A[e].float().abs().max()`` (and optionally all-reduces for tensor parallelism).
         num_tensors: Number of experts; must equal ``E``.
@@ -48,7 +48,7 @@ def cutedsl_group_weight_quantize_2d(
 
     Raises:
         NotImplementedError: pre-SM100 / missing CuteDSL runtime.
-        ValueError: bad dtype/shape/storage, or out_features not divisible by 256.
+        ValueError: bad dtype/shape/storage, or out_features not divisible by 128.
     """
     raise_if_cutedsl_nvfp4_unavailable("cutedsl_group_weight_quantize_2d")
     if A.dtype != torch.bfloat16:
@@ -69,10 +69,10 @@ def cutedsl_group_weight_quantize_2d(
         raise ValueError("global_amax must be on the same device as A")
     if not global_amax.is_contiguous():
         raise ValueError("global_amax must be contiguous")
-    if M % 256 != 0:
+    if M % 128 != 0:
         raise ValueError(
             f"cutedsl_group_weight_quantize_2d requires out_features (dim 1) divisible "
-            f"by 256, got {M}"
+            f"by 128, got {M}"
         )
     if N % 128 != 0:
         raise ValueError(f"Expected N divisible by 128, got N={N}")

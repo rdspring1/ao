@@ -290,36 +290,24 @@ def _get_num_sms(device_idx: int) -> int:
 M_TILE = 128
 N_TILE = 16
 K = 16
-U = 16  # adjacent col-groups per super-tile
-KW = K * U  # wide A load K (= M-positions per super-tile)
 MMA_TILER = (M_TILE, N_TILE, K)  # instruction atom stays 128x16x16
 
 NUM_AB_STAGE = 2
 NUM_ACC_STAGE = 1
 
-# --- warp specialization (RHT mode, 14 warps): col is a cheap TMEM epilogue (MMA does the work) ---
+# --- warp specialization, supertile-independent part (RHT mode): col is a cheap TMEM epilogue ---
 N_COL_WARPS = 4
-N_ROW_WARPS = 8
 COL_WARP_END = N_COL_WARPS  # warps 0..3 = col
 ROW_WARP_BEGIN = N_COL_WARPS  # 4
-ROW_WARP_END = N_COL_WARPS + N_ROW_WARPS  # 12
-MMA_WARP = ROW_WARP_END  # 12
-TMA_WARP = MMA_WARP + 1  # 13
-N_WARPS = TMA_WARP + 1  # 14
-FUSED_TPB = 32 * N_WARPS  # 448
 COL_THREADS = 32 * N_COL_WARPS  # 128
-ROW_THREADS = 32 * N_ROW_WARPS  # 256  (== KW rows for U=16: 1 row/thread)
 
-# --- warp specialization (weight mode, apply_rht=False, no MMA): col now does the heavy transposed
-# SMEM read itself, so col and row get EQUAL warps (their per-tile outputs are equal-sized). Col's 8
-# warps cover the 128 N-rows with 2 threads/row (each does half the U u-blocks). ---
+# --- weight mode (apply_rht=False, no MMA): col now does the heavy transposed SMEM read itself,
+# so col and row get EQUAL warps for the 256-row supertile (their per-tile outputs are
+# equal-sized; at 128-row col keeps 8 warps while row drops to 4). Col's 8 warps cover the
+# 128 N-rows with 2 threads/row (each owns half the col-group blocks). ---
 COL_WARP_END_W = 8  # warps 0..7 = col (2 threads / N-row)
 ROW_WARP_BEGIN_W = 8
-ROW_WARP_END_W = 16  # warps 8..15 = row (1 thread / M-row, KW=256)
-TMA_WARP_W = 16
-FUSED_TPB_W = 32 * (TMA_WARP_W + 1)  # 544
 COL_THREADS_W = 32 * COL_WARP_END_W  # 256
-ROW_THREADS_W = 32 * (ROW_WARP_END_W - ROW_WARP_BEGIN_W)  # 256
 
 TMEM_ALLOC_BAR = 1
 TMEM_DEALLOC_BAR = 2
@@ -330,9 +318,36 @@ ROW_FP4_STAGES = 2
 # Swizzled scale-factor layout (cutlass NVFP4): SF[r,c] -> [r//128, c//4, r%32, (r%128//32)*4 + c%4].
 # Per super-tile, the SF tile has a 32x16 (=16B-wide) inner -> TMA-storable. Block inner = 32*16.
 SF_BLK = 32 * 16  # 512 fp8 per (128-row x 4-col) swizzle block
-SF_GCOL = U // 4  # 4  : M-groups (c//4) per col super-tile (16 SF cols)
-SF_RBLK = KW // 128  # 2  : M-blocks (r//128) per row super-tile (256 M rows)
 SF_RGRP = (M_TILE // 16) // 4  # 2  : N-groups (c//4) per row super-tile (8 SF cols)
+
+
+def _set_supertile_geometry(kernel_obj, col_groups_per_supertile: int):
+    """Derive the supertile/warp geometry onto a kernel instance.
+
+    col_groups_per_supertile = the number of 16-column blocks each main-loop iteration
+    processes; a supertile spans kw = 16 * col_groups_per_supertile M-positions. 16 (a
+    256-row supertile) serves M % 256 and is the tuned config; 8 (128-row) serves M % 128
+    and is the floor (sf_rblk = kw//128 must stay >= 1; the plain col-SF box is
+    col_groups_per_supertile bytes wide, so swizzle_sf=False needs 16). Row warps own one
+    M-row per thread (row_threads == kw), so they scale with the supertile height.
+    """
+    assert col_groups_per_supertile in (8, 16), (
+        f"col_groups_per_supertile must be 8 or 16, got {col_groups_per_supertile}"
+    )
+    kernel_obj.col_groups_per_supertile = col_groups_per_supertile
+    kernel_obj.kw = K * col_groups_per_supertile
+    kernel_obj.sf_gcol = col_groups_per_supertile // 4  # M-groups (c//4) per col super-tile
+    kernel_obj.sf_rblk = kernel_obj.kw // 128  # M-blocks (r//128) per row super-tile
+    n_row_warps = kernel_obj.kw // 32  # 8 for the 256-row supertile, 4 for 128-row
+    kernel_obj.row_warp_end = ROW_WARP_BEGIN + n_row_warps
+    kernel_obj.mma_warp = kernel_obj.row_warp_end
+    kernel_obj.tma_warp = kernel_obj.mma_warp + 1
+    kernel_obj.fused_tpb = 32 * (kernel_obj.tma_warp + 1)  # 448 / 320 threads
+    kernel_obj.row_threads = 32 * n_row_warps  # == kw: 1 M-row per thread
+    kernel_obj.row_warp_end_w = ROW_WARP_BEGIN_W + n_row_warps
+    kernel_obj.tma_warp_w = kernel_obj.row_warp_end_w
+    kernel_obj.fused_tpb_w = 32 * (kernel_obj.tma_warp_w + 1)  # 544 / 416 threads
+    kernel_obj.row_threads_w = 32 * n_row_warps
 
 
 def _pack16(q, sr: cutlass.Constexpr, rng_base):
@@ -419,9 +434,11 @@ class _Tcgen05RowColFused:
         sr: bool = False,
         apply_rht: bool = True,
         grouped: bool = False,
+        col_groups_per_supertile: int = 16,
     ):
         # swizzle_sf=True: cutlass NVFP4 swizzled SF (GEMM-ready, TMA-coalesced store).
-        # False: plain (N,M//16)/(M,N//16) SF (row SF falls back to a strided SIMT store).
+        # False: plain (N,M//16)/(M,N//16) SF (row SF falls back to a strided SIMT store); its
+        # col-SF box is col_groups_per_supertile bytes wide, so it requires 16 (TMA 16B min).
         # sr=True: stochastic rounding (cvt.rs) in the FP4 cast; False: round-to-nearest.
         # apply_rht=True: columnwise path = NVFP4(RHT(A.t())) via the tcgen05 UMMA (the B operand is
         # the Hadamard matrix). False (weight quantize): plain NVFP4(A.t()) — the col warps read the
@@ -430,16 +447,21 @@ class _Tcgen05RowColFused:
         # Activations (apply_rht=True) keep the standard 1x16 scaling. The RHT path is compiled
         # separately, so its codegen is unchanged.
         # grouped=True: A is E equal-sized experts stacked into (E*M, N), each with its own
-        # global amax. Experts are uniform and contiguous and M % (N_TILE*U) == 0, so a work tile
-        # never straddles two of them: the rowwise outputs are byte-identical to the ungrouped
+        # global amax. Experts are uniform and contiguous and M % kw == 0, so a work tile never
+        # straddles two of them: the rowwise outputs are byte-identical to the ungrouped
         # (E*M, N) result (the 128x4 SF swizzle is per-128-row-block) and only the columnwise
         # stores need an expert offset on their tile coordinate. Compiled as its own variant so
         # the two shipped ungrouped kernels keep their codegen exactly, and so grouped never has
         # to be crossed with sr (whose col seed would alias across experts) or with apply_rht.
+        # col_groups_per_supertile=16 (256-row supertile) serves M % 256; 8 serves M % 128.
+        assert not (col_groups_per_supertile < 16 and not swizzle_sf), (
+            "swizzle_sf=False requires col_groups_per_supertile=16"
+        )
         self.swizzle_sf = swizzle_sf
         self.sr = sr
         self.apply_rht = apply_rht
         self.grouped = grouped
+        _set_supertile_geometry(self, col_groups_per_supertile)
 
     @cute.jit
     def __call__(
@@ -472,20 +494,20 @@ class _Tcgen05RowColFused:
         )
         tiled_mma = cute.make_tiled_mma(cute.make_mma_atom(mma_op))
 
-        # --- wide A: K = 16*U -> U k-blocks (M-blocks); MN_SW128 swizzle ---
+        # --- wide A: K = 16*col_groups -> col_groups k-blocks (M-blocks); MN_SW128 swizzle ---
         a_atom = tcgen05.make_smem_layout_atom(
             tcgen05.SmemLayoutAtomKind.MN_SW128, cutlass.BFloat16
         )
         a_shape = tiled_mma.partition_shape_A(
-            cute.dice((M_TILE, N_TILE, KW), (1, None, 1))
+            cute.dice((M_TILE, N_TILE, self.kw), (1, None, 1))
         )
         a_smem_layout_staged = tcgen05.tile_to_mma_shape(
             a_atom, cute.append(a_shape, NUM_AB_STAGE), order=(1, 2, 3)
         )
-        # clean (M_mma=128, KW=256, STAGE) view of the SAME bytes for the row read
+        # clean (M_mma=128, KW, STAGE) view of the SAME bytes for the row read
         # (same atom + swizzle -> identical physical mapping to a_smem_layout_staged).
         a_clean_layout = cute.tile_to_shape(
-            a_atom, (M_TILE, KW, NUM_AB_STAGE), order=(0, 1, 2)
+            a_atom, (M_TILE, self.kw, NUM_AB_STAGE), order=(0, 1, 2)
         )
 
         # --- narrow B: one 16x16 RHT, 1 k-block ---
@@ -503,7 +525,7 @@ class _Tcgen05RowColFused:
             g2s,
             mA,
             a_smem_layout,
-            (M_TILE, N_TILE, KW),
+            (M_TILE, N_TILE, self.kw),
             tiled_mma,
             (1, 1, 1, 1),
         )
@@ -524,30 +546,30 @@ class _Tcgen05RowColFused:
 
         acc_shape = tiled_mma.partition_shape_C(MMA_TILER[:2])
         tCtAcc_fake = tiled_mma.make_fragment_C(
-            cute.append(cute.append(acc_shape, U), NUM_ACC_STAGE)
+            cute.append(cute.append(acc_shape, self.col_groups_per_supertile), NUM_ACC_STAGE)
         )
         num_tmem_alloc_cols = sm100_utils.get_num_tmem_alloc_cols(tCtAcc_fake)
 
         # Weight mode (apply_rht=False) skips the B (Hadamard) load — no MMA — so don't count it
         # in the TMA tx_count, or the AB-full barrier would wait on bytes that never arrive.
         num_tma_load_bytes = (
-            M_TILE * KW + (N_TILE * K if cutlass.const_expr(self.apply_rht) else 0)
+            M_TILE * self.kw + (N_TILE * K if cutlass.const_expr(self.apply_rht) else 0)
         ) * 2
 
         # COL FP4 store: super-tile = 2U u32 wide
-        fp4_smem_layout = cute.make_layout((M_TILE, 2 * U), stride=(2 * U, 1))
+        fp4_smem_layout = cute.make_layout((M_TILE, 2 * self.col_groups_per_supertile), stride=(2 * self.col_groups_per_supertile, 1))
         tma_atom_fp4, tma_tensor_fp4 = cpasync.make_tiled_tma_atom(
             cpasync.CopyBulkTensorTileS2GOp(),
             mFP4,
             fp4_smem_layout,
-            (M_TILE, 2 * U),
+            (M_TILE, 2 * self.col_groups_per_supertile),
         )
         # COL SF store (TMA). swizzled: (1, SF_GCOL*SF_BLK) box over flat (N//128, (M//64)*SF_BLK);
-        # plain: (M_TILE, U) box over (N, M//16).
+        # plain: (M_TILE, col_groups) box over (N, M//16).
         if cutlass.const_expr(self.swizzle_sf):
-            col_sf_box = (1, SF_GCOL * SF_BLK)
+            col_sf_box = (1, self.sf_gcol * SF_BLK)
         else:
-            col_sf_box = (M_TILE, U)
+            col_sf_box = (M_TILE, self.col_groups_per_supertile)
         sf_smem_layout = cute.make_layout(col_sf_box, stride=(col_sf_box[1], 1))
         tma_atom_sf, tma_tensor_sf = cpasync.make_tiled_tma_atom(
             cpasync.CopyBulkTensorTileS2GOp(),
@@ -556,21 +578,21 @@ class _Tcgen05RowColFused:
             col_sf_box,
         )
 
-        # ROW FP4 store: super-tile = (KW M-rows, M_TILE//8 u32) = (256,16) = 64B wide -> TMA-ok
+        # ROW FP4 store: super-tile = (KW M-rows, M_TILE//8 u32), inner = 64B wide -> TMA-ok
         row_fp4_smem_layout = cute.make_layout(
-            (KW, M_TILE // 8), stride=(M_TILE // 8, 1)
+            (self.kw, M_TILE // 8), stride=(M_TILE // 8, 1)
         )
         tma_atom_row_fp4, tma_tensor_row_fp4 = cpasync.make_tiled_tma_atom(
             cpasync.CopyBulkTensorTileS2GOp(),
             mRowFP4,
             row_fp4_smem_layout,
-            (KW, M_TILE // 8),
+            (self.kw, M_TILE // 8),
         )
 
         # ROW SF store. swizzled: TMA, (SF_RBLK, SF_RGRP*SF_BLK) box over flat (M//128, (N//64)*SF_BLK).
         # plain: strided SIMT, so this atom is unused (alias the FP4 atom).
         if cutlass.const_expr(self.swizzle_sf):
-            row_sf_box = (SF_RBLK, SF_RGRP * SF_BLK)
+            row_sf_box = (self.sf_rblk, SF_RGRP * SF_BLK)
             row_sf_smem_layout = cute.make_layout(row_sf_box, stride=(row_sf_box[1], 1))
             tma_atom_row_sf, tma_tensor_row_sf = cpasync.make_tiled_tma_atom(
                 cpasync.CopyBulkTensorTileS2GOp(),
@@ -586,7 +608,7 @@ class _Tcgen05RowColFused:
 
         num_tiles_m = N // cutlass.Int32(M_TILE)  # N output-row tiles (M_mma=128)
         num_tiles_ns = M // cutlass.Int32(
-            N_TILE * U
+            N_TILE * self.col_groups_per_supertile
         )  # M contraction block-groups (K=16U)
         num_super = num_tiles_m * num_tiles_ns
         # grouped: M is the stacked E*M_expert extent, so pid_ns // tiles_ns_per_expert is the
@@ -632,7 +654,7 @@ class _Tcgen05RowColFused:
         ).launch(
             grid=(GRID, 1, 1),
             block=(
-                FUSED_TPB if cutlass.const_expr(self.apply_rht) else FUSED_TPB_W,
+                self.fused_tpb if cutlass.const_expr(self.apply_rht) else self.fused_tpb_w,
                 1,
                 1,
             ),
@@ -688,18 +710,18 @@ class _Tcgen05RowColFused:
             _COL_END, _ROW_BEG, _ROW_END, _TMA_W = (
                 COL_WARP_END,
                 ROW_WARP_BEGIN,
-                ROW_WARP_END,
-                TMA_WARP,
+                self.row_warp_end,
+                self.tma_warp,
             )
-            _COL_THR, _ROW_THR = COL_THREADS, ROW_THREADS
+            _COL_THR, _ROW_THR = COL_THREADS, self.row_threads
         else:
             _COL_END, _ROW_BEG, _ROW_END, _TMA_W = (
                 COL_WARP_END_W,
                 ROW_WARP_BEGIN_W,
-                ROW_WARP_END_W,
-                TMA_WARP_W,
+                self.row_warp_end_w,
+                self.tma_warp_w,
             )
-            _COL_THR, _ROW_THR = COL_THREADS_W, ROW_THREADS_W
+            _COL_THR, _ROW_THR = COL_THREADS_W, self.row_threads_w
 
         if warp_idx == _TMA_W:
             cpasync.prefetch_descriptor(tma_atom_a)
@@ -723,9 +745,9 @@ class _Tcgen05RowColFused:
         # AB pipeline: TMA producer. RHT mode consumers = MMA (1 umma arrive) + ROW_THREADS;
         # weight mode (no MMA) consumers = COL_THREADS_W + ROW_THREADS_W (both warp groups read sA).
         if cutlass.const_expr(self.apply_rht):
-            ab_cons_count = 1 + ROW_THREADS
+            ab_cons_count = 1 + self.row_threads
         else:
-            ab_cons_count = COL_THREADS_W + ROW_THREADS_W
+            ab_cons_count = COL_THREADS_W + self.row_threads_w
         ab_prod_grp = pipeline.CooperativeGroup(pipeline.Agent.Thread)
         ab_cons_grp = pipeline.CooperativeGroup(pipeline.Agent.Thread, ab_cons_count)
         ab_pipeline = pipeline.PipelineTmaUmma.create(
@@ -775,7 +797,7 @@ class _Tcgen05RowColFused:
             raw_a, a_smem_layout_staged.inner, dtype=cutlass.BFloat16
         )
         sA = cute.make_tensor(swz_ptr, a_smem_layout_staged.outer)
-        # row view: SAME swizzled pointer, clean (M_mma=128, KW=256, STAGE) *outer* layout
+        # row view: SAME swizzled pointer, clean (M_mma=128, KW, STAGE) *outer* layout
         # -> swizzle applied identically to sA (both PDSL), just a different logical grouping.
         sA_clean = cute.make_tensor(swz_ptr, a_clean_layout.outer)
 
@@ -791,15 +813,15 @@ class _Tcgen05RowColFused:
             byte_alignment=128,
         )
         # COL SF SMEM. swizzled: raw bytes with a 4D write-view (group, 32, 16) + a 2D TMA-view
-        # over the same memory; plain: a single (M_TILE, U) tile (write == TMA view).
+        # over the same memory; plain: a single (M_TILE, col_groups) tile (write == TMA view).
         if cutlass.const_expr(self.swizzle_sf):
             raw_csf = smem.allocate_array(
-                cutlass.Float8E4M3FN, SF_GCOL * SF_BLK, byte_alignment=128
+                cutlass.Float8E4M3FN, self.sf_gcol * SF_BLK, byte_alignment=128
             )
             sSF_w = cute.make_tensor(
                 raw_csf,
                 cute.make_layout(
-                    (1, SF_GCOL, 32, 16), stride=(SF_GCOL * SF_BLK, SF_BLK, 16, 1)
+                    (1, self.sf_gcol, 32, 16), stride=(self.sf_gcol * SF_BLK, SF_BLK, 16, 1)
                 ),
             )
             sSF = cute.make_tensor(
@@ -811,12 +833,12 @@ class _Tcgen05RowColFused:
                 layout=sf_smem_layout,
                 byte_alignment=128,
             )
-            sSF_w = sSF  # (M_TILE, U) write == TMA
+            sSF_w = sSF  # (M_TILE, col_groups) write == TMA
 
         # double-buffered row FP4 staging: overlap TMA store with next iter's compute
         row_fp4_staged = cute.make_layout(
-            (KW, M_TILE // 8, ROW_FP4_STAGES),
-            stride=(M_TILE // 8, 1, KW * (M_TILE // 8)),
+            (self.kw, M_TILE // 8, ROW_FP4_STAGES),
+            stride=(M_TILE // 8, 1, self.kw * (M_TILE // 8)),
         )
         sRowFP4 = smem.allocate_tensor(
             element_type=cutlass.Int32,
@@ -828,21 +850,21 @@ class _Tcgen05RowColFused:
         sRowSF_w = None
         sRowSF = None
         if cutlass.const_expr(self.swizzle_sf):
-            _rsf_stage = SF_RBLK * SF_RGRP * SF_BLK
+            _rsf_stage = self.sf_rblk * SF_RGRP * SF_BLK
             raw_rsf = smem.allocate_array(
                 cutlass.Float8E4M3FN, _rsf_stage * ROW_FP4_STAGES, byte_alignment=128
             )
             sRowSF_w = cute.make_tensor(
                 raw_rsf,
                 cute.make_layout(
-                    (SF_RBLK, SF_RGRP, 32, 16, ROW_FP4_STAGES),
+                    (self.sf_rblk, SF_RGRP, 32, 16, ROW_FP4_STAGES),
                     stride=(SF_RGRP * SF_BLK, SF_BLK, 16, 1, _rsf_stage),
                 ),
             )
             sRowSF = cute.make_tensor(
                 raw_rsf,
                 cute.make_layout(
-                    (SF_RBLK, SF_RGRP * SF_BLK, ROW_FP4_STAGES),
+                    (self.sf_rblk, SF_RGRP * SF_BLK, ROW_FP4_STAGES),
                     stride=(SF_RGRP * SF_BLK, 1, _rsf_stage),
                 ),
             )
@@ -851,7 +873,7 @@ class _Tcgen05RowColFused:
         thr_mma = tiled_mma.get_slice(0)
         gA_mkl = cute.local_tile(
             mA_mkl,
-            cute.slice_((M_TILE, N_TILE, KW), (None, 0, None)),
+            cute.slice_((M_TILE, N_TILE, self.kw), (None, 0, None)),
             (None, None, None),
         )
         gB_nkl = cute.local_tile(
@@ -877,7 +899,7 @@ class _Tcgen05RowColFused:
         )
         tBgB = tBgB[(None, 0, None, 0)]
 
-        tCrA = tiled_mma.make_fragment_A(sA)  # (MMA, M, U, STAGE)
+        tCrA = tiled_mma.make_fragment_A(sA)  # (MMA, M, col_groups, STAGE)
         tCrB = tiled_mma.make_fragment_B(sB)
 
         def _global_scale(amax):
@@ -940,7 +962,7 @@ class _Tcgen05RowColFused:
             ab_producer.tail()
 
         # ==================== MMA warp (AB consumer, acc producer) ====================
-        if warp_idx == MMA_WARP and cutlass.const_expr(self.apply_rht):
+        if warp_idx == self.mma_warp and cutlass.const_expr(self.apply_rht):
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(cutlass.Float32)
             tCtAcc_base = cute.make_tensor(tmem_ptr, acc_fake_layout)
@@ -951,7 +973,7 @@ class _Tcgen05RowColFused:
             for local_iter in cutlass.range(num_iters):
                 ab_handle = ab_consumer.wait_and_advance()
                 acc_pipeline.producer_acquire(acc_producer_state)
-                for u in cutlass.range_constexpr(U):
+                for u in cutlass.range_constexpr(self.col_groups_per_supertile):
                     tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
                     cute.gemm(
                         tiled_mma,
@@ -980,7 +1002,7 @@ class _Tcgen05RowColFused:
                 super_id = start_pid + local_iter * GRID
                 pid_m = super_id // num_tiles_ns
                 pid_ns = super_id % num_tiles_ns
-                m0 = pid_ns * cutlass.Int32(KW)  # global M-row base
+                m0 = pid_ns * cutlass.Int32(self.kw)  # global M-row base
                 buf = local_iter % ROW_FP4_STAGES  # double-buffer index
                 if cutlass.const_expr(self.grouped):
                     # The rowwise outputs are the stacked (E*M, N) result verbatim, so only the
@@ -1061,7 +1083,7 @@ class _Tcgen05RowColFused:
                 row_store_barrier.arrive_and_wait()
                 if warp_idx == cutlass.Int32(_ROW_BEG):
                     gRowFP4 = cute.local_tile(
-                        mRowFP4_tma, (KW, M_TILE // 8), (pid_ns, pid_m)
+                        mRowFP4_tma, (self.kw, M_TILE // 8), (pid_ns, pid_m)
                     )
                     tRs, tRg = cpasync.tma_partition(
                         tma_atom_row_fp4,
@@ -1073,7 +1095,7 @@ class _Tcgen05RowColFused:
                     cute.copy(tma_atom_row_fp4, tRs, tRg)
                     if cutlass.const_expr(self.swizzle_sf):
                         gRowSF = cute.local_tile(
-                            mRowSF_tma, (SF_RBLK, SF_RGRP * SF_BLK), (pid_ns, pid_m)
+                            mRowSF_tma, (self.sf_rblk, SF_RGRP * SF_BLK), (pid_ns, pid_m)
                         )
                         tRSs, tRSg = cpasync.tma_partition(
                             tma_atom_row_sf,
@@ -1134,7 +1156,7 @@ class _Tcgen05RowColFused:
                 acc_idx = acc_consumer_state.index
 
                 acc_pipeline.consumer_wait(acc_consumer_state)
-                for u in cutlass.range_constexpr(U):
+                for u in cutlass.range_constexpr(self.col_groups_per_supertile):
                     cute.copy(
                         tiled_copy_t2r,
                         tTR_tAcc_base[(None, None, None, 0, 0, u, acc_idx)],
@@ -1178,7 +1200,9 @@ class _Tcgen05RowColFused:
                 epi_store_barrier.arrive_and_wait()
                 if warp_idx == cutlass.Int32(0):
                     gFP4 = cute.local_tile(
-                        mFP4_tma, (M_TILE, 2 * U), (pid_m_col, pid_ns_col)
+                        mFP4_tma,
+                        (M_TILE, 2 * self.col_groups_per_supertile),
+                        (pid_m_col, pid_ns_col),
                     )
                     tSs, tSg = cpasync.tma_partition(
                         tma_atom_fp4,
@@ -1190,11 +1214,13 @@ class _Tcgen05RowColFused:
                     cute.copy(tma_atom_fp4, tSs, tSg)
                     if cutlass.const_expr(self.swizzle_sf):
                         gSF = cute.local_tile(
-                            mSF_tma, (1, SF_GCOL * SF_BLK), (pid_m_col, pid_ns_col)
+                            mSF_tma, (1, self.sf_gcol * SF_BLK), (pid_m_col, pid_ns_col)
                         )
                     else:
                         gSF = cute.local_tile(
-                            mSF_tma, (M_TILE, U), (pid_m_col, pid_ns_col)
+                            mSF_tma,
+                            (M_TILE, self.col_groups_per_supertile),
+                            (pid_m_col, pid_ns_col),
                         )
                     tSFs, tSFg = cpasync.tma_partition(
                         tma_atom_sf,
@@ -1223,7 +1249,7 @@ class _Tcgen05RowColFused:
                 pipeline.PipelineUserType.Consumer, NUM_AB_STAGE
             )
             # 8 col warps (256 threads) cover the 128 N-rows with 2 threads/row: nrow = the N-row,
-            # u_half selects which half of the U u-blocks this thread owns (each does U//2 blocks).
+            # u_half selects which half of the col-group blocks this thread owns.
             nrow = tidx % cutlass.Int32(M_TILE)
             u_half = tidx // cutlass.Int32(M_TILE)
             for local_iter in cutlass.range(num_iters):
@@ -1241,8 +1267,8 @@ class _Tcgen05RowColFused:
 
                 ab_pipeline.consumer_wait(col_ab_state)  # wait sA full
                 stage = col_ab_state.index
-                for u_local in cutlass.range_constexpr(U // 2):
-                    u = cutlass.Int32(u_local) + u_half * cutlass.Int32(U // 2)
+                for u_local in cutlass.range_constexpr(self.col_groups_per_supertile // 2):
+                    u = cutlass.Int32(u_local) + u_half * cutlass.Int32(self.col_groups_per_supertile // 2)
                     blk = cute.make_rmem_tensor((16,), cutlass.Float32)
                     for i in cutlass.range_constexpr(16):
                         mpos = u * cutlass.Int32(16) + cutlass.Int32(
@@ -1289,7 +1315,9 @@ class _Tcgen05RowColFused:
                 col_store_barrier.arrive_and_wait()
                 if warp_idx == cutlass.Int32(0):
                     gFP4 = cute.local_tile(
-                        mFP4_tma, (M_TILE, 2 * U), (pid_m_col, pid_ns_col)
+                        mFP4_tma,
+                        (M_TILE, 2 * self.col_groups_per_supertile),
+                        (pid_m_col, pid_ns_col),
                     )
                     tSs, tSg = cpasync.tma_partition(
                         tma_atom_fp4,
@@ -1301,11 +1329,13 @@ class _Tcgen05RowColFused:
                     cute.copy(tma_atom_fp4, tSs, tSg)
                     if cutlass.const_expr(self.swizzle_sf):
                         gSF = cute.local_tile(
-                            mSF_tma, (1, SF_GCOL * SF_BLK), (pid_m_col, pid_ns_col)
+                            mSF_tma, (1, self.sf_gcol * SF_BLK), (pid_m_col, pid_ns_col)
                         )
                     else:
                         gSF = cute.local_tile(
-                            mSF_tma, (M_TILE, U), (pid_m_col, pid_ns_col)
+                            mSF_tma,
+                            (M_TILE, self.col_groups_per_supertile),
+                            (pid_m_col, pid_ns_col),
                         )
                     tSFs, tSFg = cpasync.tma_partition(
                         tma_atom_sf,
@@ -1326,8 +1356,11 @@ class _Tcgen05RhtAmax:
     Each epilogue reduces to a global max-abs instead of quantizing:
       col_amax = max|RHT(A.t())|  (TMEM accumulator),  row_amax = max|A|  (raw sA).
     The 16x16 RHT runs on tensor cores, so the pass is HBM-bound. Requires
-    M % 256 == 0, N % 128 == 0.
+    M % (16 * col_groups_per_supertile) == 0 (16 -> M % 256, 8 -> M % 128), N % 128 == 0.
     """
+
+    def __init__(self, col_groups_per_supertile: int = 16):
+        _set_supertile_geometry(self, col_groups_per_supertile)
 
     @cute.jit
     def __call__(
@@ -1356,13 +1389,13 @@ class _Tcgen05RhtAmax:
             tcgen05.SmemLayoutAtomKind.MN_SW128, cutlass.BFloat16
         )
         a_shape = tiled_mma.partition_shape_A(
-            cute.dice((M_TILE, N_TILE, KW), (1, None, 1))
+            cute.dice((M_TILE, N_TILE, self.kw), (1, None, 1))
         )
         a_smem_layout_staged = tcgen05.tile_to_mma_shape(
             a_atom, cute.append(a_shape, NUM_AB_STAGE), order=(1, 2, 3)
         )
         a_clean_layout = cute.tile_to_shape(
-            a_atom, (M_TILE, KW, NUM_AB_STAGE), order=(0, 1, 2)
+            a_atom, (M_TILE, self.kw, NUM_AB_STAGE), order=(0, 1, 2)
         )
 
         b_atom = tcgen05.make_smem_layout_atom(
@@ -1379,7 +1412,7 @@ class _Tcgen05RhtAmax:
             g2s,
             mA,
             a_smem_layout,
-            (M_TILE, N_TILE, KW),
+            (M_TILE, N_TILE, self.kw),
             tiled_mma,
             (1, 1, 1, 1),
         )
@@ -1400,12 +1433,12 @@ class _Tcgen05RhtAmax:
 
         acc_shape = tiled_mma.partition_shape_C(MMA_TILER[:2])
         tCtAcc_fake = tiled_mma.make_fragment_C(
-            cute.append(cute.append(acc_shape, U), NUM_ACC_STAGE)
+            cute.append(cute.append(acc_shape, self.col_groups_per_supertile), NUM_ACC_STAGE)
         )
         num_tmem_alloc_cols = sm100_utils.get_num_tmem_alloc_cols(tCtAcc_fake)
 
-        num_tma_load_bytes = (M_TILE * KW + N_TILE * K) * 2
-        num_tiles_ns = M // cutlass.Int32(N_TILE * U)
+        num_tma_load_bytes = (M_TILE * self.kw + N_TILE * K) * 2
+        num_tiles_ns = M // cutlass.Int32(N_TILE * self.col_groups_per_supertile)
         num_super = (N // cutlass.Int32(M_TILE)) * num_tiles_ns
 
         self.kernel(
@@ -1426,7 +1459,7 @@ class _Tcgen05RhtAmax:
             num_tiles_ns,
             num_super,
             GRID,
-        ).launch(grid=(GRID, 1, 1), block=(FUSED_TPB, 1, 1), stream=stream)
+        ).launch(grid=(GRID, 1, 1), block=(self.fused_tpb, 1, 1), stream=stream)
 
     @cute.kernel
     def kernel(
@@ -1454,7 +1487,7 @@ class _Tcgen05RhtAmax:
         start_pid, _, _ = cute.arch.block_idx()
         lane = tidx % cutlass.Int32(32)
 
-        if warp_idx == TMA_WARP:
+        if warp_idx == self.tma_warp:
             cpasync.prefetch_descriptor(tma_atom_a)
             cpasync.prefetch_descriptor(tma_atom_b)
 
@@ -1469,7 +1502,7 @@ class _Tcgen05RhtAmax:
         storage = smem.allocate(SharedStorage)
 
         # AB pipeline: TMA producer; consumers = MMA (1 umma arrive) + ROW_THREADS (thread arrives)
-        ab_cons_count = 1 + ROW_THREADS
+        ab_cons_count = 1 + self.row_threads
         ab_prod_grp = pipeline.CooperativeGroup(pipeline.Agent.Thread)
         ab_cons_grp = pipeline.CooperativeGroup(pipeline.Agent.Thread, ab_cons_count)
         ab_pipeline = pipeline.PipelineTmaUmma.create(
@@ -1530,7 +1563,7 @@ class _Tcgen05RhtAmax:
         thr_mma = tiled_mma.get_slice(0)
         gA_mkl = cute.local_tile(
             mA_mkl,
-            cute.slice_((M_TILE, N_TILE, KW), (None, 0, None)),
+            cute.slice_((M_TILE, N_TILE, self.kw), (None, 0, None)),
             (None, None, None),
         )
         gB_nkl = cute.local_tile(
@@ -1569,7 +1602,7 @@ class _Tcgen05RhtAmax:
         )
 
         # ==================== TMA warp (AB producer) ====================
-        if warp_idx == TMA_WARP:
+        if warp_idx == self.tma_warp:
             for local_iter in cutlass.range(num_iters):
                 super_id = start_pid + local_iter * GRID
                 pid_m = super_id // num_tiles_ns
@@ -1590,7 +1623,7 @@ class _Tcgen05RhtAmax:
             ab_producer.tail()
 
         # ==================== MMA warp (AB consumer, acc producer) ====================
-        if warp_idx == MMA_WARP:
+        if warp_idx == self.mma_warp:
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(cutlass.Float32)
             tCtAcc_base = cute.make_tensor(tmem_ptr, acc_fake_layout)
@@ -1600,7 +1633,7 @@ class _Tcgen05RhtAmax:
             for local_iter in cutlass.range(num_iters):
                 ab_handle = ab_consumer.wait_and_advance()
                 acc_pipeline.producer_acquire(acc_producer_state)
-                for u in cutlass.range_constexpr(U):
+                for u in cutlass.range_constexpr(self.col_groups_per_supertile):
                     tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
                     cute.gemm(
                         tiled_mma,
@@ -1615,7 +1648,7 @@ class _Tcgen05RhtAmax:
             acc_pipeline.producer_tail(acc_producer_state)
 
         # ==================== ROW warps (AB consumer, read raw sA) -> row amax ====================
-        if warp_idx >= ROW_WARP_BEGIN and warp_idx < ROW_WARP_END:
+        if warp_idx >= ROW_WARP_BEGIN and warp_idx < self.row_warp_end:
             k_row = tidx - cutlass.Int32(
                 ROW_WARP_BEGIN * 32
             )  # 0..KW-1 = M-position within super-tile
@@ -1677,7 +1710,7 @@ class _Tcgen05RhtAmax:
             for local_iter in cutlass.range(num_iters):
                 acc_idx = acc_consumer_state.index
                 acc_pipeline.consumer_wait(acc_consumer_state)
-                for u in cutlass.range_constexpr(U):
+                for u in cutlass.range_constexpr(self.col_groups_per_supertile):
                     cute.copy(
                         tiled_copy_t2r,
                         tTR_tAcc_base[(None, None, None, 0, 0, u, acc_idx)],
@@ -1749,17 +1782,17 @@ def _get_sr_rng_buffer(device_idx):
     return torch.zeros(1, dtype=torch.int32, device=torch.device("cuda", device_idx))
 
 
-@functools.lru_cache(maxsize=8)
-def _compile_amax_tc_kernel(device_idx):
-    """Compile the tensor-core RHT amax with symbolic shapes (cached per device).
+@functools.lru_cache(maxsize=None)
+def _compile_amax_tc_kernel(device_idx, col_groups_per_supertile=16):
+    """Compile the tensor-core RHT amax with symbolic shapes (cached per device+u).
 
-    The symbolic (sym_int) shapes make the compiled kernel serve any (M % 256, N % 128); M/N/GRID
-    are runtime Int32 args. Not keyed on the sign vector, which is a runtime launch buffer (the
-    compile uses a fake), so the compiled kernel is identical for every sign vector.
+    The symbolic (sym_int) shapes make the compiled kernel serve any (M % (16*u), N % 128);
+    M/N/GRID are runtime Int32 args. Not keyed on the sign vector, which is a runtime launch
+    buffer (the compile uses a fake), so the compiled kernel is identical for every sign vector.
     """
     device = torch.device("cuda", device_idx)
     # aT = A.t().unsqueeze(-1): (N, M, 1), dim0 (N) contiguous -> stride (1, N, 1).
-    m_sym = cute.sym_int(divisibility=N_TILE * U)  # M % 256
+    m_sym = cute.sym_int(divisibility=N_TILE * col_groups_per_supertile)  # M % 256 or M % 128
     n_sym = cute.sym_int(divisibility=M_TILE)  # N % 128
     fake_aT = make_fake_tensor(
         cutlass.BFloat16, (n_sym, m_sym, 1), stride=(1, cute.sym_int(), 1)
@@ -1769,7 +1802,7 @@ def _compile_amax_tc_kernel(device_idx):
     )
     fake_col = make_fake_tensor(cutlass.Float32, (1,), stride=(1,))
     fake_row = make_fake_tensor(cutlass.Float32, (1,), stride=(1,))
-    k = _Tcgen05RhtAmax()
+    k = _Tcgen05RhtAmax(col_groups_per_supertile=col_groups_per_supertile)
     # c_layout for the TMEM->reg read = layout of the col FP4 output (row-major 2D); the enum
     # depends only on row/col-majorness, so a dummy contiguous tensor suffices.
     dummy = torch.empty((M_TILE, 16), dtype=torch.int32, device=device)
@@ -1797,7 +1830,7 @@ def _cutedsl_rht_amax_impl(A: torch.Tensor, sign_vector=DEFAULT_SIGN_VECTOR):
 
     The column amax is taken over the post-RHT data (not the plain amax) for correctness: RHT
     can raise the per-block max, and a too-small global scale saturates the E4M3 block scales.
-    Requires M % 256 == 0, N % 128 == 0.
+    Requires M % 128 == 0, N % 128 == 0.
     """
     if A.dtype != torch.bfloat16:
         raise ValueError(f"Expected bfloat16, got {A.dtype}")
@@ -1806,12 +1839,13 @@ def _cutedsl_rht_amax_impl(A: torch.Tensor, sign_vector=DEFAULT_SIGN_VECTOR):
     if not A.is_contiguous():
         raise ValueError("A must be row-major (contiguous)")
     M, N = A.shape
-    # The tile is N_TILE*U=256 wide in M. Without M%256, M=128 gives GRID=0
+    # The tile is N_TILE*col_groups wide in M. Below that divisibility, GRID=0
     # -> a no-op launch that silently returns amax=0.
-    if M % 256 != 0:
-        raise ValueError(f"M must be divisible by 256, got M={M}")
+    if M % 128 != 0:
+        raise ValueError(f"M must be divisible by 128, got M={M}")
     if N % 128 != 0:
         raise ValueError(f"N must be divisible by 128, got N={N}")
+    col_groups_per_supertile = 16 if M % 256 == 0 else 8
     # This is a non-differentiable op (autograd is owned by the outer linear Function);
     # detach so the input passed to the kernel never carries autograd state.
     A = A.detach()
@@ -1822,10 +1856,10 @@ def _cutedsl_rht_amax_impl(A: torch.Tensor, sign_vector=DEFAULT_SIGN_VECTOR):
     rht_nk = _get_rht_buffer(tuple(sign_vector), dev.index)  # torch buffer (kept alive)
 
     NUM_SMS = _get_num_sms(dev.index)
-    GRID = min(NUM_SMS, (N // M_TILE) * (M // (N_TILE * U)))
+    GRID = min(NUM_SMS, (N // M_TILE) * (M // (N_TILE * col_groups_per_supertile)))
     stream = cuda.CUstream(int(torch.cuda.current_stream(dev).cuda_stream))
 
-    amax_compiled = _compile_amax_tc_kernel(dev.index)
+    amax_compiled = _compile_amax_tc_kernel(dev.index, col_groups_per_supertile)
     amax_compiled(
         A.t().unsqueeze(-1),
         rht_nk,
@@ -1839,14 +1873,21 @@ def _cutedsl_rht_amax_impl(A: torch.Tensor, sign_vector=DEFAULT_SIGN_VECTOR):
     return col_amax, row_amax
 
 
-# maxsize=None: the key is (device, swizzle, sr, apply_rht, grouped) and every entry is a
-# compiled kernel that a CUDA-graph capture may depend on. An eviction would force a lazy
-# recompile mid-capture, so the cache must never evict.
+# maxsize=None: the key is (device, swizzle, sr, apply_rht, grouped, col_groups_per_supertile)
+# and every entry is a compiled kernel that a CUDA-graph capture may depend on. An eviction
+# would force a lazy recompile mid-capture, so the cache must never evict.
 @functools.lru_cache(maxsize=None)
-def _compile_fused_kernel(device_idx, swizzle, sr, apply_rht=True, grouped=False):
-    """Compile the fused kernel with symbolic shapes (cached per device+swizzle+sr+apply_rht).
+def _compile_fused_kernel(
+    device_idx,
+    swizzle,
+    sr,
+    apply_rht=True,
+    grouped=False,
+    col_groups_per_supertile=16,
+):
+    """Compile the fused kernel with symbolic shapes (cached per device+flags+supertile).
 
-    The symbolic (sym_int) shapes make the compiled kernel serve any (M % 256, N % 128); the
+    The symbolic (sym_int) shapes make the compiled kernel serve any (M % (16*u), N % 128); the
     divisibilities below match each output's TMA store box so the atoms tile cleanly. ``swizzle``
     selects the cutlass-swizzled SF layout (op default) vs the plain (N, M//16)/(M, N//16) layout.
     ``sr`` compiles the stochastic-rounding (cvt.rs) variant as a separate kernel, leaving the RTNE
@@ -1858,7 +1899,8 @@ def _compile_fused_kernel(device_idx, swizzle, sr, apply_rht=True, grouped=False
     # The grouped variant is only reachable from the weight quantize: apply_rht would need a
     # per-expert B operand, and sr's columnwise seed (pid_m, nrow) aliases across experts.
     assert not (grouped and (apply_rht or sr))
-    m_sym = cute.sym_int(divisibility=N_TILE * U)  # M % 256
+    # M % 256 or M % 128
+    m_sym = cute.sym_int(divisibility=N_TILE * col_groups_per_supertile)
     n_sym = cute.sym_int(divisibility=M_TILE)  # N % 128
     free = cute.sym_int  # a fresh dynamic stride per call
     # Reusing a sym_int ties the two extents together in the compiled signature. The col outputs
@@ -1873,9 +1915,11 @@ def _compile_fused_kernel(device_idx, swizzle, sr, apply_rht=True, grouped=False
     fake_bT = make_fake_tensor(
         cutlass.BFloat16, (HADAMARD_DIM, HADAMARD_DIM, 1), stride=(HADAMARD_DIM, 1, 1)
     )
-    # col_fp4 (N, M//8) u32, store box inner = 2*U = 32; row_fp4 (M, N//8) u32, inner = 16.
+    # col_fp4 (N, M//8) u32, store box inner = 2*col_groups; row_fp4 (M, N//8) u32, inner = 16.
     fake_cfp4 = make_fake_tensor(
-        cutlass.Uint32, (cn_sym, cute.sym_int(divisibility=2 * U)), stride=(free(), 1)
+        cutlass.Uint32,
+        (cn_sym, cute.sym_int(divisibility=2 * col_groups_per_supertile)),
+        stride=(free(), 1),
     )
     fake_rfp4 = make_fake_tensor(
         cutlass.Uint32,
@@ -1884,22 +1928,27 @@ def _compile_fused_kernel(device_idx, swizzle, sr, apply_rht=True, grouped=False
     )
     if swizzle:
         # SF flattened to 2D for the TMA atom: col_sf.reshape(N//128, (M//64)*512) has inner
-        # divisible by 2048 (from M%256); row_sf.reshape(M//128, (N//64)*512) inner by 1024.
+        # inner divisible by (col_groups//4)*512 (from the M bound);
+        # row_sf.reshape(M//128, (N//64)*512) outer divisible by supertile M-blocks,
+        # inner by 1024 (from N%128).
         fake_csf = make_fake_tensor(
             cutlass.Float8E4M3FN,
-            (cute.sym_int(divisibility=1), cute.sym_int(divisibility=2048)),
+            (cute.sym_int(divisibility=1), cute.sym_int(divisibility=(col_groups_per_supertile // 4) * SF_BLK)),
             stride=(free(), 1),
         )
         fake_rsf = make_fake_tensor(
             cutlass.Float8E4M3FN,
-            (cute.sym_int(divisibility=2), cute.sym_int(divisibility=1024)),
+            (
+                cute.sym_int(divisibility=(K * col_groups_per_supertile) // 128),
+                cute.sym_int(divisibility=1024),
+            ),
             stride=(free(), 1),
         )
     else:
-        # plain SF: col (N, M//16), row (M, N//16).
+        # plain SF: col (N, M//16), row (M, N//16). Requires col_groups=16 (col box is that many bytes wide).
         fake_csf = make_fake_tensor(
             cutlass.Float8E4M3FN,
-            (cn_sym, cute.sym_int(divisibility=U)),
+            (cn_sym, cute.sym_int(divisibility=col_groups_per_supertile)),
             stride=(free(), 1),
         )
         fake_rsf = make_fake_tensor(
@@ -1913,7 +1962,11 @@ def _compile_fused_kernel(device_idx, swizzle, sr, apply_rht=True, grouped=False
     )
     fake_sr_rng = make_fake_tensor(cutlass.Int32, (1,), stride=(1,))
     k = _Tcgen05RowColFused(
-        swizzle_sf=swizzle, sr=sr, apply_rht=apply_rht, grouped=grouped
+        swizzle_sf=swizzle,
+        sr=sr,
+        apply_rht=apply_rht,
+        grouped=grouped,
+        col_groups_per_supertile=col_groups_per_supertile,
     )
     return cute.compile(
         k,
@@ -1961,7 +2014,9 @@ def _cutedsl_rht_quantize_row_col_impl(
     since ``max|A.t()| == max|A|``.
 
     Args:
-        A: (M, N) bfloat16, row-major. M % 256 == 0, N % 128 == 0.
+        A: (M, N) bfloat16, row-major. M % 128 == 0 (M % 256 selects the faster
+            256-row supertile; other M % 128 shapes compile a 128-row variant),
+            N % 128 == 0.
         col_global_amax: scalar float32 = max|RHT(A.t())| (columnwise decode scale).
         row_global_amax: scalar float32 = max|A| (rowwise decode scale).
         sign_vector: RHT sign vector as a list of ints.
@@ -1990,10 +2045,17 @@ def _cutedsl_rht_quantize_row_col_impl(
     if not A.is_contiguous():
         raise ValueError("A must be row-major (contiguous)")
     M, N = A.shape
-    if M % 256 != 0:
-        raise ValueError(f"M must be divisible by 256, got M={M}")
+    if M % 128 != 0:
+        raise ValueError(f"M must be divisible by 128, got M={M}")
     if N % 128 != 0:
         raise ValueError(f"N must be divisible by 128, got N={N}")
+    col_groups_per_supertile = 16 if M % 256 == 0 else 8
+    if col_groups_per_supertile < 16 and not swizzle_scale_factors:
+        raise ValueError(
+            "swizzle_scale_factors=False requires M % 256 == 0 (the plain col-SF "
+            "TMA box is col_groups_per_supertile bytes wide, below TMA's 16B "
+            "minimum for the 128-row supertile)"
+        )
     # Non-differentiable op (autograd owned by the outer linear Function); detach so the
     # input passed to the kernel never carries autograd state.
     A = A.detach()
@@ -2048,10 +2110,16 @@ def _cutedsl_rht_quantize_row_col_impl(
     row_amax_t = row_global_amax.reshape(1)
 
     NUM_SMS = _get_num_sms(dev.index)
-    GRID = min(NUM_SMS, (N // M_TILE) * (M // (N_TILE * U)))
+    GRID = min(NUM_SMS, (N // M_TILE) * (M // (N_TILE * col_groups_per_supertile)))
     stream = cuda.CUstream(int(torch.cuda.current_stream(dev).cuda_stream))
 
-    fused = _compile_fused_kernel(dev.index, swizzle, sr, bool(apply_rht))
+    fused = _compile_fused_kernel(
+        dev.index,
+        swizzle,
+        sr,
+        bool(apply_rht),
+        col_groups_per_supertile=col_groups_per_supertile,
+    )
     fused(
         A.t().unsqueeze(-1),
         rht_nk,
@@ -2089,7 +2157,7 @@ def _cutedsl_group_weight_quantize_2d_impl(
     ``max|A[e].t()| == max|A[e]|``.
 
     Args:
-        A: (E, M, N) bfloat16, contiguous. M % 256 == 0, N % 128 == 0.
+        A: (E, M, N) bfloat16, contiguous. M % 128 == 0, N % 128 == 0.
         global_amax: (E,) float32 per-expert ``A[e].float().abs().max()``.
 
     Returns:
@@ -2112,10 +2180,22 @@ def _cutedsl_group_weight_quantize_2d_impl(
     )
 
     NUM_SMS = _get_num_sms(dev.index)
-    GRID = min(NUM_SMS, (N // M_TILE) * (E * M // (N_TILE * U)))
+    # Keyed on the per-expert M, not E*M: a supertile must not straddle two experts,
+    # which is what lets the grouped kernel apply one expert offset per work tile.
+    col_groups_per_supertile = 16 if M % 256 == 0 else 8
+    GRID = min(
+        NUM_SMS, (N // M_TILE) * (E * M // (N_TILE * col_groups_per_supertile))
+    )
     stream = cuda.CUstream(int(torch.cuda.current_stream(dev).cuda_stream))
 
-    fused = _compile_fused_kernel(dev.index, True, False, apply_rht=False, grouped=True)
+    fused = _compile_fused_kernel(
+        dev.index,
+        True,
+        False,
+        apply_rht=False,
+        grouped=True,
+        col_groups_per_supertile=col_groups_per_supertile,
+    )
     fused(
         A.view(E * M, N).t().unsqueeze(-1),
         _get_identity_buffer(dev.index),  # unused MMA B operand (no MMA on this path)

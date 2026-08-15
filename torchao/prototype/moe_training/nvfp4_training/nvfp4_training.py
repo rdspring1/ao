@@ -85,8 +85,8 @@ class NVFP4TrainingConfig(AOBaseConfig):
             CUTEDSL: CuteDSL kernels for the full quantize path (amax, forward
                 RTNE quantize, SR backward quantize, and 2D weight quantize).
                 Requires SM100; in_features divisible by 128 and out_features
-                by 256. Under tensor parallel the same constraints apply to each
-                per-rank shard, and the per-rank M shard must be divisible by 256.
+                by 128. Under tensor parallel the same constraints apply to each
+                per-rank shard, and the per-rank M shard must be divisible by 128.
                 Unlike AUTO, an unmet requirement raises instead of falling back.
             Default: AUTO.
         process_group: Optional ProcessGroup for tensor-parallel TP.

@@ -66,7 +66,6 @@ def make_runner(
     num_tensors: int,
 ) -> Optional[Callable[[], object]]:
     """No-arg callable running ``backend``'s grouped 2D quantize, or None if unavailable."""
-    M = weights.shape[1]
     if backend == "triton":
         if not has_triton():
             return None
@@ -74,8 +73,7 @@ def make_runner(
             triton_group_weight_quantize_2d as op,
         )
     elif backend == "cutedsl":
-        # The cutedsl super-tile is 256 rows of M, stricter than triton's 128.
-        if not cutedsl_nvfp4_kernels_available() or M % 256 != 0:
+        if not cutedsl_nvfp4_kernels_available():
             return None
         from torchao.prototype.moe_training.nvfp4_training.group_quantize_2d_cutedsl import (
             cutedsl_group_weight_quantize_2d as op,

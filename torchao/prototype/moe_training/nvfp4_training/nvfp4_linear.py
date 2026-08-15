@@ -180,18 +180,6 @@ class nvfp4_mm_triton(torch.autograd.Function):
                 f"nvfp4_mm_triton requires M, K, N all divisible by 128; "
                 f"got M={M}, K={K}, N={N}"
             )
-        if use_cutedsl and M % 256 != 0:
-            # The outer M % 128 gate is too coarse for CuteDSL: M=128 reaches the amax
-            # kernel and silently returns zero amaxes.
-            raise ValueError(
-                f"kernel_preference=CUTEDSL requires M divisible by 256, got M={M}"
-            )
-        if use_cutedsl and N % 256 != 0:
-            # The CuteDSL weight quantize maps the weight as (out=N, in=K) into the fused kernel,
-            # whose M tiler needs out_features % 256 (stricter than the Triton weight kernel's %128).
-            raise ValueError(
-                f"kernel_preference=CUTEDSL requires N (out_features) divisible by 256, got N={N}"
-            )
         input_2d = input_hp.reshape(-1, K).contiguous()
 
         # Amaxes are separate ops so TP callers can all-reduce them before quantizing.
@@ -336,10 +324,10 @@ def nvfp4_linear(
         sign_vector: RHT sign vector used for amax and quantization.
         kernel_preference: Backend for quantization, AUTO (default), TRITON, or CUTEDSL.
             CuteDSL runs the full path — the amax, the forward RTNE quantize, the backward
-            SR (cvt.rs) quantize, and the 2D weight quantize — but needs M and out_features
-            divisible by 256 on top of the path's own %128. AUTO takes CuteDSL when the
-            runtime and the shapes allow and falls back to Triton otherwise; CUTEDSL is the
-            same choice made loudly, raising rather than falling back.
+            SR (cvt.rs) quantize, and the 2D weight quantize — and accepts exactly the
+            shapes Triton does (the path's own %128). AUTO takes CuteDSL when the runtime
+            allows and falls back to Triton otherwise; CUTEDSL is the same choice made
+            loudly, raising rather than falling back.
         sr_seed: Fixed int64 seed tensor (size=(1,)) for SR Philox key. Allocated
             fresh if None. For reproducibility, pass a pre-allocated module buffer.
     """
@@ -360,14 +348,8 @@ def nvfp4_linear(
                 f"({cutedsl_nvfp4_unavailable_reason()})."
             )
         use_cutedsl = False
-    # Under AUTO an unsupported shape falls back; nvfp4_mm_triton.forward still raises
-    # for an explicit CUTEDSL request, so the loud path keeps its error.
-    if (
-        use_cutedsl
-        and kernel_preference == KernelPreference.AUTO
-        and (input_hp.shape[-2] % 256 != 0 or weight_hp.shape[0] % 256 != 0)
-    ):
-        use_cutedsl = False
+    # No shape fallback: CuteDSL now accepts exactly the shapes Triton does, and
+    # nvfp4_mm_triton.forward's shared % 128 gate rejects the rest for both.
 
     if sr_seed is None:
         sr_seed = torch.randint(

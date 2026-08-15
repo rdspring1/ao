@@ -241,12 +241,12 @@ def test_resolve_backends_falls_back_without_cutedsl(monkeypatch):
         nvfp4_grouped_mm, "cutedsl_nvfp4_kernels_available", lambda: False
     )
 
-    assert _resolve_backends(KernelPreference.AUTO, 8, 1024) == (False, False)
-    assert _resolve_backends(KernelPreference.TRITON, 8, 1024) == (False, False)
+    assert _resolve_backends(KernelPreference.AUTO, 8) == (False, False)
+    assert _resolve_backends(KernelPreference.TRITON, 8) == (False, False)
     with pytest.raises(RuntimeError, match="CUTEDSL requires"):
-        _resolve_backends(KernelPreference.CUTEDSL, 8, 1024)
+        _resolve_backends(KernelPreference.CUTEDSL, 8)
     with pytest.raises(ValueError, match="AUTO, TRITON, or CUTEDSL"):
-        _resolve_backends(KernelPreference.TORCH, 8, 1024)
+        _resolve_backends(KernelPreference.TORCH, 8)
 
 
 @pytest.mark.skipif(not has_triton(), reason="unsupported without triton")
@@ -258,18 +258,14 @@ def test_resolve_backends_falls_back_without_cutedsl(monkeypatch):
     not cutedsl_nvfp4_kernels_available(), reason="requires the CuteDSL runtime"
 )
 def test_resolve_backends_is_per_op():
-    """The two CuteDSL limits are independent: the RHT ops cap expert count and the
-    weight quantize needs N % 256, so one falling back must not drag the other."""
-    assert _resolve_backends(KernelPreference.AUTO, 8, 1024) == (True, True)
+    """The expert cap belongs to the RHT ops alone: the weight quantize now accepts
+    every shape the grouped GEMM does, so the RHT path falling back must not drag it."""
+    assert _resolve_backends(KernelPreference.AUTO, 8) == (True, True)
     # 65 experts exceeds the CuteDSL group cap; the weight quantize is unaffected.
-    assert _resolve_backends(KernelPreference.AUTO, 65, 1024) == (False, True)
-    # N=1408 is the 16B gate/up shape: 128-aligned but not 256.
-    assert _resolve_backends(KernelPreference.AUTO, 8, 1408) == (True, False)
+    assert _resolve_backends(KernelPreference.AUTO, 65) == (False, True)
 
     with pytest.raises(ValueError, match="at most 64 experts"):
-        _resolve_backends(KernelPreference.CUTEDSL, 65, 1024)
-    with pytest.raises(ValueError, match="divisible by 256"):
-        _resolve_backends(KernelPreference.CUTEDSL, 8, 1408)
+        _resolve_backends(KernelPreference.CUTEDSL, 65)
 
 
 @skip_if_rocm("ROCm not supported")

@@ -54,15 +54,9 @@ _ALIGNMENT = 128
 _SCALE_RECIPE = [F.ScalingType.BlockWise1x16, F.ScalingType.TensorWise]
 _SWIZZLE = [F.SwizzleType.SWIZZLE_32_4_4, F.SwizzleType.NO_SWIZZLE]
 
-# cutedsl_group_weight_quantize_2d's super-tile is 256 rows of the per-expert out
-# dimension, stricter than the Triton kernel's 128.
-_CUTEDSL_WEIGHT_ROWS = 256
-
-
 def _resolve_backends(
     kernel_preference: KernelPreference,
     num_experts: int,
-    out_features: int,
 ) -> tuple[bool, bool]:
     """``(use_cutedsl_rht, use_cutedsl_weight)`` for this call.
 
@@ -98,18 +92,15 @@ def _resolve_backends(
     )
 
     use_cutedsl_rht = num_experts <= MAX_GROUPS
-    use_cutedsl_weight = out_features % _CUTEDSL_WEIGHT_ROWS == 0
     if kernel_preference == KernelPreference.CUTEDSL and not use_cutedsl_rht:
         raise ValueError(
             f"kernel_preference=CUTEDSL requires at most {MAX_GROUPS} experts, "
             f"got {num_experts}"
         )
-    if kernel_preference == KernelPreference.CUTEDSL and not use_cutedsl_weight:
-        raise ValueError(
-            f"kernel_preference=CUTEDSL requires N (out_features) divisible by "
-            f"{_CUTEDSL_WEIGHT_ROWS}, got {out_features}"
-        )
-    return use_cutedsl_rht, use_cutedsl_weight
+    # The weight quantize accepts every shape the grouped GEMM does (out_features
+    # % 128, enforced by the caller), so it takes CuteDSL whenever the runtime is
+    # present. Only the RHT path has a constraint of its own.
+    return use_cutedsl_rht, True
 
 
 @conditional_nostrict_trace
@@ -222,7 +213,7 @@ class _NVFP4GroupedMM(torch.autograd.Function):
                 )
 
         use_cutedsl_rht, use_cutedsl_weight = _resolve_backends(
-            kernel_preference, num_experts, N
+            kernel_preference, num_experts
         )
 
         input_act = input_act.to(torch.bfloat16).contiguous()

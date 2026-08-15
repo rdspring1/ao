@@ -81,9 +81,9 @@ if has_triton() and is_sm_at_least_100() and torch_version_at_least("2.10.0"):
     )
 
 # Shapes swept by the kernel-parametrized tests. Both kernels need M % 128 == 0 and
-# N % 128 == 0 for the swizzled scale layout; the CuteDSL kernel additionally needs
-# M % 256 == 0, so M=128 runs triton-only (see _skip_if_unsupported_shape).
-_M_VALUES = [128, 256, 512, 1024]
+# N % 128 == 0 for the swizzled scale layout. M=128/384 exercise the CuteDSL 128-row
+# supertile (M % 128 but not % 256); the other M run its tuned 256-row supertile.
+_M_VALUES = [128, 256, 384, 512, 1024]
 _N_VALUES = [128, 256, 384, 512, 1024]
 # Shape both kernels accept, for the tests that do not sweep shapes.
 _M_BOTH, _N_BOTH = 256, 256
@@ -253,8 +253,6 @@ def _skip_if_unsupported_shape(kernel: str, M: int, N: int) -> None:
     """Skip shapes the selected backend cannot handle."""
     if M % 128 != 0 or N % 128 != 0:
         pytest.skip("swizzled scales require M % 128 == 0 and N % 128 == 0")
-    if kernel == "cutedsl" and M % 256 != 0:
-        pytest.skip("cutedsl kernel requires M % 256 == 0")
 
 
 def _rht_amax(
@@ -636,7 +634,7 @@ def test_rht_quantize_row_col_zero_and_near_zero_no_nan_or_saturation(
 @_skip_no_triton
 @_skip_no_cutedsl
 @pytest.mark.parametrize("N", [256, 512], ids=lambda n: f"N{n}")
-@pytest.mark.parametrize("M", [256, 512], ids=lambda m: f"M{m}")
+@pytest.mark.parametrize("M", [256, 384, 512], ids=lambda m: f"M{m}")
 @torch.no_grad()
 def test_cutedsl_vs_triton_interchangeable(M, N):
     """Fed the SAME global amaxes, CuteDSL and Triton outputs reconstruct each other to
@@ -1054,8 +1052,8 @@ def test_cutedsl_rht_quantize_sr_unbiased():
 @_skip_no_cutedsl
 @pytest.mark.parametrize(
     "M,N",
-    [(128, 256), (256, 200), (384, 256)],
-    ids=["M_not_mult_256", "N_not_mult_128", "M_not_mult_256_b"],
+    [(64, 256), (256, 200), (192, 256)],
+    ids=["M_not_mult_128", "N_not_mult_128", "M_not_mult_128_b"],
 )
 @torch.no_grad()
 def test_cutedsl_rht_quantize_invalid_shape_raises(M, N):
