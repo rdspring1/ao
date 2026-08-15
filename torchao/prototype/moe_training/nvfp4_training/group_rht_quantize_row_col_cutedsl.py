@@ -21,24 +21,6 @@ from .group_rht_quantize_row_col_triton import _validate_graph_amax, _validate_r
 from .hadamard_cutedsl_utils import raise_if_cutedsl_nvfp4_unavailable
 from .hadamard_utils import _device_key, get_rht_matrix
 
-# Odd multipliers so every field of the caller-owned Philox state reaches the
-# kernel's single RNG base; a plain XOR would let col_seed^col_offset collide
-# with row_seed^row_offset.
-_FOLD_MUL = (1, 0x9E3779B1, 0x85EBCA77, 0xC2B2AE3D)
-
-
-def _fold_rng_state(rng_state: torch.Tensor) -> torch.Tensor:
-    """Fold ``[col_seed, col_offset, row_seed, row_offset]`` into one int64 scalar.
-
-    Device-side only, so it stays capturable: the kernel decorrelates the
-    columnwise and rowwise streams internally from this single base.
-    """
-    folded = rng_state[0:1] * _FOLD_MUL[0]
-    for i in range(1, 4):
-        folded = folded ^ (rng_state[i : i + 1] * _FOLD_MUL[i])
-    return folded
-
-
 @torch.library.custom_op("torchao::cutedsl_group_rht_quantize_row_col", mutates_args=())
 def cutedsl_group_rht_quantize_row_col(
     A: torch.Tensor,
@@ -113,7 +95,7 @@ def cutedsl_group_rht_quantize_row_col(
         tuple(sign_vector),
         logical_packed_length=logical_packed_length,
         stochastic_rounding=enable_stochastic_rounding,
-        sr_rng=_fold_rng_state(rng_state) if enable_stochastic_rounding else None,
+        sr_rng=rng_state if enable_stochastic_rounding else None,
     )
     return (
         row_fp4,

@@ -107,7 +107,9 @@ def _weight_quantize_2d_reference_scales(A: torch.Tensor) -> torch.Tensor:
         max=torch.finfo(torch.float32).max
     )
     enc_g = torch.where(is_global_amax_zero, torch.ones_like(enc_g), enc_g)
-    pvscale = (block_amax / FP4_MAX) * enc_g
+    # amax * (enc/6), not (amax/6) * enc: one rounding rather than two, which is the
+    # association both kernels use (quantize_2d_triton, _quant16_from_amax).
+    pvscale = block_amax * (enc_g * (1.0 / FP4_MAX))
     pvscale = pvscale.clamp(max=FP8_MAX).to(torch.float8_e4m3fn)  # (M//16, N//16)
 
     # Expand: each block-row scale repeated 16 times → (M, N//16)
@@ -198,11 +200,11 @@ def _assert_scales_match_up_to_rounding_ties(
 def _assert_scales_vs_reference(
     kernel: str, scales: torch.Tensor, reference: torch.Tensor, what: str
 ) -> None:
-    """triton reproduces the PyTorch oracle bitwise; CuteDSL up to FP8 rounding ties."""
-    if kernel == "triton":
-        torch.testing.assert_close(scales, reference, atol=0, rtol=0)
-    else:
-        _assert_scales_match_up_to_rounding_ties(scales, reference, what)
+    """Both backends reproduce the PyTorch oracle bitwise: they share the scale chain
+    (div_rn for the global scale, one-rounding association for the block scale) and
+    differ only in how they get the block amax, which is exact."""
+    del kernel, what
+    torch.testing.assert_close(scales, reference, atol=0, rtol=0)
 
 
 # ---------------------------------------------------------------------------
@@ -240,15 +242,19 @@ def test_weight_quantize_2d_scales_vs_reference(kernel, M, N):
 @pytest.mark.parametrize("M", _M_VALUES, ids=lambda m: f"M{m}")
 @torch.no_grad()
 def test_cutedsl_weight_quantize_2d_matches_triton(M, N):
-    """Both backends emit the same 2D 16x16 scale factors, modulo FP8 rounding ties."""
+    """The two backends are byte-for-byte interchangeable: same codes, same scales.
+
+    Both the FP4 nibbles and the FP8 scales, not just the scales -- the codes are what a
+    tie-breaking difference in the encode reciprocal would show up in first.
+    """
     _skip_if_unsupported_shape("cutedsl", M, N)
     torch.manual_seed(3)
     W = torch.randn(M, N, dtype=torch.bfloat16, device="cuda")
     amax = W.float().abs().max()
-    _, c_rsf, _, c_csf = _weight_quantize_2d("cutedsl", W, amax)
-    _, t_rsf, _, t_csf = _weight_quantize_2d("triton", W, amax)
-    _assert_scales_match_up_to_rounding_ties(c_rsf, t_rsf, "rowwise SF vs Triton 16x16")
-    _assert_scales_match_up_to_rounding_ties(c_csf, t_csf, "colwise SF vs Triton 16x16")
+    cutedsl = _weight_quantize_2d("cutedsl", W, amax)
+    triton_out = _weight_quantize_2d("triton", W, amax)
+    for name, c, t in zip(("q", "sf", "qt", "sft"), cutedsl, triton_out):
+        assert torch.equal(c, t), f"{name} differs between backends"
 
 
 # ---------------------------------------------------------------------------

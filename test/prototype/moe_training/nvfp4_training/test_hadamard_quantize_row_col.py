@@ -280,39 +280,32 @@ def _quantize_row_col(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Dispatch to the selected backend's fused RHT row/col quantize.
 
-    Returns (col_codes, col_sf, row_codes, row_sf). With ``stochastic_rounding=True``,
-    ``seed``/``offset`` default to fresh random int64 buffers.
+    Returns (col_codes, col_sf, row_codes, row_sf). The two ops take the same four
+    Philox bases, so the only difference here is which one is called. With
+    ``stochastic_rounding=True``, ``seed``/``offset`` default to fresh random int64
+    buffers.
     """
-    sign_vector = list(sign_vector)
-    if kernel == "triton":
-        sr_kwargs = {}
-        if stochastic_rounding:
-            sr_kwargs = {
-                "col_seed_base": _random_i64(x.device) if seed is None else seed,
-                "col_offset_base": _random_i64(x.device) if offset is None else offset,
-                "row_seed_base": _random_i64(x.device) if seed is None else seed,
-                "row_offset_base": _random_i64(x.device) if offset is None else offset,
-            }
-        return triton_rht_quantize_row_col(
-            x,
-            col_global_amax=col_amax,
-            row_global_amax=row_amax,
-            sign_vector=sign_vector,
-            stochastic_rounding=stochastic_rounding,
-            **sr_kwargs,
-        )
-
+    quantize = (
+        triton_rht_quantize_row_col
+        if kernel == "triton"
+        else cutedsl_rht_quantize_row_col
+    )
     sr_kwargs = {}
     if stochastic_rounding:
+        col_seed = _random_i64(x.device) if seed is None else seed
+        col_offset = _random_i64(x.device) if offset is None else offset
         sr_kwargs = {
-            "seed": _random_i64(x.device) if seed is None else seed,
-            "offset": _random_i64(x.device) if offset is None else offset,
+            "col_seed_base": col_seed,
+            "col_offset_base": col_offset,
+            # ^1 to decorrelate the row stream from the col one, as nvfp4_linear does.
+            "row_seed_base": col_seed ^ 1,
+            "row_offset_base": col_offset,
         }
-    return cutedsl_rht_quantize_row_col(
+    return quantize(
         x,
         col_amax,
         row_amax,
-        sign_vector,
+        list(sign_vector),
         stochastic_rounding=stochastic_rounding,
         **sr_kwargs,
     )
@@ -637,36 +630,89 @@ def test_rht_quantize_row_col_zero_and_near_zero_no_nan_or_saturation(
 @pytest.mark.parametrize("M", [256, 384, 512], ids=lambda m: f"M{m}")
 @torch.no_grad()
 def test_cutedsl_vs_triton_interchangeable(M, N):
-    """Fed the SAME global amaxes, CuteDSL and Triton outputs reconstruct each other to
-    high SQNR (they implement the same RHT + NVFP4 quantize)."""
+    """Fed the same global amaxes, the two backends are byte-for-byte interchangeable.
+
+    Both the amaxes themselves and all four quantize outputs. The backends share the
+    RHT rounding (bf16), the scale chain (div_rn, one-rounding association) and the FP4
+    encode PTX, so nothing is left to differ.
+    """
     torch.manual_seed(0)
     A = torch.randn(M, N, dtype=torch.bfloat16, device="cuda")
 
-    # One set of amaxes, fed to both kernels.
-    col_amax, row_amax = _rht_amax("triton", A, sign_vector=_HARDCODED_SIGN_VECTOR)
-    c_col, c_col_sf, c_row, c_row_sf = _quantize_row_col(
-        "cutedsl",
-        A,
-        col_amax=col_amax,
-        row_amax=row_amax,
-        sign_vector=_HARDCODED_SIGN_VECTOR,
+    t_amax = _rht_amax("triton", A, sign_vector=_HARDCODED_SIGN_VECTOR)
+    c_amax = _rht_amax("cutedsl", A, sign_vector=_HARDCODED_SIGN_VECTOR)
+    for name, t, c in zip(("col_amax", "row_amax"), t_amax, c_amax):
+        assert torch.equal(t, c), f"{name} differs between backends"
+
+    col_amax, row_amax = t_amax
+    kwargs = dict(
+        col_amax=col_amax, row_amax=row_amax, sign_vector=_HARDCODED_SIGN_VECTOR
     )
-    t_col, t_col_sf, t_row, t_row_sf = _quantize_row_col(
-        "triton",
-        A,
-        col_amax=col_amax,
-        row_amax=row_amax,
-        sign_vector=_HARDCODED_SIGN_VECTOR,
+    cutedsl = _quantize_row_col("cutedsl", A, **kwargs)
+    triton_out = _quantize_row_col("triton", A, **kwargs)
+    for name, c, t in zip(("qd", "sfd", "qa", "sfa"), cutedsl, triton_out):
+        assert torch.equal(c, t), f"{name} differs between backends"
+
+
+@pytest.fixture
+def pinned_triton_tile():
+    """Pin the Triton autotune to the 128x128 config the CuteDSL SR counter assumes.
+
+    Reproducing Triton's stochastic-rounding stream means reproducing its Philox
+    counter, which is keyed on the flat tile index and therefore on BLOCK_M/BLOCK_N.
+    Every config above 128x128 exhausts SM100 tensor or shared memory and is pruned at
+    runtime, so 128x128 is what actually runs -- but that is an emergent property of the
+    hardware, not a contract, so the SR test states it rather than relying on it.
+    """
+    import triton
+
+    from torchao.prototype.moe_training.nvfp4_training import (
+        hadamard_quantize_row_col_triton as hq,
     )
 
-    col_sqnr = compute_error(
-        _dequantize(t_col, t_col_sf, col_amax), _dequantize(c_col, c_col_sf, col_amax)
+    saved = list(hq.HADAMARD_QUANTIZE_CONFIGS)
+    pinned = triton.Config(
+        {"BLOCK_M": 128, "BLOCK_N": 128, "NUM_STAGES": 3}, num_warps=4, num_stages=3
     )
-    row_sqnr = compute_error(
-        _dequantize(t_row, t_row_sf, row_amax), _dequantize(c_row, c_row_sf, row_amax)
+    hq.HADAMARD_QUANTIZE_CONFIGS[:] = [pinned]
+    hq._hadamard_quantize_row_col_kernel.configs = hq.HADAMARD_QUANTIZE_CONFIGS
+    try:
+        yield
+    finally:
+        hq.HADAMARD_QUANTIZE_CONFIGS[:] = saved
+        hq._hadamard_quantize_row_col_kernel.configs = hq.HADAMARD_QUANTIZE_CONFIGS
+
+
+@_skip_no_triton
+@_skip_no_cutedsl
+@pytest.mark.parametrize(
+    "M,N",
+    [(256, 512), (384, 1024), (128, 128), (256, 1408), (1024, 2432)],
+    ids=["base", "supertile128", "single-tile", "short-group", "short-group-b"],
+)
+@torch.no_grad()
+def test_cutedsl_vs_triton_stochastic_rounding_bitwise(pinned_triton_tile, M, N):
+    """SR draws the identical Philox words on both backends, so the codes are identical.
+
+    The last two shapes have ``(N // 128) % 8 != 0``, i.e. a short trailing column group
+    in Triton's L2 swizzle -- the case where inverting ``_compute_pid`` needs the
+    ``(r - base) mod group_size_n`` term rather than plain ``r``.
+    """
+    torch.manual_seed(5)
+    A = torch.randn(M, N, dtype=torch.bfloat16, device="cuda")
+    col_amax, row_amax = _rht_amax("triton", A, sign_vector=_HARDCODED_SIGN_VECTOR)
+    kwargs = dict(
+        col_amax=col_amax,
+        row_amax=row_amax,
+        sign_vector=_HARDCODED_SIGN_VECTOR,
+        stochastic_rounding=True,
+        seed=torch.tensor([0x5EED1234], dtype=torch.int64, device="cuda"),
+        offset=torch.tensor([0x0FF5E7], dtype=torch.int64, device="cuda"),
     )
-    assert col_sqnr >= 28.0, f"cutedsl-vs-triton col SQNR {col_sqnr:.1f} dB < 28"
-    assert row_sqnr >= 35.0, f"cutedsl-vs-triton row SQNR {row_sqnr:.1f} dB < 35"
+    cutedsl = _quantize_row_col("cutedsl", A, **kwargs)
+    triton_out = _quantize_row_col("triton", A, **kwargs)
+    for name, c, t in zip(("qd", "sfd", "qa", "sfa"), cutedsl, triton_out):
+        assert torch.equal(c, t), f"{name} differs between backends"
 
 
 # ---------------------------------------------------------------------------

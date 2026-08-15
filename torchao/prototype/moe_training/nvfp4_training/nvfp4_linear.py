@@ -71,41 +71,26 @@ def _rht_quantize_row_col(
 
     RTNE when sr_seed is None; stochastic rounding otherwise, with fresh offsets
     drawn from the default CUDA RNG (a first-class CUDA-graph side input — see
-    the nvfp4_mm_triton docstring). CuteDSL derives its col/row streams from a
-    single (seed, offset) base internally; Triton takes separate col/row bases.
+    the nvfp4_mm_triton docstring). Both backends take the same four Philox bases
+    and draw the same stream from them.
     """
+    quantize = (
+        cutedsl_rht_quantize_row_col if use_cutedsl else triton_rht_quantize_row_col
+    )
     if sr_seed is None:
-        if use_cutedsl:
-            return cutedsl_rht_quantize_row_col(x, col_amax, row_amax, sign_vector_list)
-        return triton_rht_quantize_row_col(
-            x,
-            stochastic_rounding=False,
-            sign_vector=sign_vector_list,
-            col_global_amax=col_amax,
-            row_global_amax=row_amax,
-        )
+        return quantize(x, col_amax, row_amax, sign_vector_list)
     offset_col = torch.randint(0, 2**32, (1,), dtype=torch.int64, device=x.device)
-    if use_cutedsl:
-        return cutedsl_rht_quantize_row_col(
-            x,
-            col_amax,
-            row_amax,
-            sign_vector_list,
-            stochastic_rounding=True,
-            seed=sr_seed,
-            offset=offset_col,
-        )
     offset_row = torch.randint(0, 2**32, (1,), dtype=torch.int64, device=x.device)
-    return triton_rht_quantize_row_col(
+    return quantize(
         x,
+        col_amax,
+        row_amax,
+        sign_vector_list,
         stochastic_rounding=True,
-        sign_vector=sign_vector_list,
         col_seed_base=sr_seed,
         row_seed_base=sr_seed ^ 1,
         col_offset_base=offset_col,
         row_offset_base=offset_row,
-        col_global_amax=col_amax,
-        row_global_amax=row_amax,
     )
 
 

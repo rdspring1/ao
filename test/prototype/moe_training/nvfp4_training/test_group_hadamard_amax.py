@@ -7,9 +7,9 @@ input validation.
 Semantics match the non-grouped triton_rht_amax (single sign vector):
   col_amax[g] = max|RHT(A_g.T)|, row_amax[g] = max|A_g|.
 
-triton reduces the RHT output in bfloat16, so it matches the bf16-rounded oracle
-bitwise; cutedsl reduces the tcgen05 accumulator in float32, so it matches only to
-a small tolerance. The plain rowwise amax is exact for both.
+Both backends round the RHT output to bfloat16 before reducing -- triton the tl.dot
+accumulator, cutedsl the tcgen05 one -- so both match the bf16-rounded oracle, and each
+other, bitwise. The plain rowwise amax is exact for both.
 """
 
 from __future__ import annotations
@@ -80,9 +80,6 @@ _KERNELS = [
     pytest.param("cutedsl", marks=_skip_no_cutedsl, id="cutedsl"),
 ]
 
-# cutedsl reduces the RHT in float32 where triton rounds to bfloat16 first, so the
-# columnwise amax only agrees to a small tolerance; the rowwise amax is exact.
-_COL_TOL = {"triton": {"atol": 0, "rtol": 0}, "cutedsl": {"atol": 5e-3, "rtol": 5e-3}}
 
 
 def _maybe_sm100(fn):
@@ -168,9 +165,9 @@ def test_group_rht_amax_matches_per_group_kernel(kernel):
         1,
     )
 
-    torch.testing.assert_close(actual_col, expected_col, **_COL_TOL[kernel])
+    torch.testing.assert_close(actual_col, expected_col, atol=0, rtol=0)
     assert torch.equal(actual_row, expected_row)
-    torch.testing.assert_close(actual_col, torch_col, **_COL_TOL[kernel])
+    torch.testing.assert_close(actual_col, torch_col, atol=0, rtol=0)
     torch.testing.assert_close(actual_row, torch_row, atol=0, rtol=0)
 
 
@@ -232,7 +229,7 @@ def test_group_rht_amax_deepseek_dimensions(kernel, shape):
         0,
     )
 
-    torch.testing.assert_close(actual_col, expected_col, **_COL_TOL[kernel])
+    torch.testing.assert_close(actual_col, expected_col, atol=0, rtol=0)
     assert torch.equal(actual_row, expected_row)
 
 
@@ -240,7 +237,7 @@ def test_group_rht_amax_deepseek_dimensions(kernel, shape):
 @_skip_no_cutedsl
 @torch.no_grad()
 def test_cutedsl_group_rht_amax_matches_triton():
-    """Ragged 128-aligned groups: rowwise amax is bitwise, columnwise within tolerance."""
+    """Ragged 128-aligned groups: both amaxes are bitwise equal across backends."""
     device = torch.device("cuda", 0)
     groups = (128, 256, 384, 128)
     hidden_size = 1024
@@ -251,7 +248,7 @@ def test_cutedsl_group_rht_amax_matches_triton():
     cutedsl_col, cutedsl_row = _group_rht_amax("cutedsl", *args)
 
     assert torch.equal(cutedsl_row, triton_row)
-    torch.testing.assert_close(cutedsl_col, triton_col, atol=5e-3, rtol=5e-3)
+    assert torch.equal(cutedsl_col, triton_col)
 
 
 @_maybe_sm100

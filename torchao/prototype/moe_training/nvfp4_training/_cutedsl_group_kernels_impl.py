@@ -57,6 +57,9 @@ from ._cutedsl_kernels_impl import (
     _max_f32,
     _min_f32,
     _quant16,
+    _round_rht_amax,
+    philox4,
+    philox_prep,
 )
 
 # --- tile shapes (TE :262-271). M = hidden, N = tokens, K = 16 (the RHT block) ---
@@ -324,7 +327,7 @@ class _Tcgen05GroupRowColFused(_GroupRhtMainloop):
         mRowSF: cute.Tensor,  # (tokens//128, hidden//64, 32, 16) e4m3
         row_amax_t: cute.Tensor,  # (num_tensors,) f32
         col_amax_t: cute.Tensor,  # (num_tensors,) f32
-        sr_rng_t: cute.Tensor,  # (1,) i32
+        sr_rng_t: cute.Tensor,  # (8,) i32 Philox state
         offsets_t: cute.Tensor,  # (num_tensors,) i32 cumulative row-end offsets
         logical_len_t: cute.Tensor,  # (1,) i32 valid padded token count
         hidden: cutlass.Int32,
@@ -564,9 +567,11 @@ class _Tcgen05GroupRowColFused(_GroupRhtMainloop):
         # capacity rows read back as zero, matching the triton op's contract.
         tiles_in_n_valid = logical_len_t[0] // cutlass.Int32(TOKEN_TILE)
         zero_sf = _zero_sf()
-        sr_rng = cutlass.Uint32(0)
-        if cutlass.const_expr(self.sr):
-            sr_rng = cutlass.Uint32(sr_rng_t[0])
+        # Triton's grid is (cdiv(tokens,128) * cdiv(hidden,128),) with
+        # pid_m = tile_idx // num_tiles_hidden over tokens, so its tile index is
+        # tile_n * tiles_in_h + tile_m. Reconstructing it arithmetically makes the
+        # SR stream independent of this kernel's CLC traversal order.
+        tiles_in_h = hidden // cutlass.Int32(M_TILE)
 
         # ==================== TMA warp (mainloop producer) ====================
         if warp_idx == TMA_WARP:
@@ -718,6 +723,14 @@ class _Tcgen05GroupRowColFused(_GroupRhtMainloop):
             rCol = cute.make_rmem_tensor((2 * EPI_UNROLL,), cutlass.Uint32)
             rColSF = cute.make_rmem_tensor((EPI_UNROLL,), cutlass.Float8E4M3FN)
 
+            col_state = None
+            if cutlass.const_expr(self.sr):
+                col_state = philox_prep(
+                    cutlass.Uint32(sr_rng_t[0]),
+                    cutlass.Uint32(sr_rng_t[1]),
+                    cutlass.Uint32(sr_rng_t[2]),
+                )
+
             acc_consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, ACC_STAGES
             )
@@ -735,6 +748,7 @@ class _Tcgen05GroupRowColFused(_GroupRhtMainloop):
                         g_end = offsets_t[g]
                         _, dec, enc_over_fp4max = _global_scale(col_amax_t[g])
                     h_global = tile_m * cutlass.Int32(M_TILE) + h_local
+                    tile_id = tile_n * tiles_in_h + tile_m
 
                     acc_pipeline.consumer_wait(acc_consumer_state)
                     for u in cutlass.range_constexpr(EPI_UNROLL):
@@ -746,16 +760,18 @@ class _Tcgen05GroupRowColFused(_GroupRhtMainloop):
                             tTR_rAcc,
                         )
                         vals = tTR_rAcc.load().reshape((16,))
-                        col_rng = None
+                        col_rb = None
                         if cutlass.const_expr(self.sr):
-                            col_rng = _sr_base(
-                                sr_rng,
-                                h_global,
-                                tile_n * cutlass.Int32(EPI_UNROLL) + cutlass.Int32(u),
-                                _SR_TAG_COL,
+                            # Triton's columnwise scaled tile is (hidden, tokens), so its
+                            # flat packed index is h_local * (128/2) + token_local/2.
+                            col_rb = philox4(
+                                col_state,
+                                tile_id * cutlass.Int32(TILE_PACKED)
+                                + h_local * cutlass.Int32(TOKEN_TILE // 2)
+                                + cutlass.Int32(u * 8),
                             )
                         w0, w1, sf = _quant16(
-                            vals, enc_over_fp4max, dec, self.sr, col_rng
+                            vals, enc_over_fp4max, dec, self.sr, col_rb, rht_acc=True
                         )
                         rCol[u * 2] = w0
                         rCol[u * 2 + 1] = w1
@@ -829,6 +845,13 @@ class _Tcgen05GroupRowColFused(_GroupRhtMainloop):
 
             blk = cute.make_rmem_tensor((16,), cutlass.Float32)
             rBlk = cute.make_rmem_tensor((16,), cutlass.BFloat16)
+            row_state = None
+            if cutlass.const_expr(self.sr):
+                row_state = philox_prep(
+                    cutlass.Uint32(sr_rng_t[4]),
+                    cutlass.Uint32(sr_rng_t[5]),
+                    cutlass.Uint32(sr_rng_t[6]),
+                )
             ab_consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, MAINLOOP_STAGES
             )
@@ -859,16 +882,19 @@ class _Tcgen05GroupRowColFused(_GroupRhtMainloop):
                         )
                         for j in cutlass.range_constexpr(16):
                             blk[j] = rBlk[j].to(cutlass.Float32)
-                        row_rng = None
+                        row_rb = None
                         if cutlass.const_expr(self.sr):
-                            row_rng = _sr_base(
-                                sr_rng,
-                                tile_n * cutlass.Int32(TOKEN_TILE) + tok,
-                                tile_m * cutlass.Int32(ROW_HB) + hb,
-                                _SR_TAG_ROW,
+                            # Triton's rowwise scaled tile is (tokens, hidden), so its
+                            # flat packed index is tok * (128/2) + hidden_local/2.
+                            row_rb = philox4(
+                                row_state,
+                                (tile_n * tiles_in_h + tile_m)
+                                * cutlass.Int32(TILE_PACKED)
+                                + tok * cutlass.Int32(M_TILE // 2)
+                                + hb * cutlass.Int32(8),
                             )
                         w0, w1, sf = _quant16(
-                            blk, r_enc_over_fp4max, r_dec, self.sr, row_rng
+                            blk, r_enc_over_fp4max, r_dec, self.sr, row_rb
                         )
                         gRow[(tok, hb * cutlass.Int32(2))] = w0
                         gRow[(tok, hb * cutlass.Int32(2) + cutlass.Int32(1))] = w1
@@ -948,6 +974,8 @@ def _compile_group_fused_kernel(device_idx: int, swizzle: bool, sr: bool):
     )
     fake_amax = make_fake_tensor(cutlass.Float32, (free(),), stride=(1,))
     fake_i32_1 = make_fake_tensor(cutlass.Int32, (1,), stride=(1,))
+    # (8,) Philox state: [col_seed_lo/hi, col_off_lo/hi, row_seed_lo/hi, row_off_lo/hi].
+    fake_sr_rng = make_fake_tensor(cutlass.Int32, (8,), stride=(1,))
     fake_offsets = make_fake_tensor(cutlass.Int32, (free(),), stride=(1,))
 
     return cute.compile(
@@ -960,7 +988,7 @@ def _compile_group_fused_kernel(device_idx: int, swizzle: bool, sr: bool):
         fake_row_sf,
         fake_amax,
         fake_amax,
-        fake_i32_1,
+        fake_sr_rng,
         fake_offsets,
         fake_i32_1,
         cutlass.Int32(0),
@@ -1006,7 +1034,10 @@ def _cutedsl_group_rht_quantize_row_col_impl(
     rht_nk = _get_rht_buffer(tuple(sign_vector), dev.index)
     sr_rng_t = _get_sr_rng_buffer(dev.index)
     if stochastic_rounding:
-        sr_rng_t.copy_((sr_rng.reshape(1).to(torch.int64) & 0x7FFFFFFF).to(torch.int32))
+        # [col_seed, col_offset, row_seed, row_offset] int64 -> the eight little-endian
+        # 32-bit halves Philox keys and counters are built from. One 32-byte D2D copy,
+        # so it stays graph-capturable and does no host RNG.
+        sr_rng_t.copy_(sr_rng[:4].view(torch.int32))
     if logical_packed_length is None:
         logical_packed_length = offsets[-1:]
     # The CuteDSL entry point requires byte_offset==0, and offsets[-1:] is a
@@ -1429,7 +1460,7 @@ class _Tcgen05GroupRhtAmax(_GroupRhtMainloop):
                         acc_pipeline.consumer_release(acc_consumer_state)
                     acc_consumer_state.advance()
 
-                    run_max = _max_f32(run_max, tile_max)
+                    run_max = _max_f32(run_max, _round_rht_amax(tile_max))
                 _flush_group_max(run_max, col_amax_t, g, lane)
 
                 clc_pipeline.consumer_wait(clc_consumer_state)
@@ -1598,24 +1629,11 @@ def _valid_tile_count(tile_n_base, n_all, tiles_in_n_valid):
     return cutlass.select_(rem < n_all, rem, n_all)
 
 
-# Stochastic-rounding stream tags. The two coordinate fields are mixed with
-# distinct odd multipliers rather than bit-packed: a shift-and-or packing aliases
-# once a field exceeds its shift width, which would hand whole block pairs the
-# same SR stream on real shapes.
-_SR_TAG_COL = 0x00C01000
-_SR_TAG_ROW = 0x00B00200
-_SR_MUL_A = 0x9E3779B1
-_SR_MUL_B = 0x85EBCA77
+# Packed bytes in one 128x128 triton tile: the stride between consecutive tile_id
+# values in triton's stochastic-rounding Philox counter (hadamard_utils._pack_fp4).
+TILE_PACKED = TOKEN_TILE * (M_TILE // 2)
 
 
-def _sr_base(sr_rng, coord_a, coord_b, tag):
-    """Per-(thread, block) stochastic-rounding seed, decorrelated across paths."""
-    return (
-        sr_rng
-        ^ (cutlass.Uint32(coord_a) * cutlass.Uint32(_SR_MUL_A))
-        ^ (cutlass.Uint32(coord_b) * cutlass.Uint32(_SR_MUL_B))
-        ^ cutlass.Uint32(tag)
-    )
 
 
 def _zero_sf():

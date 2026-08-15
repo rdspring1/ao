@@ -137,14 +137,184 @@ def _cvt_rs_satfinite_e2m1x4_f32_pack4(
 
 
 @dsl_user_op
-def _hash_u32(x: cutlass.Uint32, *, loc=None, ip=None) -> cutlass.Uint32:
-    """murmur3 32-bit finalizer: a well-mixed (seed, counter) -> uniform u32 for stochastic rounding."""
-    x = x ^ (x >> 16)
-    x = x * cutlass.Uint32(0x85EBCA6B)
-    x = x ^ (x >> 13)
-    x = x * cutlass.Uint32(0xC2B2AE35)
-    x = x ^ (x >> 16)
-    return x
+def _cvt_rn_bf16x2_f32(
+    hi: cutlass.Float32, lo: cutlass.Float32, *, loc=None, ip=None
+) -> cutlass.Uint32:
+    """Round two f32 to bfloat16 in one instruction, packed as ``{hi, lo}``."""
+    return cutlass.Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [hi.ir_value(loc=loc, ip=ip), lo.ir_value(loc=loc, ip=ip)],
+            "cvt.rn.bf16x2.f32 $0, $1, $2;",
+            "=r,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def _rcp_approx_f32(a: cutlass.Float32, *, loc=None, ip=None) -> cutlass.Float32:
+    """Fast approximate reciprocal via PTX rcp.approx.f32.
+
+    Used for the per-block encode scale, where the triton kernels emit the same
+    instruction. Correctly-rounded division there would cost ~27% on the grouped
+    quantize and ~11% on triton, for a reciprocal that has always been approximate
+    (triton's plain ``/`` lowers to the ~2 ulp ``div.full.f32``).
+    """
+    return cutlass.Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [a.ir_value(loc=loc, ip=ip)],
+            "rcp.approx.f32 $0, $1;",
+            "=f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def _u32_as_f32(x: cutlass.Uint32, *, loc=None, ip=None) -> cutlass.Float32:
+    """Reinterpret 32 bits as f32 (PTX registers are untyped, so this is free)."""
+    return cutlass.Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [x.ir_value(loc=loc, ip=ip)],
+            "mov.b32 $0, $1;",
+            "=f,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def _mulhi_u32(a: cutlass.Uint32, b: cutlass.Uint32, *, loc=None, ip=None):
+    """High 32 bits of a 32x32 unsigned multiply (triton's math.umulhi)."""
+    return cutlass.Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [a.ir_value(loc=loc, ip=ip), b.ir_value(loc=loc, ip=ip)],
+            "mul.hi.u32 $0, $1, $2;",
+            "=r,r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+# Philox-4x32-10, byte-identical to triton.language.random (PHILOX_KEY_A/B,
+# PHILOX_ROUND_A/B, 10 rounds). The triton kernels draw their stochastic-rounding bits
+# from tl.randint, so reproducing this exactly is what makes cvt.rs agree across the
+# two backends.
+PHILOX_ROUNDS = 10
+_PHILOX_KEY_A, _PHILOX_KEY_B = 0x9E3779B9, 0xBB67AE85
+_PHILOX_ROUND_A, _PHILOX_ROUND_B = 0xD2511F53, 0xCD9E8D57
+
+# hadamard_quantize_row_col_triton passes GROUP_SIZE_N=8 to _compute_pid, and runs a
+# 128x128 tile (its larger autotune configs exhaust SM100 tensor/shared memory and are
+# pruned). One tile holds BLOCK_M * BLOCK_N / 2 packed bytes, the stride between tile_id
+# values in its stochastic-rounding Philox counter.
+_GROUP_SIZE_N = 8
+TRITON_TILE_PACKED = 128 * (128 // 2)
+
+
+def philox_prep(seed_lo, seed_hi, offset_base):
+    """Hoist every launch-uniform part of Philox out of the epilogues.
+
+    ``tl.randint`` enters with ``c2 = c3 = 0``, so round 1 leaves ``c1 = 0`` and makes
+    ``c2``/``c3`` functions of ``c0`` alone -- and ``c0`` is the low half of the offset,
+    i.e. the launch-uniform ``offset_base``. Only ``c0' = c1 ^ k0`` carries the
+    per-element counter, and round 2's ``c0``/``c1`` are still counter-independent. The
+    key schedule depends only on the round index, so all ten steps precompute too.
+
+    Returns the opaque state ``philox_c0`` consumes. Building it once per kernel keeps
+    the per-element cost at eight full rounds plus a two-instruction round-2 tail.
+    """
+    sched = [
+        (
+            seed_lo + cutlass.Uint32((r * _PHILOX_KEY_A) & 0xFFFFFFFF),
+            seed_hi + cutlass.Uint32((r * _PHILOX_KEY_B) & 0xFFFFFFFF),
+        )
+        for r in range(PHILOX_ROUNDS)
+    ]
+    A, B = cutlass.Uint32(_PHILOX_ROUND_A), cutlass.Uint32(_PHILOX_ROUND_B)
+    c2_r1 = _mulhi_u32(A, offset_base) ^ sched[0][1]
+    c3_r1 = A * offset_base
+    c0_r2 = _mulhi_u32(B, c2_r1) ^ sched[1][0]
+    c1_r2 = B * c2_r1
+    return sched, c0_r2, c1_r2, c3_r1
+
+
+def philox4(state, packed_base):
+    """The four random words a 16-element chunk needs, in triton's counter order.
+
+    Triton draws one word per packed byte but its ``cvt.rs`` asm consumes only two of
+    every four (``$9``/``$10`` of a ``pack=4`` group), so a chunk starting at packed
+    index ``p0`` uses ``p0, p0+1, p0+4, p0+5`` -- not four consecutive counters.
+    Matching that stride is what makes the FP4 codes agree; it also means these kernels
+    issue half the Philox calls triton does.
+    """
+    return tuple(
+        philox_c0(cutlass.Uint32(packed_base + cutlass.Int32(d)), state)
+        for d in (0, 1, 4, 5)
+    )
+
+
+def triton_tile_id(pid_hidden, pid_token, num_pid_n, num_pid_m):
+    """Invert ``hadamard_utils._compute_pid``: the flat tile index triton would use.
+
+    The linear triton kernel is persistent and feeds its Philox counter the *flat*
+    ``tile_id``, not the (pid_m, pid_n) pair, so reproducing its stochastic-rounding
+    stream means undoing the GROUP_SIZE_N=8 L2 swizzle.
+
+    Forward, with ``base = group_id * num_pid_in_group`` and ``q = tile_id - base``:
+    ``pid_m = q // group_size_n`` but ``pid_n - first = (base + q) % group_size_n``, i.e.
+    the column index is taken modulo the *global* tile id. So ``q = pid_m * group_size_n
+    + (r - base) mod group_size_n``, and the ``base`` term only vanishes when
+    ``group_size_n`` divides it -- always true for a full 8-wide group, not for a short
+    trailing one (num_pid_n = 11, num_pid_m = 2 is the smallest counterexample).
+    """
+    group_id = pid_hidden // cutlass.Int32(_GROUP_SIZE_N)
+    first_pid_n = group_id * cutlass.Int32(_GROUP_SIZE_N)
+    rem = num_pid_n - first_pid_n
+    group_size_n = cutlass.select_(
+        rem < cutlass.Int32(_GROUP_SIZE_N), rem, cutlass.Int32(_GROUP_SIZE_N)
+    )
+    base = group_id * (cutlass.Int32(_GROUP_SIZE_N) * num_pid_m)
+    # (r - base) mod group_size_n, kept non-negative so the sign of % never matters.
+    r = pid_hidden - first_pid_n
+    s = (r + group_size_n - base % group_size_n) % group_size_n
+    return base + pid_token * group_size_n + s
+
+
+def philox_c0(counter, state):
+    """``tl.randint(seed, (counter << 32) | offset_base)``, given ``philox_prep`` state.
+
+    Rounds 3-10 run in full; the last drops ``c1``/``c3``, which only feed rounds that
+    no longer exist.
+    """
+    sched, c0_r2, c1_r2, c3_r1 = state
+    A, B = cutlass.Uint32(_PHILOX_ROUND_A), cutlass.Uint32(_PHILOX_ROUND_B)
+    # Round 1 (c2 = c3 = 0): c0' = c1 ^ k0 is the only counter-dependent output.
+    c0_r1 = counter ^ sched[0][0]
+    # Round 2: c0/c1 are precomputed; c2/c3 carry the counter (c1_r1 == 0).
+    c0, c1 = c0_r2, c1_r2
+    c2 = _mulhi_u32(A, c0_r1) ^ c3_r1 ^ sched[1][1]
+    c3 = A * c0_r1
+    for r in range(2, PHILOX_ROUNDS):
+        _c0, _c2 = c0, c2
+        c0 = _mulhi_u32(B, _c2) ^ c1 ^ sched[r][0]
+        if r < PHILOX_ROUNDS - 1:
+            c2 = _mulhi_u32(A, _c0) ^ c3 ^ sched[r][1]
+            c1 = B * _c2
+            c3 = A * _c0
+    return c0
 
 
 @dsl_user_op
@@ -157,25 +327,6 @@ def _min_f32(
             [a.ir_value(loc=loc, ip=ip), b.ir_value(loc=loc, ip=ip)],
             "min.f32 $0, $1, $2;",
             "=f,f,f",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
-    )
-
-
-@dsl_user_op
-def _rcp_approx_f32(a: cutlass.Float32, *, loc=None, ip=None) -> cutlass.Float32:
-    """Fast approximate reciprocal via PTX rcp.approx.f32.
-
-    Less precise than 1.0/x but acceptable for FP4 quantization scale factors.
-    """
-    return cutlass.Float32(
-        llvm.inline_asm(
-            T.f32(),
-            [a.ir_value(loc=loc, ip=ip)],
-            "rcp.approx.f32 $0, $1;",
-            "=f,f",
             has_side_effects=False,
             is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,
@@ -350,14 +501,15 @@ def _set_supertile_geometry(kernel_obj, col_groups_per_supertile: int):
     kernel_obj.row_threads_w = 32 * n_row_warps
 
 
-def _pack16(q, sr: cutlass.Constexpr, rng_base):
+def _pack16(q, sr: cutlass.Constexpr, rb):
     """Pack 16 scaled f32 -> (w0, w1) packed-FP4 u32. RTNE, or stochastic rounding (hardware
-    cvt.rs) when sr, with four decorrelated random words derived from rng_base via _hash_u32."""
+    cvt.rs) when sr, consuming the four random words in ``rb``.
+
+    ``rb`` covers the elements in groups of four -- rb[0] for q[0:4], rb[1] for q[4:8],
+    and so on -- which is the grouping triton's cvt.rs asm uses, so the caller only has
+    to hand over the same Philox draws triton would have made."""
     if cutlass.const_expr(sr):
-        rb0 = _hash_u32(rng_base)
-        rb1 = _hash_u32(rng_base ^ cutlass.Uint32(0x9E3779B9))
-        rb2 = _hash_u32(rng_base ^ cutlass.Uint32(0x7F4A7C15))
-        rb3 = _hash_u32(rng_base ^ cutlass.Uint32(0xBB67AE85))
+        rb0, rb1, rb2, rb3 = rb
         w0 = _cvt_rs_satfinite_e2m1x4_f32_pack4(
             q[0], q[2], q[4], q[6], q[1], q[3], q[5], q[7], rb0, rb1
         )
@@ -372,6 +524,24 @@ def _pack16(q, sr: cutlass.Constexpr, rng_base):
             q[8], q[10], q[12], q[14], q[9], q[11], q[13], q[15]
         )
     return w0, w1
+
+
+def _round_rht_amax(amax):
+    """``max|bf16(v)|`` from ``max|v|``: one rounding for a whole reduction.
+
+    The Triton kernels truncate ``tl.dot``'s fp32 accumulator with ``.to(tl.bfloat16)``
+    before both the amax and the quantize, matching TransformerEngine, whose RHT output
+    is a bf16 tensor. The tcgen05 UMMA accumulator is fp32 and lives in TMEM, so
+    consuming it raw would make every columnwise scale and code disagree with Triton.
+
+    Rounding is only observable through two consumers -- the amax and the scaled value --
+    so neither needs a rounded copy of the input. Round-to-nearest-even is monotonic in
+    magnitude, so rounding an amax once equals rounding all 16 inputs and then reducing
+    (NaN survives either order); the scaled values round pairwise inside the multiply
+    loop (``rht_acc`` in ``_quant16_from_amax``). Materializing a rounded 16-value copy
+    instead cost 29% on the grouped quantize.
+    """
+    return cutlass.Float32(cutlass.BFloat16(amax))
 
 
 def _abs_amax16(vals):
@@ -393,10 +563,21 @@ def _group16_amax(amax):
 
 
 def _quant16_from_amax(
-    vals, amax, enc_over_fp4max, dec, sr: cutlass.Constexpr = False, rng_base=None
+    vals,
+    amax,
+    enc_over_fp4max,
+    dec,
+    sr: cutlass.Constexpr = False,
+    rb=None,
+    rht_acc: cutlass.Constexpr = False,
 ):
     """Quantize 16 f32 values to NVFP4 (w0,w1 packed u32, pvscale_fp8) using a given block amax
-    (1x16 or a shared 16x16 amax). sr selects stochastic rounding over RTNE."""
+    (1x16 or a shared 16x16 amax). sr selects stochastic rounding over RTNE.
+
+    ``rht_acc`` marks ``vals`` as a raw tcgen05 RHT accumulator, which triton would have
+    truncated to bfloat16 first: each pair is rounded with one ``cvt.rn.bf16x2.f32``
+    inside the multiply loop, widening back by a shift or a mask. The caller is
+    responsible for having rounded ``amax`` (see ``_round_rht_amax``)."""
     # Cap at FP8_E4M3_MAX only, with no lower clamp: TE emits a zero per-vector scale for an
     # all-zero vector and when a nonzero scale underflows in E4M3, so imposing a nonzero floor
     # would diverge from the TE ground truth (mirrors the triton _nvfp4_quantize). A zero
@@ -412,19 +593,41 @@ def _quant16_from_amax(
     pv_back = cute.make_rmem_tensor((4,), cutlass.Float32)
     pv_back.store(pv_f8.load().to(cutlass.Float32))
     denom = pv_back[0] * dec
+    # rcp.approx.f32 on both backends: the triton kernels emit the same instruction, so
+    # the FP4 codes agree byte for byte. See _rcp_approx_f32 for why not div.rn.
     enc = _min_f32(_rcp_approx_f32(denom), cutlass.Float32(FP32_MAX))
     q = cute.make_rmem_tensor((16,), cutlass.Float32)
-    for i in range(16):
-        q[i] = _min_xorsign_abs_f32(vals[i] * enc, cutlass.Float32(FP4_E2M1_MAX))
-    w0, w1 = _pack16(q, sr, rng_base)
+    fp4_max = cutlass.Float32(FP4_E2M1_MAX)
+    if cutlass.const_expr(rht_acc):
+        for i in range(0, 16, 2):
+            packed = _cvt_rn_bf16x2_f32(vals[i + 1], vals[i])
+            lo = _u32_as_f32(packed << cutlass.Uint32(16))
+            hi = _u32_as_f32(packed & cutlass.Uint32(0xFFFF0000))
+            q[i] = _min_xorsign_abs_f32(lo * enc, fp4_max)
+            q[i + 1] = _min_xorsign_abs_f32(hi * enc, fp4_max)
+    else:
+        for i in range(16):
+            q[i] = _min_xorsign_abs_f32(vals[i] * enc, fp4_max)
+    w0, w1 = _pack16(q, sr, rb)
     return w0, w1, pvscale_fp8
 
 
-def _quant16(vals, enc_over_fp4max, dec, sr: cutlass.Constexpr = False, rng_base=None):
-    """1x16 NVFP4 quantize -> (w0,w1 packed u32, pvscale_fp8). vals: 16-elem f32 rmem."""
-    return _quant16_from_amax(
-        vals, _abs_amax16(vals), enc_over_fp4max, dec, sr, rng_base
-    )
+def _quant16(
+    vals,
+    enc_over_fp4max,
+    dec,
+    sr: cutlass.Constexpr = False,
+    rb=None,
+    rht_acc: cutlass.Constexpr = False,
+):
+    """1x16 NVFP4 quantize -> (w0,w1 packed u32, pvscale_fp8). vals: 16-elem f32 rmem.
+
+    ``rht_acc=True`` for a raw RHT accumulator: the block amax rounds once (monotonic),
+    the values round pairwise in the multiply loop."""
+    amax = _abs_amax16(vals)
+    if cutlass.const_expr(rht_acc):
+        amax = _round_rht_amax(amax)
+    return _quant16_from_amax(vals, amax, enc_over_fp4max, dec, sr, rb, rht_acc)
 
 
 class _Tcgen05RowColFused:
@@ -922,11 +1125,29 @@ class _Tcgen05RowColFused:
         # untyped and gains a type inside it.
         _, g_dec, enc_over_fp4max = _global_scale(global_amax_t[0])  # col (RHT)
         _, r_dec, r_enc_over_fp4max = _global_scale(row_amax_t[0])  # row (plain)
-        sr_rng = cutlass.Uint32(0)
+        col_state, row_state = None, None
         if cutlass.const_expr(self.sr):
-            sr_rng = cutlass.Uint32(
-                sr_rng_t[0]
-            )  # per-call stochastic-rounding RNG base
+            col_state = philox_prep(
+                cutlass.Uint32(sr_rng_t[0]),
+                cutlass.Uint32(sr_rng_t[1]),
+                cutlass.Uint32(sr_rng_t[2]),
+            )
+            row_state = philox_prep(
+                cutlass.Uint32(sr_rng_t[4]),
+                cutlass.Uint32(sr_rng_t[5]),
+                cutlass.Uint32(sr_rng_t[6]),
+            )
+        # Triton tile geometry for the stochastic-rounding counter. The linear triton
+        # kernel autotunes BLOCK_M/BLOCK_N over {128,256}^2, but every config above
+        # 128x128 exhausts SM100 tensor or shared memory and is pruned at runtime, so
+        # 128x128 is what actually runs; the SR tests pin it to make that explicit.
+        # Counters are derived from global (token, hidden) coordinates rather than this
+        # kernel's supertile, so the 256-row supertile spanning two triton token tiles
+        # costs nothing. col_tiles_per_expert is num_tiles_m (N // M_TILE), the
+        # hidden-tile count -- its grouped name is moot here, since sr and grouped are
+        # never compiled together.
+        tri_tiles_tok = num_tiles_ns * cutlass.Int32(self.kw // M_TILE)
+        tri_tiles_hid = col_tiles_per_expert
 
         pipeline_init_wait(cluster_shape_mn=cluster_layout_vmnk)
 
@@ -1024,31 +1245,31 @@ class _Tcgen05RowColFused:
                         blk[j] = sA_clean[
                             ((m_mma % 64, m_mma // 64), (kc, kd), (0, stage))
                         ].to(cutlass.Float32)
-                    row_rng = None
+                    row_rb = None
                     if cutlass.const_expr(self.sr):
-                        # row-stream RNG seed for this (global M-row, SF-col block); 0x00B0.. tags row.
-                        # The two fields are mixed multiplicatively rather than bit-packed: the SF-col
-                        # block index runs to N/16, so a (row << 8) ^ blk packing aliases as soon as
-                        # N > 4096 -- seed(r, 256+j) == seed(r^1, j) -- handing whole block pairs the
-                        # same SR stream on real shapes (N=14336/28672). Distinct odd multipliers
-                        # scatter each field across all 32 bits instead.
-                        row_rng = (
-                            sr_rng
-                            ^ (cutlass.Uint32(m0 + k_row) * cutlass.Uint32(0x9E3779B1))
-                            ^ (
-                                cutlass.Uint32(
-                                    pid_m * cutlass.Int32(M_TILE // 16)
-                                    + cutlass.Int32(b)
-                                )
-                                * cutlass.Uint32(0x85EBCA77)
+                        # This thread owns supertile row k_row, i.e. triton token tile
+                        # pid_ns*(kw/128) + k_row//128 at local token k_row%128. Its
+                        # rowwise tile is (tokens, hidden), so the flat packed index is
+                        # token_local * (128/2) + hidden_local/2.
+                        row_rb = philox4(
+                            row_state,
+                            triton_tile_id(
+                                pid_m,
+                                pid_ns * cutlass.Int32(self.kw // M_TILE)
+                                + k_row // cutlass.Int32(M_TILE),
+                                tri_tiles_hid,
+                                tri_tiles_tok,
                             )
-                            ^ cutlass.Uint32(0x00B00200)
+                            * cutlass.Int32(TRITON_TILE_PACKED)
+                            + (k_row % cutlass.Int32(M_TILE))
+                            * cutlass.Int32(M_TILE // 2)
+                            + cutlass.Int32(b * 8),
                         )
                     amax = _abs_amax16(blk)
                     if cutlass.const_expr(not self.apply_rht):
                         amax = _group16_amax(amax)
                     w0, w1, sf = _quant16_from_amax(
-                        blk, amax, r_enc_over_fp4max, r_dec, self.sr, row_rng
+                        blk, amax, r_enc_over_fp4max, r_dec, self.sr, row_rb
                     )
                     sRowFP4[k_row, b * 2, buf] = w0
                     sRowFP4[k_row, b * 2 + 1, buf] = w1
@@ -1163,19 +1384,27 @@ class _Tcgen05RowColFused:
                         tTR_rAcc,
                     )
                     vals = tTR_rAcc.load().reshape((16,))
-                    col_rng = None
+                    col_rb = None
                     if cutlass.const_expr(self.sr):
-                        col_rng = (
-                            sr_rng
-                            ^ (
-                                cutlass.Uint32(pid_m * cutlass.Int32(M_TILE) + tidx)
-                                << cutlass.Uint32(8)
+                        # This thread's 16 tokens start at supertile offset u*16, so they
+                        # sit in triton token tile pid_ns*(kw/128) + u//8 at local token
+                        # (u%8)*16. Its columnwise tile is (hidden, tokens), so the flat
+                        # packed index is hidden_local * (128/2) + token_local/2.
+                        col_rb = philox4(
+                            col_state,
+                            triton_tile_id(
+                                pid_m,
+                                pid_ns * cutlass.Int32(self.kw // M_TILE)
+                                + cutlass.Int32(u // (M_TILE // 16)),
+                                tri_tiles_hid,
+                                tri_tiles_tok,
                             )
-                            ^ cutlass.Uint32(u)
-                            ^ cutlass.Uint32(0x00C01000)
+                            * cutlass.Int32(TRITON_TILE_PACKED)
+                            + tidx * cutlass.Int32(M_TILE // 2)
+                            + cutlass.Int32((u % (M_TILE // 16)) * 8),
                         )
                     w0, w1, pvscale_fp8 = _quant16(
-                        vals, enc_over_fp4max, g_dec, self.sr, col_rng
+                        vals, enc_over_fp4max, g_dec, self.sr, col_rb, rht_acc=True
                     )
 
                     sFP4[tidx, u * 2] = w0
@@ -1278,20 +1507,10 @@ class _Tcgen05RowColFused:
                         blk[i] = sA_clean[
                             ((nrow % 64, nrow // 64), (mpos % 8, mpos // 8), (0, stage))
                         ].to(cutlass.Float32)
-                    col_rng = None
-                    if cutlass.const_expr(self.sr):
-                        col_rng = (
-                            sr_rng
-                            ^ (
-                                cutlass.Uint32(pid_m * cutlass.Int32(M_TILE) + nrow)
-                                << cutlass.Uint32(8)
-                            )
-                            ^ cutlass.Uint32(u)
-                            ^ cutlass.Uint32(0x00C01000)
-                        )
                     amax = _group16_amax(_abs_amax16(blk))
+                    # Weight mode is RTNE only (asserted at compile), so no SR draw here.
                     w0, w1, sf = _quant16_from_amax(
-                        blk, amax, enc_over_fp4max, g_dec, self.sr, col_rng
+                        blk, amax, enc_over_fp4max, g_dec, False, None
                     )
                     sFP4[nrow, u * 2] = w0
                     sFP4[nrow, u * 2 + 1] = w1
@@ -1724,6 +1943,8 @@ class _Tcgen05RhtAmax:
                     acc_pipeline.consumer_release(acc_consumer_state)
                 acc_consumer_state.advance()
 
+            # One bf16 rounding for the whole reduction; see _round_rht_amax.
+            thread_col_max = _round_rht_amax(thread_col_max)
             for offset in [16, 8, 4, 2, 1]:
                 thread_col_max = _max_f32(
                     thread_col_max, cute.arch.shuffle_sync_bfly(thread_col_max, offset)
@@ -1770,16 +1991,20 @@ def _get_identity_buffer(device_idx):
 
 @functools.lru_cache(maxsize=None)
 def _get_sr_rng_buffer(device_idx):
-    """Persistent (1,) int32 stochastic-rounding RNG-base buffer, cached per device.
+    """Persistent (8,) int32 stochastic-rounding Philox state buffer, cached per device.
 
-    The fused kernel reads its SR seed from this *stable* address. A fresh per-call tensor would be
+    Holds the caller's ``[col_seed, col_offset, row_seed, row_offset]`` int64s viewed as
+    little-endian 32-bit halves, which is the form Philox keys and counters take:
+    ``[col_seed_lo, col_seed_hi, col_off_lo, col_off_hi, row_seed_lo, ...]``.
+
+    The fused kernel reads its SR state from this *stable* address. A fresh per-call tensor would be
     an untracked live allocation in the CUDA-graph pool (``torch.compile(mode="reduce-overhead")``)
     AND a correctness hazard — the captured kernel would read a recycled address on replay. The SR
-    path copies the per-call ``(seed ^ offset)`` value in (the copy is captured, so each graph
-    replay re-reads the freshly-advanced offset); the RTNE path never reads it (the kernel guards
-    the read behind ``const_expr(sr)``), so its value is irrelevant there.
+    path copies the per-call state in (the copy is captured, so each graph replay re-reads the
+    freshly-advanced offset); the RTNE path never reads it (the kernel guards the read behind
+    ``const_expr(sr)``), so its value is irrelevant there.
     """
-    return torch.zeros(1, dtype=torch.int32, device=torch.device("cuda", device_idx))
+    return torch.zeros(8, dtype=torch.int32, device=torch.device("cuda", device_idx))
 
 
 @functools.lru_cache(maxsize=None)
@@ -1897,8 +2122,10 @@ def _compile_fused_kernel(
     Not keyed on the sign vector / RNG (runtime launch buffers).
     """
     # The grouped variant is only reachable from the weight quantize: apply_rht would need a
-    # per-expert B operand, and sr's columnwise seed (pid_m, nrow) aliases across experts.
-    assert not (grouped and (apply_rht or sr))
+    # per-expert B operand. Weight mode itself is RTNE only -- the 2D wrappers never expose
+    # stochastic rounding -- so its columnwise epilogue takes no SR draw.
+    assert not (grouped and apply_rht)
+    assert not (sr and not apply_rht), "weight mode (apply_rht=False) is RTNE only"
     # M % 256 or M % 128
     m_sym = cute.sym_int(divisibility=N_TILE * col_groups_per_supertile)
     n_sym = cute.sym_int(divisibility=M_TILE)  # N % 128
@@ -1960,7 +2187,8 @@ def _compile_fused_kernel(
     fake_amax = make_fake_tensor(
         cutlass.Float32, (free() if grouped else 1,), stride=(1,)
     )
-    fake_sr_rng = make_fake_tensor(cutlass.Int32, (1,), stride=(1,))
+    # (8,) Philox state: [col_seed_lo/hi, col_off_lo/hi, row_seed_lo/hi, row_off_lo/hi].
+    fake_sr_rng = make_fake_tensor(cutlass.Int32, (8,), stride=(1,))
     k = _Tcgen05RowColFused(
         swizzle_sf=swizzle,
         sr=sr,
@@ -2022,9 +2250,9 @@ def _cutedsl_rht_quantize_row_col_impl(
         sign_vector: RHT sign vector as a list of ints.
         stochastic_rounding: if True, both quant paths round via the Blackwell ``cvt.rs`` HW
             stochastic-rounding cvt seeded by ``sr_rng``. False -> RTNE (default).
-        sr_rng: int RNG base tensor (1-elem) required when ``stochastic_rounding=True``. The kernel
-            decorrelates col vs row and per-block internally, so a single base suffices; the caller
-            mixes a fixed seed with a fresh per-call offset for CUDA-graph-replay advancement.
+        sr_rng: (4,) int64 ``[col_seed, col_offset, row_seed, row_offset]`` Philox state,
+            required when ``stochastic_rounding=True``. The offsets are fresh per call so
+            CUDA-graph replays advance the stream. Same state the Triton op takes.
         swizzle_scale_factors: cutlass NVFP4 swizzled SF (default, GEMM-ready). False -> plain
             (N,M//16)/(M,N//16) SF, which uses a slower strided row-SF store.
         compute_rowwise: return the rowwise output (default). False -> row_fp4/row_sf returned as
@@ -2075,12 +2303,12 @@ def _cutedsl_rht_quantize_row_col_impl(
     if sr:
         if sr_rng is None:
             raise ValueError(
-                "stochastic_rounding=True requires sr_rng (RNG base tensor)"
+                "stochastic_rounding=True requires sr_rng (Philox state tensor)"
             )
-        # Single non-negative int32 device scalar; the kernel decorrelates col vs row + per-block
-        # internally via XOR tags, so one base value suffices. Written in-place (captured by the
-        # graph) so each replay re-reads the freshly-advanced offset.
-        sr_rng_t.copy_((sr_rng.reshape(1).to(torch.int64) & 0x7FFFFFFF).to(torch.int32))
+        # [col_seed, col_offset, row_seed, row_offset] int64 -> the eight little-endian
+        # 32-bit halves Philox keys and counters are built from. Written in-place
+        # (captured by the graph) so each replay re-reads the freshly-advanced offset.
+        sr_rng_t.copy_(sr_rng[:4].view(torch.int32))
 
     col_fp4 = torch.empty((N, M // 8), dtype=torch.uint32, device=dev)
     row_fp4 = torch.empty((M, N // 8), dtype=torch.uint32, device=dev)

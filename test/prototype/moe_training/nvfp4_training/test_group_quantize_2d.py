@@ -151,7 +151,14 @@ def test_group_quantize_2d_uses_each_experts_own_amax(kernel):
 @pytest.mark.parametrize("kernel", _KERNELS)
 @torch.no_grad()
 def test_group_quantize_2d_matches_torch_oracle(kernel):
-    """Rowwise codes and scales match nvfp4_quantize on aligned 16x16 blocks."""
+    """Rowwise codes and scales match nvfp4_quantize on aligned 16x16 blocks.
+
+    Scales are compared to within one E4M3 step, not bitwise: mx_formats' nvfp4_quantize
+    multiplies by a reciprocal and applies an E4M3_EPS floor, where both kernels follow
+    TE's correctly-rounded div_rn with no floor. The two are mathematically equal and can
+    land on adjacent representable values. ``test_cutedsl_group_quantize_2d_matches_triton``
+    is what pins the backends to each other bitwise.
+    """
     torch.manual_seed(42)
     E, M, N = 2, 256, 256
     weights = torch.randn(
@@ -165,16 +172,11 @@ def test_group_quantize_2d_matches_torch_oracle(kernel):
     )
 
     for expert in range(E):
-        if kernel == "triton":
-            torch.testing.assert_close(
-                actual_scales[expert], expected_scales[expert], atol=0, rtol=0
-            )
-        else:
-            _assert_scales_match_up_to_rounding_ties(
-                actual_scales[expert],
-                expected_scales[expert],
-                f"expert {expert} rowwise SF vs oracle",
-            )
+        _assert_scales_match_up_to_rounding_ties(
+            actual_scales[expert],
+            expected_scales[expert],
+            f"expert {expert} rowwise SF vs mx_formats oracle",
+        )
         actual_unpacked = torch.stack(
             (actual_codes[expert] & 0xF, actual_codes[expert] >> 4), dim=-1
         )
@@ -195,21 +197,16 @@ def test_group_quantize_2d_matches_torch_oracle(kernel):
 @_skip_no_cutedsl
 @torch.no_grad()
 def test_cutedsl_group_quantize_2d_matches_triton():
-    """Both backends emit the same per-expert 16x16 scale factors, modulo FP8 rounding ties."""
+    """The two backends are byte-for-byte interchangeable, codes as well as scales."""
     torch.manual_seed(3)
     E, M, N = 3, 256, 512
     weights = torch.randn((E, M, N), dtype=torch.bfloat16, device="cuda")
     global_amax = weights.float().abs().amax(dim=(1, 2))
 
-    _, c_sfa, _, c_sfa_t = _group_quantize("cutedsl", weights, global_amax, E)
-    _, t_sfa, _, t_sfa_t = _group_quantize("triton", weights, global_amax, E)
-    for expert in range(E):
-        _assert_scales_match_up_to_rounding_ties(
-            c_sfa[expert], t_sfa[expert], f"expert {expert} rowwise SF vs Triton"
-        )
-        _assert_scales_match_up_to_rounding_ties(
-            c_sfa_t[expert], t_sfa_t[expert], f"expert {expert} colwise SF vs Triton"
-        )
+    cutedsl = _group_quantize("cutedsl", weights, global_amax, E)
+    triton_out = _group_quantize("triton", weights, global_amax, E)
+    for name, c, t in zip(("q", "sf", "qt", "sft"), cutedsl, triton_out):
+        assert torch.equal(c, t), f"{name} differs between backends"
 
 
 @requires_grouped_kernel

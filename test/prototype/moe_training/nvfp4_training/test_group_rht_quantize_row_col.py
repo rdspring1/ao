@@ -569,6 +569,45 @@ def test_group_rht_stochastic_rounding_launches(graph_case, kernel):
     assert torch.isfinite(sfd.float()).all()
 
 
+@_maybe_sm100
+@_skip_no_cutedsl
+@pytest.mark.parametrize("stochastic_rounding", [False, True], ids=["rtne", "rs"])
+@torch.no_grad()
+def test_cutedsl_group_quantize_matches_triton_bitwise(
+    graph_case, stochastic_rounding
+):
+    """The two grouped backends are byte-for-byte interchangeable, RTNE and SR alike.
+
+    SR included: the CuteDSL kernel draws the same Philox words triton does, from the
+    same caller-owned ``[col_seed, col_offset, row_seed, row_offset]`` state, at the
+    counters triton's ``cvt.rs`` actually consumes.
+    """
+    spec, A, B, offsets, amax_row, amax_col, _, _ = graph_case
+    psl, hs = A.shape
+    num_groups = len(spec.groups)
+    _skip_if_unsupported_groups("cutedsl", num_groups)
+
+    args = (
+        A,
+        list(_HARDCODED_SIGN_VECTOR),
+        offsets,
+        num_groups,
+        psl,
+        hs,
+        spec.shape_rep,
+        amax_row,
+        amax_col,
+        _make_rng_state(A.device, (0x5EED, 0x0FF5, 0xBEEF, 0xCAFE))
+        if stochastic_rounding
+        else None,
+        stochastic_rounding,
+    )
+    cutedsl = _group_quantize("cutedsl", *args)
+    triton_out = _group_quantize("triton", *args)
+    for name, c, t in zip(("qa", "sfa", "qd", "sfd"), cutedsl, triton_out):
+        assert torch.equal(c, t), f"{name} differs between backends"
+
+
 def _run_sr(graph_case, rng_state, kernel="triton"):
     spec, A, B, offsets, amax_row, amax_col, _, _ = graph_case
     psl, hs = A.shape

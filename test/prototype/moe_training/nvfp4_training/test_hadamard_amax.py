@@ -111,9 +111,10 @@ def test_get_rht_matrix_with_generated_sign_matches_sampled_signs():
 def test_rht_amax_vs_reference(kernel, M, N):
     """col_amax = max|RHT(A.t())| (post-Hadamard), row_amax = max|A| (plain).
 
-    triton reduces the RHT output in bfloat16, so it must match the bf16-rounded
-    reference bitwise; CuteDSL reduces in float32, so it matches the float32 reference
-    only to a small tolerance. The plain amax is exact for both.
+    Both backends round the RHT result to bfloat16 before reducing -- triton via
+    ``.to(tl.bfloat16)`` on the ``tl.dot`` accumulator, CuteDSL via the same rounding on
+    the tcgen05 TMEM accumulator -- which is what TransformerEngine does, so both must
+    match the bf16-rounded reference bitwise. The plain amax is exact for both.
     """
     _skip_if_unsupported_shape(kernel, M, N)
     torch.manual_seed(42)
@@ -121,20 +122,15 @@ def test_rht_amax_vs_reference(kernel, M, N):
 
     get_rht_matrix.cache_clear()
     B = get_rht_matrix(_HARDCODED_SIGN_VECTOR, "cuda", torch.bfloat16, 16)
-    if kernel == "triton":
-        ref_col_amax = (
-            (A.t().reshape(N * M // 16, 16) @ B).to(torch.bfloat16).abs().max().float()
-        )
-        col_tol = {"atol": 0, "rtol": 0}
-    else:
-        ref_col_amax = (A.t().reshape(N * M // 16, 16).float() @ B.float()).abs().max()
-        col_tol = {"atol": 2e-3, "rtol": 2e-3}
+    ref_col_amax = (
+        (A.t().reshape(N * M // 16, 16) @ B).to(torch.bfloat16).abs().max().float()
+    )
     ref_row_amax = A.abs().max().float()
 
     get_rht_matrix.cache_clear()
 
     col_amax, row_amax = _rht_amax(kernel, A, _HARDCODED_SIGN_VECTOR)
-    torch.testing.assert_close(col_amax, ref_col_amax, **col_tol)
+    torch.testing.assert_close(col_amax, ref_col_amax, atol=0, rtol=0)
     torch.testing.assert_close(row_amax, ref_row_amax, atol=0, rtol=0)
 
 
