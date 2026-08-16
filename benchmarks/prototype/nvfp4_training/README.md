@@ -329,6 +329,50 @@ the 128-row CuteDSL supertile. That path runs near Triton parity rather than the
 1.2x the 256-row shapes get: the no-MMA weight path has no per-supertile pipeline for
 the shorter height to amortize.
 
+### CuteDSL comparison vs TransformerEngine
+
+Fresh baseline from 2026-08-16 for the DeepSeek-V3 671B FFN shapes, excluding
+attention GEMMs and using `E = 4`. Run environment: NVIDIA GB200, CUDA 13.4,
+PyTorch 2.15.0a0+git0f3e7e2, TransformerEngine 2.19.0.dev0+172bd93, and torchao
+commit `e720c1b7`.
+
+Times are CUDA kernel self-time in microseconds, with 15 warmups and 50 measured
+iterations. Memcpy and memset events are excluded. The grouped activation comparison
+times the complete post-RHT amax and row/column quantization pipeline: one
+`cutedsl_group_rht_amax` followed by one `cutedsl_group_rht_quantize_row_col`, versus
+TransformerEngine's `split_quantize` counterpart.
+
+| projection | E | M | N | math | CuteDSL pipeline (us) | TE pipeline (us) | TE speedup |
+|---|---:|---:|---:|---|---:|---:|---:|
+| gate/up (w1/w3) | 4 | 2048 | 7168 | standard | 91.11 | 64.44 | 1.41x |
+| gate/up (w1/w3) | 4 | 2048 | 7168 | fast | 72.64 | 55.86 | 1.30x |
+| down (w2) | 4 | 7168 | 2048 | standard | 92.76 | 62.80 | 1.48x |
+| down (w2) | 4 | 7168 | 2048 | fast | 73.65 | 54.77 | 1.35x |
+
+The corresponding standalone CuteDSL stage times were:
+
+| projection | math | amax (us) | quantize (us) |
+|---|---|---:|---:|
+| gate/up (w1/w3) | standard | 22.77 | 61.18 |
+| gate/up (w1/w3) | fast | 22.67 | 45.40 |
+| down (w2) | standard | 22.63 | 63.00 |
+| down (w2) | fast | 22.60 | 46.57 |
+
+TransformerEngine has no grouped 2D weight quantization kernel. The correct weight
+comparison is therefore one `cutedsl_group_weight_quantize_2d` launch over all four
+experts versus four times TransformerEngine's measured single-expert kernel time.
+Both sides consume precomputed per-expert amaxes.
+
+| projection | E | M | N | CuteDSL grouped (us) | TE single (us) | TE single x E (us) | TE speedup |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| gate/up (w1/w3) | 4 | 2048 | 7168 | 92.74 | 13.64 | 54.56 | 1.70x |
+| down (w2) | 4 | 7168 | 2048 | 92.57 | 13.65 | 54.62 | 1.69x |
+
+The public CuteDSL 2D weight path has no fast-math specialization. Repeating under
+`NVTE_USE_FAST_MATH=1` produced 92.92/54.56 us for gate/up and 92.63/54.50 us for
+down (CuteDSL grouped/TE single x E), which is measurement noise. Fast math improved
+the complete CuteDSL activation pipeline by 20-21% and the TE pipeline by 13%.
+
 ### Grouped Weight Amax
 
 Benchmarks `triton_group_weight_amax` — the input-side twin of the grouped 2D weight
