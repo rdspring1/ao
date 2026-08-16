@@ -612,33 +612,24 @@ def _abs_amax16(vals):
     return amax
 
 
-def _group16_amax(amax):
+def _group16_amax(amax, deltas: cutlass.Constexpr = (8, 4, 2, 1)):
     """Reduce a 1x16 block amax to the 16x16 (2D) block amax via a butterfly max over the
-    16-lane half-warp group. The 16 lanes hold the 16 orthogonal 1x16 strips of one 16x16
-    block, so xor offsets 8/4/2/1 (which stay within a 16-aligned lane group) leave every
-    lane holding the shared block max."""
-    for delta in (8, 4, 2, 1):
+    lane group that holds the block's 16 orthogonal 1x16 strips. With one strip per lane
+    that group is 16 lanes wide (xor offsets 8/4/2/1); a caller holding two strips per lane
+    has already folded one level in-register and passes the 8-lane offsets (4/2/1). Either
+    way the offsets stay inside an aligned lane group, so every lane ends with the shared
+    block max."""
+    for delta in deltas:
         amax = _max_f32(amax, cute.arch.shuffle_sync_bfly(amax, delta))
     return amax
 
 
-def _quant16_from_amax(
-    vals,
-    amax,
-    enc_over_fp4max,
-    dec,
-    sr: cutlass.Constexpr = False,
-    rb=None,
-    rht_acc: cutlass.Constexpr = False,
-    fast_math: cutlass.Constexpr = False,
-):
-    """Quantize 16 f32 values to NVFP4 (w0,w1 packed u32, pvscale_fp8) using a given block amax
-    (1x16 or a shared 16x16 amax). sr selects stochastic rounding over RTNE.
+def _enc_from_amax(amax, enc_over_fp4max, dec, fast_math: cutlass.Constexpr = False):
+    """Block amax -> (encode multiplier, stored E4M3 scale).
 
-    ``rht_acc`` marks ``vals`` as a raw tcgen05 RHT accumulator. Exact mode rounds it
-    through bfloat16 for TE-default compatibility; fast mode consumes FP32 directly and
-    uses TE's approximate FTZ reciprocal. The caller is responsible for rounding
-    ``amax`` in exact mode (see ``_round_rht_amax``)."""
+    Split out of ``_quant16_from_amax`` so a caller that shares one 16x16 block amax across
+    several 1x16 strips pays for the E4M3 round-trip and the exact reciprocal once.
+    """
     # Cap at FP8_E4M3_MAX only, with no lower clamp: TE emits a zero per-vector scale for an
     # all-zero vector and when a nonzero scale underflows in E4M3, so imposing a nonzero floor
     # would diverge from the TE ground truth (mirrors the triton _nvfp4_quantize). A zero
@@ -660,21 +651,40 @@ def _quant16_from_amax(
         else _div_rn_f32(cutlass.Float32(1.0), denom),
         cutlass.Float32(FP32_MAX),
     )
+    return enc, pvscale_fp8
+
+
+def _pack16_rn_from_enc(vals, enc):
+    """16 BF16-origin f32 values + encode multiplier -> the two packed-FP4 u32 words."""
+    w0 = _mul_cvt_rn_e2m1x8_f32(
+        vals[0], vals[1], vals[2], vals[3], vals[4], vals[5], vals[6], vals[7], enc
+    )
+    w1 = _mul_cvt_rn_e2m1x8_f32(
+        vals[8], vals[9], vals[10], vals[11], vals[12], vals[13], vals[14], vals[15], enc
+    )
+    return w0, w1
+
+
+def _quant16_from_amax(
+    vals,
+    amax,
+    enc_over_fp4max,
+    dec,
+    sr: cutlass.Constexpr = False,
+    rb=None,
+    rht_acc: cutlass.Constexpr = False,
+    fast_math: cutlass.Constexpr = False,
+):
+    """Quantize 16 f32 values to NVFP4 (w0,w1 packed u32, pvscale_fp8) using a given block amax
+    (1x16 or a shared 16x16 amax). sr selects stochastic rounding over RTNE.
+
+    ``rht_acc`` marks ``vals`` as a raw tcgen05 RHT accumulator. Exact mode rounds it
+    through bfloat16 for TE-default compatibility; fast mode consumes FP32 directly and
+    uses TE's approximate FTZ reciprocal. The caller is responsible for rounding
+    ``amax`` in exact mode (see ``_round_rht_amax``)."""
+    enc, pvscale_fp8 = _enc_from_amax(amax, enc_over_fp4max, dec, fast_math)
     if cutlass.const_expr(not sr and not fast_math and not rht_acc):
-        w0 = _mul_cvt_rn_e2m1x8_f32(
-            vals[0], vals[1], vals[2], vals[3], vals[4], vals[5], vals[6], vals[7], enc
-        )
-        w1 = _mul_cvt_rn_e2m1x8_f32(
-            vals[8],
-            vals[9],
-            vals[10],
-            vals[11],
-            vals[12],
-            vals[13],
-            vals[14],
-            vals[15],
-            enc,
-        )
+        w0, w1 = _pack16_rn_from_enc(vals, enc)
         return w0, w1, pvscale_fp8
     q = cute.make_rmem_tensor((16,), cutlass.Float32)
     fp4_max = cutlass.Float32(FP4_E2M1_MAX)
@@ -1585,10 +1595,16 @@ class _Tcgen05RowColFused:
             col_ab_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, NUM_AB_STAGE
             )
-            # 8 col warps (256 threads) cover the 128 N-rows with 2 threads/row: nrow = the N-row,
-            # u_half selects which half of the col-group blocks this thread owns.
-            nrow = tidx % cutlass.Int32(M_TILE)
-            u_half = tidx // cutlass.Int32(M_TILE)
+            # 8 col warps (256 threads) cover the 128 N-rows two rows at a time: a thread owns
+            # the adjacent pair (nrow, nrow+1) and a quarter of the col-group blocks. N is the
+            # contiguous SMEM mode, so the pair is one 32-bit load rather than two 16-bit ones
+            # (a warp then moves the full 128B instead of 64B), and because the pair sits in the
+            # same 16x16 block both rows share one amax, one E4M3 scale and one reciprocal.
+            nrow = (tidx % cutlass.Int32(64)) * cutlass.Int32(2)
+            u_quarter = tidx // cutlass.Int32(64)
+            blk0 = cute.make_rmem_tensor((16,), cutlass.Float32)
+            blk1 = cute.make_rmem_tensor((16,), cutlass.Float32)
+            rPair = cute.make_rmem_tensor((2,), cutlass.BFloat16)
             for local_iter in cutlass.range(num_iters):
                 super_id = start_pid + local_iter * GRID
                 pid_m = super_id // num_tiles_ns
@@ -1605,27 +1621,39 @@ class _Tcgen05RowColFused:
                 ab_pipeline.consumer_wait(col_ab_state)  # wait sA full
                 stage = col_ab_state.index
                 for u_local in cutlass.range_constexpr(
-                    self.col_groups_per_supertile // 2
+                    self.col_groups_per_supertile // 4
                 ):
-                    u = cutlass.Int32(u_local) + u_half * cutlass.Int32(
-                        self.col_groups_per_supertile // 2
+                    u = cutlass.Int32(u_local) + u_quarter * cutlass.Int32(
+                        self.col_groups_per_supertile // 4
                     )
-                    blk = cute.make_rmem_tensor((16,), cutlass.Float32)
                     for i in cutlass.range_constexpr(16):
                         mpos = u * cutlass.Int32(16) + cutlass.Int32(
                             i
                         )  # M-position (0..255)
-                        # transposed read: A.t()[N-row=nrow, M-pos=mpos]
-                        blk[i] = sA_clean[
-                            ((nrow % 64, nrow // 64), (mpos % 8, mpos // 8), (0, stage))
-                        ].to(cutlass.Float32)
-                    amax = _group16_amax(_abs_amax16(blk))
-                    # Weight mode is RTNE only (asserted at compile), so no SR draw here.
-                    w0, w1, sf = _quant16_from_amax(
-                        blk, amax, enc_over_fp4max, g_dec, False, None
+                        # transposed read: A.t()[N-rows nrow, nrow+1][M-pos=mpos]
+                        cute.autovec_copy(
+                            cute.local_tile(
+                                sA_clean[(None, (mpos % 8, mpos // 8), (0, stage))],
+                                (2,),
+                                (nrow // 2,),
+                            ),
+                            rPair,
+                        )
+                        blk0[i] = rPair[0].to(cutlass.Float32)
+                        blk1[i] = rPair[1].to(cutlass.Float32)
+                    # The pair is two of the 16 strips of one 16x16 block: fold them in-register,
+                    # then butterfly over the 8 lanes holding the other 14.
+                    amax = _group16_amax(
+                        _max_f32(_abs_amax16(blk0), _abs_amax16(blk1)), (4, 2, 1)
                     )
+                    # Weight mode is RTNE only (asserted at compile), so no SR draw here.
+                    enc, sf = _enc_from_amax(amax, enc_over_fp4max, g_dec)
+                    w0, w1 = _pack16_rn_from_enc(blk0, enc)
+                    v0, v1 = _pack16_rn_from_enc(blk1, enc)
                     sFP4[nrow, u * 2] = w0
                     sFP4[nrow, u * 2 + 1] = w1
+                    sFP4[nrow + 1, u * 2] = v0
+                    sFP4[nrow + 1, u * 2 + 1] = v1
                     if cutlass.const_expr(self.swizzle_sf):
                         sSF_w[
                             0,
@@ -1634,8 +1662,16 @@ class _Tcgen05RowColFused:
                             (nrow // cutlass.Int32(32)) * cutlass.Int32(4)
                             + (u % cutlass.Int32(4)),
                         ] = sf
+                        sSF_w[
+                            0,
+                            u // cutlass.Int32(4),
+                            (nrow + 1) % cutlass.Int32(32),
+                            ((nrow + 1) // cutlass.Int32(32)) * cutlass.Int32(4)
+                            + (u % cutlass.Int32(4)),
+                        ] = sf
                     else:
                         sSF_w[nrow, u] = sf
+                        sSF_w[nrow + 1, u] = sf
 
                 cute.arch.mbarrier_arrive(
                     ab_pipeline.sync_object_empty.get_barrier(stage)
