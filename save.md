@@ -2,7 +2,7 @@
 
 ## Local NVFP4 History Rewrite Preflight
 
-Status: IN PROGRESS
+Status: COMPLETE
 
 ### Preflight
 
@@ -34,6 +34,25 @@ configuration and remove only the temporary rewrite branch after establishing fi
 No new source, API, abstraction, or test is being invented during the rewrite. The two
 replacement commits partition the already validated final tree; the history branch is the
 recoverable checkpoint for the original lineage and ledgers.
+
+### What Changed
+
+- Rebuilt `nvfp4_moe` as one Triton/oracle commit on `origin/nvfp4_moe`.
+- Rebuilt `nvfp4_moe_cutedsl` as one CuTeDSL commit on the rewritten Triton branch.
+- Preserved the original lineage and both ledgers on `nvfp4_moe_cutedsl_history`.
+- Preserved `nvfp4_moe_cutedsl` upstream configuration; no remote operation ran.
+
+### Rewrite Validation
+
+- Actual TE-default comparisons passed with zero differing code or scale bytes for
+  single RHT 256x256, grouped RHT E=4 128x128, and 2D weight 256x256 on every applicable
+  backend.
+- Five focused Triton/oracle tests and six focused backend-equivalence tests passed.
+- Targeted Ruff 0.11.6 checks and formatting passed for the first-layer files.
+- `git diff --check` passed.
+- The rewritten CuTeDSL product tree equals the archived tree outside the two ledgers.
+- Commit counts are exactly one from `origin/nvfp4_moe` to `nvfp4_moe` and one more from
+  `nvfp4_moe` to `nvfp4_moe_cutedsl`.
 
 Status: COMPLETE — TEST-ONLY NVFP4 ORACLE MOVED UNDER TEST
 

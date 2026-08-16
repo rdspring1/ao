@@ -201,3 +201,46 @@ mask hypothesis is rejected.
 - Interpretation: The oracle move preserves all repository consumers and removes the
   test-only implementation from the production package.
 - Failure classification: implementation validated.
+
+## History Rewrite Validation: Direct TE Invocation
+
+- Hypothesis: The rewritten Triton commit remains byte-identical to actual
+  TransformerEngine default for single RHT and 2D weight outputs.
+- Exact command: `env -u NVTE_USE_FAST_MATH python -` invoking TE `NVFP4Quantizer`
+  and the rewritten Triton kernels for a 256x256 BF16 tensor.
+- Result: Failed before the TorchAO kernel launched because
+  `triton_rht_quantize_row_col` received the sign vector in the
+  `col_global_amax` position.
+- Interpretation: Invocation mismatch; the custom-op schema requires
+  `(A, col_global_amax, row_global_amax, sign_vector, stochastic_rounding)`.
+- Canonical-command status: Direct comparator is appropriate; correct only the argument
+  order before rerunning.
+- Failure classification: invocation mismatch.
+
+## History Rewrite Validation: Ruff
+
+- Hypothesis: The rewritten first-layer files satisfy the repository's pinned Ruff rules.
+- Exact command: `ruff check` followed by `ruff format --check` on the eleven files in
+  the Triton/oracle commit.
+- Result: `ruff check` reported five `I001` import-order findings; formatting did not run
+  because the check exited nonzero.
+- Interpretation: The findings are a single mechanical import-order family and are all
+  reported fixable by Ruff. Applied the documented targeted `ruff check --fix`, formatted,
+  and revalidated successfully with Ruff 0.11.6.
+- Canonical-command status: Uses Ruff 0.11.6 pinned by `CONTRIBUTING.md`.
+- Failure classification: resolved implementation formatting defect.
+
+## Rewritten CuTeDSL Direct-TE Validation
+
+- Hypothesis: Both rewritten backends remain byte-identical to actual TE default for
+  single RHT, grouped RHT E=4, and 2D weight quantization.
+- Exact command: `env -u NVTE_USE_FAST_MATH python -` comparing both backends with TE
+  outputs at 256x256 and grouped E=4 128x128.
+- Initial result: Failed in comparator setup before any TorchAO kernel call because a
+  hard-coded `(2, 2, 32, 16)` view contained 2048 elements while TE exposed 4096 scale
+  bytes.
+- Interpretation: Invocation-harness shape error. Derived each blocked-scale view from
+  the actual TorchAO output shape and reran without changing kernels.
+- Corrected result: Triton and CuTeDSL each reported zero differing bytes for row codes,
+  row scales, column codes, and column scales in all three operations.
+- Failure classification: resolved invocation mismatch; implementation validated.
