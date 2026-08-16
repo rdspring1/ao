@@ -17,7 +17,6 @@ if torch_version_at_least("2.10.0") and has_triton():
         _swizzle_scales,
         convert_8xfp32_to_4xfp4_packed,
         prepare_for_cuda_graph,
-        rcp_approx,
     )
     from torchao.utils import is_sm_at_least_100
 
@@ -97,7 +96,8 @@ if torch_version_at_least("2.10.0") and has_triton():
         scale_inv = tl.reshape(pvscale_fp8, [BLOCK_M // 16, BLOCK_N // 16])
 
         denom = pvscale_fp8.to(tl.float32) * global_decode_scale
-        encode_scale = tl.minimum(rcp_approx(denom), FP32_MAX)
+        encode_num = tl.full(denom.shape, 1.0, tl.float32)
+        encode_scale = tl.minimum(tl.div_rn(encode_num, denom), FP32_MAX)
 
         scaled = a_tile * encode_scale
         scaled = tl.clamp(scaled, -FP4_E2M1_MAX, FP4_E2M1_MAX)

@@ -52,6 +52,7 @@ from ._cutedsl_kernels_impl import (
     HADAMARD_DIM,
     _abs_f32,
     _atom_max_f32_nonneg,
+    _div_rn_f32,
     _get_rht_buffer,
     _get_sr_rng_buffer,
     _max_f32,
@@ -182,14 +183,14 @@ def _global_scale(amax):
     is_zero = amax == cutlass.Float32(0.0)
     safe = cutlass.Float32(cutlass.select_(is_zero, cutlass.Float32(1.0), amax))
     c = _min_f32(
-        cutlass.Float32(FP8_E4M3_MAX * FP4_E2M1_MAX) / safe,
+        _div_rn_f32(cutlass.Float32(FP8_E4M3_MAX * FP4_E2M1_MAX), safe),
         cutlass.Float32(FP32_MAX),
     )
     c = cutlass.Float32(
         cutlass.select_(c == cutlass.Float32(0.0), cutlass.Float32(1.0), c)
     )
     enc = cutlass.Float32(cutlass.select_(is_zero, cutlass.Float32(1.0), c))
-    dec = cutlass.Float32(1.0) / enc
+    dec = _div_rn_f32(cutlass.Float32(1.0), enc)
     return enc, dec, enc * cutlass.Float32(1.0 / FP4_E2M1_MAX)
 
 

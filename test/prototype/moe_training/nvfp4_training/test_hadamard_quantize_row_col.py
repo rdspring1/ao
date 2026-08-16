@@ -61,8 +61,7 @@ from torchao.prototype.moe_training.nvfp4_training.hadamard_quantize_row_col_cut
     cutedsl_rht_quantize_row_col,
 )
 from test.prototype.moe_training.nvfp4_training._assertions import (
-    assert_codes_bracketed,
-    assert_mismatches_are_midpoints,
+    assert_codes_bitwise,
     assert_scales_adjacent,
     assert_scales_bitwise,
     assert_scales_finite,
@@ -238,11 +237,8 @@ def _quantize_row_col(
 def test_rht_quantize_rtne_vs_transformer_engine_reference(kernel, M, N, input_kind):
     """Both backends must reproduce TransformerEngine's arithmetic.
 
-    Scales bitwise; codes within a few-ulp bracket of the encode scale, which is as
-    strict as a pure-torch oracle can be — the kernels use ``rcp.approx.f32`` for that
-    reciprocal and torch cannot emit it. ``bounded_integer`` is the adversarial input for
-    the bracket: integer data under a power-of-two amax puts the scaled values exactly on
-    E2M1 midpoints, where an approximate reciprocal is a coin flip.
+    Scales and codes are bitwise. ``bounded_integer`` is adversarial because integer data
+    under a power-of-two amax places scaled values exactly on E2M1 midpoints.
     """
     _skip_if_unsupported_shape(kernel, M, N)
     if input_kind == "bounded_integer":
@@ -269,10 +265,8 @@ def test_rht_quantize_rtne_vs_transformer_engine_reference(kernel, M, N, input_k
     )
     assert_scales_bitwise(col_sf, ref_col.scales, "col sf")
     assert_scales_bitwise(row_sf, ref_row.scales, "row sf")
-    assert_codes_bracketed(col_codes, ref_col, col_amax, "col codes")
-    assert_codes_bracketed(row_codes, ref_row, row_amax, "row codes")
-    assert_mismatches_are_midpoints(col_codes, ref_col, "col codes")
-    assert_mismatches_are_midpoints(row_codes, ref_row, "row codes")
+    assert_codes_bitwise(col_codes, ref_col.codes, "col codes")
+    assert_codes_bitwise(row_codes, ref_row.codes, "row codes")
 
     if input_kind == "zeros":
         assert torch.count_nonzero(col_sf.float()).item() == 0
@@ -306,9 +300,8 @@ def test_rht_quantize_rtne_scales_vs_mx_formats_reference(kernel, M, N):
     here, the two formulations are mathematically equivalent but can land on adjacent
     E4M3 values because of FP32 rounding order.
 
-    Note: packed FP4 codes are NOT checked at all here — the kernels use an
-    approximate reciprocal (rcp.approx.f32, <=2 ULP) causing ~0.2% nibble
-    differences at FP4 midpoints. Use the SQNR test for quantization quality.
+    Packed FP4 codes are not checked here because the TE-derived test above already
+    asserts them bitwise; this test isolates compatibility with mx_formats' scale recipe.
     """
     _skip_if_unsupported_shape(kernel, M, N)
 

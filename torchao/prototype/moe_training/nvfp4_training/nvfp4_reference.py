@@ -39,11 +39,9 @@ down/up along the grid:
 
 ``pack_uint4`` puts the even element in the low nibble, which is the kernels' order.
 
-**What can be asserted.** Scales and amaxes are bitwise: every step is IEEE-exact and torch
-does not enable fast math. FP4 codes are *not*, structurally -- the kernels compute the
-per-block encode scale with ``rcp.approx.f32`` (see ``hadamard_utils.rcp_approx``) and torch
-has no way to emit that instruction. ``encode_scale_bracket`` exists for that: bracket the
-scale and you bracket the code, since the code is monotone in it.
+**What can be asserted.** Scales, amaxes, and RTNE FP4 codes are bitwise: the kernels use
+correctly rounded FP32 division, matching both this PyTorch transcription and
+TransformerEngine's default numeric path.
 """
 
 from dataclasses import dataclass
@@ -62,7 +60,6 @@ _FP32_MAX = torch.finfo(torch.float32).max
 
 __all__ = [
     "NVFP4ReferenceOutput",
-    "encode_scale_bracket",
     "global_encode_scale",
     "nvfp4_reference_quantize",
     "reference_group_rht_amax",
@@ -98,25 +95,9 @@ def _block_scale(block_amax: torch.Tensor, s_enc: torch.Tensor) -> torch.Tensor:
 
 
 def _encode_scale(block_scale_fp8: torch.Tensor, s_enc: torch.Tensor) -> torch.Tensor:
-    """Reciprocal of the effective decode scale. The kernels use rcp.approx here."""
+    """Correctly rounded reciprocal of the effective decode scale."""
     denom = block_scale_fp8.to(torch.float32) * (1.0 / s_enc)
     return (1.0 / denom).clamp(max=_FP32_MAX)
-
-
-def encode_scale_bracket(
-    block_scale_fp8: torch.Tensor, s_enc: torch.Tensor, ulps: float = 4.0
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """``(lo, hi)`` encode scales spanning the kernels' ``rcp.approx.f32``.
-
-    ``rcp.approx.f32`` is a MUFU-backed approximation with no torch equivalent, so a code
-    produced with it can differ from one produced with a correctly-rounded reciprocal
-    wherever the scaled magnitude lands near an E2M1 midpoint. Widening the scale by a few
-    ulps and quantizing at both ends brackets every code the kernel could legitimately
-    emit, which is a tighter claim than "within one FP4 step".
-    """
-    exact = _encode_scale(block_scale_fp8, s_enc)
-    rel = ulps * 2.0**-24
-    return exact * (1.0 - rel), (exact * (1.0 + rel)).clamp(max=_FP32_MAX)
 
 
 def pack_fp4(scaled: torch.Tensor) -> torch.Tensor:
@@ -134,8 +115,7 @@ def pack_fp4(scaled: torch.Tensor) -> torch.Tensor:
 class NVFP4ReferenceOutput:
     """Everything a caller might assert on, including the intermediates.
 
-    ``block_scale`` / ``encode_scale`` / ``scaled`` are exposed so a test can bracket the
-    codes (see ``encode_scale_bracket``) without recomputing the chain.
+    Intermediates remain exposed for diagnostics of the TE scale chain.
     """
 
     codes: torch.Tensor  # (R, C//2) uint8
@@ -242,7 +222,7 @@ def reference_rht_quantize_row_col(
     """``(col, row)`` references for ``*_rht_quantize_row_col``.
 
     Columnwise quantizes ``RHT(A.t())``, rowwise quantizes raw ``A``; both 1x16. Returns
-    the full reference objects rather than a flat tuple so callers can bracket the codes.
+    the full reference objects rather than a flat tuple for code and scale assertions.
     """
     col = nvfp4_reference_quantize(
         reference_rht(A, sign_vector), col_global_amax, block="1x16", layout=layout

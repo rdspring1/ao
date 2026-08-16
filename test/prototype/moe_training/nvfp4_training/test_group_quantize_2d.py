@@ -8,14 +8,13 @@ from benchmarks.prototype.nvfp4_training.deepseek_v3_shapes import (
     get_deepseek_v3_weight_shapes,
 )
 from test.prototype.moe_training.nvfp4_training._assertions import (
-    assert_codes_bracketed,
+    assert_codes_bitwise,
     assert_scales_bitwise,
 )
 from test.prototype.moe_training.nvfp4_training.test_quantize_2d import (
     _assert_scales_match_up_to_rounding_ties,
 )
 from torchao.prototype.moe_training.nvfp4_training.nvfp4_reference import (
-    nvfp4_reference_quantize,
     reference_group_weight_quantize_2d,
 )
 from torchao.prototype.moe_training.nvfp4_training.group_quantize_2d_cutedsl import (
@@ -208,8 +207,7 @@ def test_group_quantize_2d_matches_torch_oracle(kernel):
 def test_group_quantize_2d_vs_transformer_engine_reference(kernel, shape):
     """Both backends must reproduce TransformerEngine's per-expert 16x16 arithmetic.
 
-    Scales bitwise, codes within the encode-scale bracket, for every expert and both
-    directions.
+    Scales and codes bitwise for every expert and both directions.
     """
     E, M, N = shape
     _skip_if_unsupported_shape(kernel, M)
@@ -223,15 +221,8 @@ def test_group_quantize_2d_vs_transformer_engine_reference(kernel, shape):
     )
     assert_scales_bitwise(sf, ref_sf, "rowwise SF")
     assert_scales_bitwise(t_sf, ref_t_sf, "colwise SF")
-    for e in range(E):
-        row_ref = nvfp4_reference_quantize(W[e], amax[e], block="16x16", layout="plain")
-        col_ref = nvfp4_reference_quantize(
-            W[e].t().contiguous(), amax[e], block="16x16", layout="plain"
-        )
-        assert_codes_bracketed(codes[e], row_ref, amax[e], f"expert {e} rowwise codes")
-        assert_codes_bracketed(
-            t_codes[e], col_ref, amax[e], f"expert {e} colwise codes"
-        )
+    assert_codes_bitwise(codes, ref_codes, "rowwise codes")
+    assert_codes_bitwise(t_codes, ref_t_codes, "colwise codes")
 
 
 @_skip_no_triton

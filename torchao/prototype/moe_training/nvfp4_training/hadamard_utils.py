@@ -157,24 +157,6 @@ if has_triton():
         return pid_n, pid_m
 
     @triton.jit
-    def rcp_approx(x):
-        """PTX rcp.approx.f32: the per-block encode reciprocal, matching the cutedsl
-        kernels instruction for instruction.
-
-        Triton's plain ``1.0 / x`` lowers to ``div.full.f32`` (~2 ulp), which is neither
-        correctly rounded nor what cutedsl emits. Pinning both backends to rcp.approx
-        makes the FP4 codes bitwise equal and is cheaper than div.full on both.
-        """
-        return tl.inline_asm_elementwise(
-            asm="rcp.approx.f32 $0, $1;",
-            constraints="=f,f",
-            args=[x],
-            dtype=tl.float32,
-            is_pure=True,
-            pack=1,
-        )
-
-    @triton.jit
     def convert_8xfp32_to_4xfp4_packed(x_pairs):
         """Convert 8 FP32 values to 4 packed FP4 bytes using round-to-nearest.
         Calls four cvt.rn instructions, each packing two FP32 values into one packed int8."""
@@ -293,7 +275,8 @@ if has_triton():
         scale_inv = tl.reshape(pvscale_fp8, [BLOCK_N, BLOCK_M // 16])
 
         denom = pvscale_fp8.to(tl.float32) * global_decode_scale
-        encode_scale = tl.minimum(rcp_approx(denom), FP32_MAX)
+        encode_num = tl.full(denom.shape, 1.0, tl.float32)
+        encode_scale = tl.minimum(tl.div_rn(encode_num, denom), FP32_MAX)
 
         scaled = a_vecs * encode_scale
         scaled = tl.clamp(scaled, -FP4_E2M1_MAX, FP4_E2M1_MAX)

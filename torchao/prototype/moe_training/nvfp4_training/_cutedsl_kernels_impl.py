@@ -157,20 +157,16 @@ def _cvt_rn_bf16x2_f32(
 
 
 @dsl_user_op
-def _rcp_approx_f32(a: cutlass.Float32, *, loc=None, ip=None) -> cutlass.Float32:
-    """Fast approximate reciprocal via PTX rcp.approx.f32.
-
-    Used for the per-block encode scale, where the triton kernels emit the same
-    instruction. Correctly-rounded division there would cost ~27% on the grouped
-    quantize and ~11% on triton, for a reciprocal that has always been approximate
-    (triton's plain ``/`` lowers to the ~2 ulp ``div.full.f32``).
-    """
+def _div_rn_f32(
+    a: cutlass.Float32, b: cutlass.Float32, *, loc=None, ip=None
+) -> cutlass.Float32:
+    """Correctly rounded FP32 division, matching TransformerEngine's default path."""
     return cutlass.Float32(
         llvm.inline_asm(
             T.f32(),
-            [a.ir_value(loc=loc, ip=ip)],
-            "rcp.approx.f32 $0, $1;",
-            "=f,f",
+            [a.ir_value(loc=loc, ip=ip), b.ir_value(loc=loc, ip=ip)],
+            "div.rn.f32 $0, $1, $2;",
+            "=f,f,f",
             has_side_effects=False,
             is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,
@@ -592,9 +588,9 @@ def _quant16_from_amax(
     pv_back = cute.make_rmem_tensor((4,), cutlass.Float32)
     pv_back.store(pv_f8.load().to(cutlass.Float32))
     denom = pv_back[0] * dec
-    # rcp.approx.f32 on both backends: the triton kernels emit the same instruction, so
-    # the FP4 codes agree byte for byte. See _rcp_approx_f32 for why not div.rn.
-    enc = _min_f32(_rcp_approx_f32(denom), cutlass.Float32(FP32_MAX))
+    enc = _min_f32(
+        _div_rn_f32(cutlass.Float32(1.0), denom), cutlass.Float32(FP32_MAX)
+    )
     q = cute.make_rmem_tensor((16,), cutlass.Float32)
     fp4_max = cutlass.Float32(FP4_E2M1_MAX)
     if cutlass.const_expr(rht_acc):
@@ -1108,14 +1104,16 @@ class _Tcgen05RowColFused:
             is_zero = amax == cutlass.Float32(0.0)
             safe = cutlass.Float32(cutlass.select_(is_zero, cutlass.Float32(1.0), amax))
             c = _min_f32(
-                cutlass.Float32(FP8_E4M3_MAX * FP4_E2M1_MAX) / safe,
+                _div_rn_f32(
+                    cutlass.Float32(FP8_E4M3_MAX * FP4_E2M1_MAX), safe
+                ),
                 cutlass.Float32(FP32_MAX),
             )
             c = cutlass.Float32(
                 cutlass.select_(c == cutlass.Float32(0.0), cutlass.Float32(1.0), c)
             )
             enc = cutlass.Float32(cutlass.select_(is_zero, cutlass.Float32(1.0), c))
-            dec = cutlass.Float32(1.0) / enc
+            dec = _div_rn_f32(cutlass.Float32(1.0), enc)
             return enc, dec, enc * cutlass.Float32(1.0 / FP4_E2M1_MAX)
 
         # Ungrouped: one global scale pair for the whole launch. Grouped: the epilogues overwrite

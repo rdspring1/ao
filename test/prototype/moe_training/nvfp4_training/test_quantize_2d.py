@@ -14,7 +14,7 @@ from torchao.prototype.moe_training.nvfp4_training.hadamard_cutedsl_utils import
     cutedsl_nvfp4_kernels_available,
 )
 from test.prototype.moe_training.nvfp4_training._assertions import (
-    assert_codes_bracketed,
+    assert_codes_bitwise,
     assert_scales_bitwise,
     assert_scales_finite,
     assert_zero_quantized,
@@ -117,8 +117,8 @@ def _assert_scales_match_up_to_rounding_ties(
 def test_weight_quantize_2d_vs_transformer_engine_reference(kernel, M, N):
     """Both backends must reproduce TransformerEngine's 16x16 arithmetic.
 
-    Scales bitwise, codes within the encode-scale bracket. Both directions: rowwise is
-    NVFP4(W), colwise is the same recipe on W.T.
+    Scales and codes bitwise. Both directions: rowwise is NVFP4(W), colwise is the same
+    recipe on W.T.
     """
     _skip_if_unsupported_shape(kernel, M, N)
     torch.manual_seed(42)
@@ -130,8 +130,8 @@ def test_weight_quantize_2d_vs_transformer_engine_reference(kernel, M, N):
 
     assert_scales_bitwise(scales, ref_row.scales, "rowwise SF")
     assert_scales_bitwise(t_scales, ref_col.scales, "colwise SF")
-    assert_codes_bracketed(codes, ref_row, amax, "rowwise codes")
-    assert_codes_bracketed(t_codes, ref_col, amax, "colwise codes")
+    assert_codes_bitwise(codes, ref_row.codes, "rowwise codes")
+    assert_codes_bitwise(t_codes, ref_col.codes, "colwise codes")
 
 
 @_skip_no_triton

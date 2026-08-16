@@ -8,31 +8,13 @@
 
 Deliberately pytest-free so an out-of-tree comparison script can reuse them. The
 vocabulary here is what each output can honestly be held to against the plain-PyTorch
-reference in ``torchao.prototype.moe_training.nvfp4_training.nvfp4_reference``:
-
-* **scales, amaxes -> bitwise.** Every step is IEEE-exact and torch does not enable fast
-  math, so the reference reproduces the kernels' bytes exactly.
-* **FP4 codes -> bracketed.** The kernels compute the per-block encode scale with
-  ``rcp.approx.f32``, which torch cannot emit. ``assert_codes_bracketed`` quantizes at
-  both ends of a few-ulp scale bracket and requires the kernel's code to be one of them;
-  since the code is monotone in the scale, that admits exactly the codes an approximate
-  reciprocal could produce and nothing else. Where the bracket is degenerate (the
-  overwhelming majority of elements) it *is* bitwise equality.
+reference in ``torchao.prototype.moe_training.nvfp4_training.nvfp4_reference``. Scales,
+amaxes, and RTNE FP4 codes are all bitwise under TransformerEngine's default recipe.
 """
 
 from typing import Optional
 
 import torch
-
-from torchao.prototype.moe_training.nvfp4_training.nvfp4_reference import (
-    NVFP4ReferenceOutput,
-    encode_scale_bracket,
-    global_encode_scale,
-    pack_fp4,
-)
-
-# E2M1 midpoints; a code can only flip if the scaled magnitude sits on one of these.
-_FP4_MIDPOINTS = (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)
 
 
 def assert_scales_bitwise(got: torch.Tensor, ref: torch.Tensor, label: str) -> None:
@@ -67,72 +49,13 @@ def unpack_fp4_magnitudes(codes: torch.Tensor) -> torch.Tensor:
     return unpack_fp4_nibbles(codes) & 0x7
 
 
-def assert_codes_bracketed(
-    got: torch.Tensor,
-    ref: NVFP4ReferenceOutput,
-    global_amax: torch.Tensor,
-    label: str,
-    *,
-    ulps: float = 4.0,
-) -> None:
-    """Every FP4 code must be reachable from a few-ulp perturbation of the encode scale.
-
-    Also requires the sign nibbles to be exactly equal — the encode scale is positive, so
-    no reciprocal difference can flip a sign.
-
-    Compared per *nibble*, not per byte: a byte packs two elements, and one may round to
-    the low end of the bracket while its neighbour rounds to the high end, in which case
-    the byte equals neither endpoint even though both elements are in range.
-
-    Deliberately no cap on *how many* codes differ from the exactly-rounded reference:
-    that fraction is a property of the data, not of the kernel. Integer inputs under a
-    power-of-two amax put scaled values exactly on E2M1 midpoints, where an approximate
-    reciprocal is a coin flip and several percent of codes legitimately differ. The
-    bracket plus ``assert_mismatches_are_midpoints`` bound the divergence structurally,
-    which is what a cap would only approximate.
-    """
-    s_enc = global_encode_scale(global_amax)
-    lo, hi = encode_scale_bracket(ref.block_scale, s_enc, ulps=ulps)
-
-    def _expand(t):
-        return t.repeat_interleave(ref.block_rows, dim=0).repeat_interleave(16, dim=1)
-
-    got_n = unpack_fp4_nibbles(got)
-    lo_n = unpack_fp4_nibbles(pack_fp4(ref.values * _expand(lo)))
-    hi_n = unpack_fp4_nibbles(pack_fp4(ref.values * _expand(hi)))
-    outside = ~((got_n == lo_n) | (got_n == hi_n))
-    assert not outside.any(), (
-        f"{label}: {int(outside.sum())}/{outside.numel()} FP4 codes fall outside a "
-        f"{ulps}-ulp encode-scale bracket -- that is a recipe difference, not rounding"
+def assert_codes_bitwise(got: torch.Tensor, ref: torch.Tensor, label: str) -> None:
+    """Compare packed FP4 codes byte-for-byte against the TE-default reference."""
+    assert got.shape == ref.shape, (
+        f"{label}: shape mismatch {tuple(got.shape)} vs {tuple(ref.shape)}"
     )
-
-    sign_bad = ((got ^ ref.codes) & 0x88) != 0
-    assert not sign_bad.any(), (
-        f"{label}: {int(sign_bad.sum())} code bytes differ in a sign nibble; the encode "
-        "scale is positive, so no reciprocal difference can do that"
-    )
-
-
-def assert_mismatches_are_midpoints(
-    got: torch.Tensor, ref: NVFP4ReferenceOutput, label: str, *, rel: float = 1e-6
-) -> None:
-    """Diagnostic: every differing nibble must sit on an E2M1 rounding midpoint.
-
-    Turns a future regression into a one-line explanation instead of a percentage. Run it
-    on the RHT paths, where ``rcp.approx`` actually bites. Compares per nibble, not per
-    byte -- only one of a byte's two elements may have moved.
-    """
-    diff = unpack_fp4_nibbles(got) != unpack_fp4_nibbles(ref.codes)
-    if not diff.any():
-        return
-    mag = ref.scaled.double().abs()[diff]
-    on_mid = torch.zeros_like(mag, dtype=torch.bool)
-    for mid in _FP4_MIDPOINTS:
-        on_mid |= (mag - mid).abs() <= rel * mid
-    on_mid |= mag > 6.0  # saturation region
-    assert on_mid.all(), (
-        f"{label}: {int((~on_mid).sum())} differing elements are not near an E2M1 "
-        "midpoint, so the difference is not reciprocal rounding"
+    assert torch.equal(got, ref), (
+        f"{label}: {(got != ref).sum().item()}/{got.numel()} code bytes differ"
     )
 
 

@@ -1,7 +1,7 @@
 """Tests for the grouped RHT quantize kernels (SM100+), triton and cutedsl.
 
-Two oracles: the TE-derived reference in ``nvfp4_reference`` (scales bitwise, codes
-bracketed) and an independent mx_formats cross-check at 1 fp8 ULP. Mirrors
+Two oracles: the TE-derived reference in ``nvfp4_reference`` (scales and RTNE codes
+bitwise) and an independent mx_formats cross-check at 1 fp8 ULP. Mirrors
 test_hadamard_quantize_row_col.py:
 
   correctness (RTNE):
@@ -31,7 +31,7 @@ from benchmarks.prototype.nvfp4_training.deepseek_v3_shapes import (
 )
 from torchao.float8.float8_utils import compute_error
 from test.prototype.moe_training.nvfp4_training._assertions import (
-    assert_codes_bracketed,
+    assert_codes_bitwise,
     assert_scales_bitwise,
 )
 from torchao.prototype.moe_training.nvfp4_training.hadamard_cutedsl_utils import (
@@ -41,7 +41,6 @@ from torchao.prototype.moe_training.nvfp4_training.hadamard_utils import (
     DEFAULT_SIGN_VECTOR,
 )
 from torchao.prototype.moe_training.nvfp4_training.nvfp4_reference import (
-    nvfp4_reference_quantize,
     reference_group_rht_quantize_row_col,
 )
 from torchao.prototype.mx_formats.nvfp4_tensor import (
@@ -332,7 +331,7 @@ def triton_group_rht_quantize_row_col_ref(
 
 
 def _assert_group_rht_correctness(graph_case, kernel):
-    spec, A, B, offsets, amax_row, amax_col, group_tensors, rht_groups = graph_case
+    spec, A, _, offsets, amax_row, amax_col, _, _ = graph_case
     psl, hs = A.shape
     num_groups = len(spec.groups)
     _skip_if_unsupported_groups(kernel, num_groups)
@@ -353,26 +352,14 @@ def _assert_group_rht_correctness(graph_case, kernel):
     )
     _check_output_shapes(spec, qa, sfa, qd, sfd)
 
-    # TE-derived reference: both packed scale buffers bitwise, codes bracketed.
+    # TE-derived reference: packed scale buffers and RTNE codes are bitwise.
     ref_qa, ref_sfa, ref_qd, ref_sfd = reference_group_rht_quantize_row_col(
         A, offsets, num_groups, amax_col, amax_row, _HARDCODED_SIGN_VECTOR
     )
     assert_scales_bitwise(sfa, ref_sfa, "row sf")
     assert_scales_bitwise(sfd, ref_sfd, "col sf")
-
-    row_offset = 0
-    for g, (m, A_g, rht_g) in enumerate(zip(spec.groups, group_tensors, rht_groups)):
-        rows = slice(row_offset, row_offset + m)
-        cols = slice(row_offset // 2, (row_offset + m) // 2)
-        ref_row = nvfp4_reference_quantize(
-            A_g, amax_row[g], block="1x16", layout="plain"
-        )
-        ref_col = nvfp4_reference_quantize(
-            rht_g, amax_col[g], block="1x16", layout="plain"
-        )
-        assert_codes_bracketed(qa[rows], ref_row, amax_row[g], f"group {g} row codes")
-        assert_codes_bracketed(qd[:, cols], ref_col, amax_col[g], f"group {g} col codes")
-        row_offset += m
+    assert_codes_bitwise(qa, ref_qa, "row codes")
+    assert_codes_bitwise(qd, ref_qd, "col codes")
 
     # Independent mx_formats cross-check (reciprocal + E4M3_EPS floor, hence 1 ULP).
     triton_group_rht_quantize_row_col_ref(
