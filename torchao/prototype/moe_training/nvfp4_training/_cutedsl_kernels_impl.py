@@ -220,6 +220,88 @@ def _mul_cvt_rn_e2m1x8_f32(
 
 
 @dsl_user_op
+def _mul_cvt_rn_e2m1x8_acc_f32(
+    v0: cutlass.Float32,
+    v1: cutlass.Float32,
+    v2: cutlass.Float32,
+    v3: cutlass.Float32,
+    v4: cutlass.Float32,
+    v5: cutlass.Float32,
+    v6: cutlass.Float32,
+    v7: cutlass.Float32,
+    scale: cutlass.Float32,
+    *,
+    loc=None,
+    ip=None,
+) -> cutlass.Uint32:
+    """``_mul_cvt_rn_e2m1x8_f32`` for raw tcgen05 RHT accumulators.
+
+    Same packed multiply/convert, with the exact-mode bfloat16 round-through folded in: each
+    pair is rounded with one ``cvt.rn.bf16x2.f32`` and re-widened by shift/mask, which is what
+    the scalar path did before multiplying. The explicit clamp to +-FP4_E2M1_MAX is dropped
+    because ``cvt.rn.satfinite`` already saturates there.
+    """
+    return cutlass.Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [
+                v0.ir_value(loc=loc, ip=ip),
+                v1.ir_value(loc=loc, ip=ip),
+                v2.ir_value(loc=loc, ip=ip),
+                v3.ir_value(loc=loc, ip=ip),
+                v4.ir_value(loc=loc, ip=ip),
+                v5.ir_value(loc=loc, ip=ip),
+                v6.ir_value(loc=loc, ip=ip),
+                v7.ir_value(loc=loc, ip=ip),
+                scale.ir_value(loc=loc, ip=ip),
+            ],
+            (
+                "{\n"
+                ".reg .b64 s2, p01, p23, p45, p67;\n"
+                ".reg .b32 t01, t23, t45, t67, e0, e1, e2, e3, e4, e5, e6, e7;\n"
+                ".reg .f32 a0, a1, a2, a3, a4, a5, a6, a7;\n"
+                ".reg .b8 b0, b1, b2, b3;\n"
+                "mov.b64 s2, {$9, $9};\n"
+                "cvt.rn.bf16x2.f32 t01, $2, $1;\n"
+                "cvt.rn.bf16x2.f32 t23, $4, $3;\n"
+                "cvt.rn.bf16x2.f32 t45, $6, $5;\n"
+                "cvt.rn.bf16x2.f32 t67, $8, $7;\n"
+                "shl.b32 e0, t01, 16;\n"
+                "and.b32 e1, t01, 0xffff0000;\n"
+                "shl.b32 e2, t23, 16;\n"
+                "and.b32 e3, t23, 0xffff0000;\n"
+                "shl.b32 e4, t45, 16;\n"
+                "and.b32 e5, t45, 0xffff0000;\n"
+                "shl.b32 e6, t67, 16;\n"
+                "and.b32 e7, t67, 0xffff0000;\n"
+                "mov.b64 p01, {e0, e1};\n"
+                "mov.b64 p23, {e2, e3};\n"
+                "mov.b64 p45, {e4, e5};\n"
+                "mov.b64 p67, {e6, e7};\n"
+                "mul.f32x2 p01, p01, s2;\n"
+                "mul.f32x2 p23, p23, s2;\n"
+                "mul.f32x2 p45, p45, s2;\n"
+                "mul.f32x2 p67, p67, s2;\n"
+                "mov.b64 {a1, a0}, p01;\n"
+                "mov.b64 {a3, a2}, p23;\n"
+                "mov.b64 {a5, a4}, p45;\n"
+                "mov.b64 {a7, a6}, p67;\n"
+                "cvt.rn.satfinite.e2m1x2.f32 b0, a0, a1;\n"
+                "cvt.rn.satfinite.e2m1x2.f32 b1, a2, a3;\n"
+                "cvt.rn.satfinite.e2m1x2.f32 b2, a4, a5;\n"
+                "cvt.rn.satfinite.e2m1x2.f32 b3, a6, a7;\n"
+                "mov.b32 $0, {b0, b1, b2, b3};\n"
+                "}"
+            ),
+            "=r,f,f,f,f,f,f,f,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
 def _div_rn_f32(
     a: cutlass.Float32, b: cutlass.Float32, *, loc=None, ip=None
 ) -> cutlass.Float32:
@@ -654,12 +736,20 @@ def _enc_from_amax(amax, enc_over_fp4max, dec, fast_math: cutlass.Constexpr = Fa
     return enc, pvscale_fp8
 
 
-def _pack16_rn_from_enc(vals, enc):
-    """16 BF16-origin f32 values + encode multiplier -> the two packed-FP4 u32 words."""
-    w0 = _mul_cvt_rn_e2m1x8_f32(
+def _pack16_rn_from_enc(vals, enc, rht_acc: cutlass.Constexpr = False):
+    """16 f32 values + encode multiplier -> the two packed-FP4 u32 words, RTNE.
+
+    ``rht_acc`` selects the variant that first rounds the raw accumulator through bfloat16.
+    """
+    pack8 = (
+        _mul_cvt_rn_e2m1x8_acc_f32
+        if cutlass.const_expr(rht_acc)
+        else _mul_cvt_rn_e2m1x8_f32
+    )
+    w0 = pack8(
         vals[0], vals[1], vals[2], vals[3], vals[4], vals[5], vals[6], vals[7], enc
     )
-    w1 = _mul_cvt_rn_e2m1x8_f32(
+    w1 = pack8(
         vals[8], vals[9], vals[10], vals[11], vals[12], vals[13], vals[14], vals[15], enc
     )
     return w0, w1
@@ -683,8 +773,8 @@ def _quant16_from_amax(
     uses TE's approximate FTZ reciprocal. The caller is responsible for rounding
     ``amax`` in exact mode (see ``_round_rht_amax``)."""
     enc, pvscale_fp8 = _enc_from_amax(amax, enc_over_fp4max, dec, fast_math)
-    if cutlass.const_expr(not sr and not fast_math and not rht_acc):
-        w0, w1 = _pack16_rn_from_enc(vals, enc)
+    if cutlass.const_expr(not sr and not fast_math):
+        w0, w1 = _pack16_rn_from_enc(vals, enc, rht_acc)
         return w0, w1, pvscale_fp8
     q = cute.make_rmem_tensor((16,), cutlass.Float32)
     fp4_max = cutlass.Float32(FP4_E2M1_MAX)
