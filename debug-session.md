@@ -1,0 +1,229 @@
+# CuTeDSL Quantization Debug Session
+
+## Experiment 1 — 1D linear 128-row supertile
+
+- Hypothesis: the existing 128-row RHT geometry (320 threads/CTA) would improve
+  occupancy over the profiled 256-row geometry (448 threads/CTA) on the
+  `(2048, 7168)` gate/up sentinel.
+- Action: selected `col_groups_per_supertile = 8` only when `apply_rht=True`.
+- Command: `python - <<'PY' ... kernel_time_us(cutedsl_rht_quantize_row_col)` with
+  seed 123, BF16 `(2048, 7168)`, default math, RTNE; three profiler samples, each
+  using the canonical 15 warmups and 50 measured iterations.
+- Result: baseline `23.6610 us`; experiment `23.6514`, `23.6391`, `23.6493 us`.
+- Interpretation: median gain was about 0.05%, far below the approximately 2%
+  acceptance threshold. The 448-thread launch is not the limiting factor for this
+  sentinel.
+- Canonical-command status: canonical sentinel shape and timing helper; direct
+  one-off driver rather than the multi-shape benchmark CLI.
+- Failure classification: low-information performance result; change rejected and
+  reverted with an inverse patch.
+
+## Experiment 7 — Shared packed BF16-to-FP4 epilogue
+
+- Hypothesis: the packed multiply/convert primitive that was sub-threshold when only
+  the 1D row half used it would exceed the threshold when both halves of the 2D
+  no-MMA kernel used it.
+- Evidence: TransformerEngine's exact path uses packed `mul.f32x2` immediately before
+  packed FP4 conversion; both 2D row and column epilogues consume BF16-origin values.
+- Action: added `_mul_cvt_rn_e2m1x8_f32` and selected it for exact-math RTNE blocks
+  whose inputs are already BF16 values widened to FP32.
+- Command: canonical direct RTNE `cutedsl_weight_quantize_2d` sentinel at
+  `(2048, 7168)`, three samples with 15 warmups and 50 timed profiler iterations.
+- Result: `23.4702`, `23.4453`, and `23.4433 us` versus `24.7719 us`, about 5.3%
+  faster. Final matrix median was `23.2973 us`, 5.95% faster than the saved baseline.
+- Interpretation: eliminating the intermediate scalar scaled-value tensor reduces
+  epilogue work enough when both output orientations benefit.
+- Correctness: smallest 2D linear, 1D linear, and 1D grouped bitwise cases passed;
+  grouped 2D bitwise parity also passed.
+- Canonical-command status: canonical shape and timing parameters; direct driver
+  rather than multi-shape CLI.
+- Failure classification: none; validated optimization retained and committed as
+  `4a6ec376`.
+
+## Experiment 2 — 1D linear packed multiply/convert
+
+- Hypothesis: matching TransformerEngine's packed `mul.f32x2` plus FP4 conversion
+  sequence in the plain BF16 row epilogue would reduce scalar arithmetic and register
+  pressure enough to improve the `(2048, 7168)` sentinel.
+- Evidence: installed TransformerEngine
+  `common/util/ptx.cuh::mul_cvt_bf16_to_fp4_8x_round_to_nearest` uses four packed
+  FP32x2 multiplies followed immediately by four packed FP4 conversions.
+- Action: added one inline CuTeDSL primitive for eight values and used it only for
+  exact-math RTNE non-RHT blocks.
+- Command: the same canonical direct sentinel driver as Experiment 1; one initial
+  sample followed by two confirmation samples.
+- Result: `23.2968`, `23.3767`, and `23.3460 us` versus baseline `23.6610 us`, a
+  roughly 1.2-1.5% gain.
+- Interpretation: the hypothesis was directionally supported but did not meet the
+  approximately 2% acceptance threshold. Retaining a shared primitive would also
+  broaden 2D scope without sufficient payoff.
+- Canonical-command status: canonical shape, math, rounding, warmups, and timed
+  iterations; direct one-off driver rather than the multi-shape benchmark CLI.
+- Failure classification: sub-threshold performance improvement; change rejected and
+  reverted with an inverse patch.
+
+## Experiment 3 — 1D linear column-store overlap
+
+- Hypothesis: double-buffering the column FP4/scale staging and changing the TMA wait
+  from `wait_group(0)` to `wait_group(1)` would overlap the prior iteration's output
+  store with the next persistent iteration.
+- Evidence: the row epilogue already uses this safe two-stage pattern, while the
+  column epilogue used one buffer and fully drained each store.
+- Action: added two stages to both column output buffers, selected them by persistent
+  iteration, limited in-flight stores to one, and drained the final store at exit.
+- Command: canonical direct default-math RTNE `(2048, 7168)` sentinel with 15 warmups
+  and 50 measured profiler iterations.
+- Result: `23.7940 us` versus baseline `23.6610 us`, about 0.6% slower.
+- Interpretation: with only three persistent iterations at this shape, extra shared
+  memory and staging overhead outweighed the store overlap.
+- Canonical-command status: canonical sentinel shape and timing parameters; direct
+  driver rather than multi-shape CLI.
+- Failure classification: performance regression; change rejected and reverted with
+  an inverse patch.
+
+## Experiment 5 — 1D grouped 16-tile scheduler work items
+
+- Hypothesis: increasing scheduler work items from 8 to 16 token tiles would halve
+  CLC fetches and group searches for 2048-token experts.
+- Evidence: each expert has exactly 16 128-token tiles, so the sentinel currently uses
+  two work items per hidden tile and never crosses an expert boundary within either.
+- Action: changed `K_TILE_MAX` from 8 to 16.
+- Command: the same canonical grouped sentinel as Experiment 4.
+- Result: `77.6977 us` versus baseline `61.3872 us`, about 26.6% slower.
+- Interpretation: the longer work item substantially reduces persistent load balance;
+  the TransformerEngine-derived 8-tile setting is necessary despite scheduler costs.
+- Canonical-command status: canonical sentinel shape and timing parameters; direct
+  driver rather than multi-shape CLI.
+- Failure classification: major performance regression; change rejected and reverted
+  with an inverse patch.
+
+## Experiment 6 — 2D linear 128-row supertile
+
+- Hypothesis: the existing 128-row no-MMA geometry (416 threads) would schedule more
+  efficiently than the 256-row geometry (544 threads) on `(2048, 7168)`.
+- Evidence: the no-MMA path assigns 256 column threads plus one row thread per
+  supertile row, making its 256-row block much larger than the profiled RHT block.
+- Action: selected the 128-row geometry for `apply_rht=False`.
+- Command: canonical direct RTNE `cutedsl_weight_quantize_2d` sentinel at
+  `(2048, 7168)`, 15 warmups, and 50 measured profiler iterations.
+- Result: `24.7887 us` versus baseline `24.7719 us`, effectively flat/slightly slower.
+- Interpretation: halving tile height does not improve the no-MMA path; the extra tile
+  count offsets its smaller block.
+- Canonical-command status: canonical sentinel shape and timing parameters; direct
+  driver rather than multi-shape CLI.
+- Failure classification: low-information performance result; change rejected and
+  reverted with an inverse patch.
+
+## Experiment 4 — 1D grouped aligned row stores
+
+- Hypothesis: replacing the two aligned 32-bit row-code stores with one CuTeDSL
+  autovectorized two-word copy would reduce global-store instructions.
+- Evidence: each thread owns two contiguous u32 words at an 8-byte-aligned block
+  offset, while the column path already uses `cute.autovec_copy` for contiguous words.
+- Action: staged the two words in a two-element register tensor and autovector-copied
+  them into an aligned two-word local tile, including the capacity-zero path.
+- Command: canonical direct default-math RTNE grouped sentinel with `E=4`, each
+  `(2048, 7168)`, 15 warmups, and 50 measured profiler iterations.
+- Result: `62.2391 us` versus baseline `61.3872 us`, about 1.4% slower.
+- Interpretation: the register tensor/copy lowering costs more than the two direct
+  stores; alignment was not the limiting issue.
+- Canonical-command status: canonical sentinel shape and timing parameters; direct
+  driver rather than multi-shape CLI.
+- Failure classification: performance regression; change rejected and reverted with
+  an inverse patch.
+
+## Experiment 8 — SASS-first triage of the 2D weight kernel
+
+- Hypothesis: after the packed-convert win, the remaining TE gap is either epilogue
+  instruction count or occupancy, and the compiled SASS can tell them apart without
+  spending a benchmark.
+- Action: `CUTE_DSL_KEEP=cubin CUTE_DSL_DUMP_DIR=... ` around `_compile_fused_kernel(
+  0, True, False, apply_rht=False, grouped=False, col_groups_per_supertile=16)`, then
+  `cuobjdump -res-usage -sass`.
+- Result: `REG:49 STACK:0`, 3432 static instructions, of which 256 `LDS.U16`, zero
+  vector loads, and roughly 1823 (53%) integer/address arithmetic.
+- Interpretation: occupancy is not register-limited, so the 544-thread block is not
+  the binding constraint. The kernel is dominated by per-element swizzled address
+  computation feeding scalar 16-bit SMEM loads. This redirected the whole round away
+  from geometry and toward the SMEM read shape.
+- Failure classification: none; this is the discriminating measurement the round was
+  built on.
+
+## Experiment 9 — Vectorized rowwise SMEM reads
+
+- Hypothesis: the row epilogue's 16 scalar indexed reads per block are contiguous
+  (the `MN_SW128` atom makes the N grain stride-1) and should be one vector copy.
+- Evidence: `_cutedsl_group_kernels_impl.py:891-895` already reads its row blocks with
+  `cute.autovec_copy` over the same atom and the same `tile_to_shape` clean layout;
+  only the linear kernel still used scalar reads. TE's 2D kernel likewise issues
+  `LDS.128` for its rowwise half and scalar `LDS` only for the transposed half.
+- Action: replaced the `for j in range(16)` scalar read at `_cutedsl_kernels_impl.py`
+  with `cute.autovec_copy(cute.local_tile(sA_clean[(None, k_row, stage)], (16,), (b,)),
+  rBlk)` and hoisted `blk`/`rBlk` out of the block loop.
+- Result: 128 `LDS.U16` -> 16 `LDS.128`; 3432 -> 3048 static instructions; REG 49 ->
+  51. 2D linear `(2048, 7168)` `23.2973 -> 18.3297 us` (21.3%), 2D grouped E=4
+  `87.3549 -> 67.8821 us` (22.3%), 1D linear RTNE `23.2411 -> 21.4503 us` (7.7%).
+- Correctness: 45 Triton-parity cases and 54 TE-reference CuteDSL cases all passed.
+- Failure classification: none; retained.
+
+## Experiment 10 — Hoisting the col N-row slice
+
+- Hypothesis: the column epilogue's per-element swizzled addressing would strength
+  reduce if the N-row and stage were sliced out once per iteration, mirroring what
+  made the row half cheap.
+- Action: `sA_col = sA_clean[((nrow % 64, nrow // 64), None, (0, stage))]` hoisted out
+  of the 16-element loop, indexed by `mpos` inside.
+- Result: 3072 static instructions versus 3048; slightly worse.
+- Interpretation: the DSL and ptxas already strength-reduce this addressing. The col
+  half's cost is the scalar 16-bit access width itself, not redundant address math.
+- Failure classification: low-information result; reverted before measuring.
+
+## Experiment 11 — Paired columnwise SMEM reads
+
+- Hypothesis: a column thread that owns an adjacent N-row pair reads 32 bits instead
+  of 16, so a warp moves the full 128 B instead of 64 B, and the pair shares its
+  16x16 block amax, scale and reciprocal.
+- Evidence: TE's tuned 1D kernel does exactly this
+  (`specialized/quantize_transpose_nvfp4_tuned_1D.cuh:188-268`): column pairs read
+  with `ld_shared_b32`, two block amaxes taken from one `bf16x2` accumulator.
+- Action: `nrow = (tidx % 64) * 2`, `u_quarter = tidx // 64`, 4 col-groups per thread,
+  `cute.autovec_copy` of a 2-element tile per M-position; `_group16_amax` parameterized
+  to take the 8-lane offsets `(4, 2, 1)` after an in-register fold; `_quant16_from_amax`
+  split into `_enc_from_amax` + `_pack16_rn_from_enc` so the E4M3 round-trip and the
+  exact reciprocal are computed once for the pair.
+- Result: 128 `LDS.U16` -> 64 32-bit `LDS`; 3048 -> 2712 static instructions; REG 51 ->
+  56. 2D linear `18.3297 -> 16.4788 us` (10.1%), 2D grouped `67.8821 -> 60.8464 us`
+  (10.4%).
+- Correctness: 61 combined 2D Triton-parity and TE-reference cases passed.
+- Failure classification: none; retained.
+
+## Experiment 12 — Fused RHT-accumulator epilogue
+
+- Hypothesis: the `rht_acc` exact path is the last place the packed multiply/convert
+  win was not applied, and folding its bfloat16 round-through into the same asm block
+  should give the 1D column epilogue what the 2D epilogues already have.
+- Evidence: TE's `ptx.cuh:824` consumes bfloat16 directly and relies on
+  `cvt.rn.satfinite` for saturation rather than an explicit clamp.
+- Action: added `_mul_cvt_rn_e2m1x8_acc_f32` (four `cvt.rn.bf16x2.f32`, shift/mask
+  re-widen, four `mul.f32x2`, four `cvt.rn.satfinite.e2m1x2.f32`), selected via
+  `_pack16_rn_from_enc(..., rht_acc)`. Dropped the `min.xorsign.abs` clamp.
+- Result: 1D linear RTNE `21.4503 -> 19.5726 us` (8.8%); 1D grouped inherits it via the
+  shared `_quant16`, `61.6432 -> 57.5215 us` (6.7%).
+- Correctness: 33 cases including the TE fast-math byte-identity test and the
+  zero/near-zero no-saturation test (which is what exercises the removed clamp).
+- Failure classification: none; retained.
+
+## Experiment 13 — Two co-resident CTAs on the 2D path
+
+- Hypothesis: with 56 registers and a ~92 KiB SMEM budget at the 128-row supertile,
+  two 416-thread CTAs fit per SM, raising 17 warps/SM to 26.
+- Evidence: all TMEM allocation is `apply_rht`-gated, so the weight path holds no
+  TMEM and two CTAs cannot contend for it. The earlier 128-row experiment kept
+  `GRID = min(NUM_SMS, num_super)` and therefore never tested occupancy.
+- Action: forced `col_groups_per_supertile = 8` for `apply_rht=False` and doubled the
+  persistent grid.
+- Result: `16.1811 us` versus `16.4788 us`, 1.81% faster.
+- Interpretation: real but below the ~2% bar, and it would pin every weight shape to
+  the 128-row geometry. Occupancy is a genuine second-order effect here, not the
+  first-order one the pre-round table suggested.
+- Failure classification: sub-threshold improvement; reverted.
