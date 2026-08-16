@@ -1,5 +1,40 @@
 # CuteDSL TE-Default RTNE Quantization Optimization
 
+## Local NVFP4 History Rewrite Preflight
+
+Status: IN PROGRESS
+
+### Preflight
+
+Preserve the current `bc87303f` lineage and workflow ledgers on
+`nvfp4_moe_cutedsl_history`, then rebuild the local work as exactly one Triton/oracle
+commit on `origin/nvfp4_moe` and exactly one CuTeDSL product commit above it. Repoint
+only local branches; do not push, rewrite a remote, or use GitHub tooling.
+
+### Observable Success Criterion
+
+- `origin/nvfp4_moe..nvfp4_moe` contains one commit named
+  `Match Triton NVFP4 kernels to TransformerEngine defaults`.
+- `nvfp4_moe..nvfp4_moe_cutedsl` contains one commit named
+  `Add CuTeDSL NVFP4 kernels`.
+- The rewritten CuTeDSL tree equals the archived final product tree except for
+  `save.md` and `debug-session.md`.
+- Focused TE-default byte-equivalence and backend-equivalence validations pass, and the
+  final worktree is clean.
+
+### Scope Fence
+
+The first commit contains only Triton numerical fixes, the test-only TE oracle and shared
+assertions, group-aware blocked-scale support, and Triton-only oracle tests. The second
+contains all remaining CuTeDSL integration and product changes. Preserve upstream branch
+configuration and remove only the temporary rewrite branch after establishing final tips.
+
+### Surgical Simplicity
+
+No new source, API, abstraction, or test is being invented during the rewrite. The two
+replacement commits partition the already validated final tree; the history branch is the
+recoverable checkpoint for the original lineage and ledgers.
+
 Status: COMPLETE — TEST-ONLY NVFP4 ORACLE MOVED UNDER TEST
 
 ### Preflight
