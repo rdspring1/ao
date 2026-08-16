@@ -49,12 +49,13 @@ from typing import Optional, Sequence, Tuple
 
 import torch
 
+from torchao.prototype.mx_formats.kernels import f32_to_f4_unpacked, pack_uint4
+from torchao.prototype.mx_formats.utils import to_blocked, to_blocked_grouped
+
 from torchao.prototype.moe_training.nvfp4_training.hadamard_utils import (
     DEFAULT_SIGN_VECTOR,
     get_rht_matrix,
 )
-from torchao.prototype.mx_formats.kernels import f32_to_f4_unpacked, pack_uint4
-from torchao.prototype.mx_formats.utils import to_blocked, to_blocked_grouped
 
 FP4_E2M1_MAX = 6.0
 FP8_E4M3_MAX = 448.0

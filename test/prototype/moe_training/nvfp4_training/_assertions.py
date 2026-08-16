@@ -114,9 +114,7 @@ def assert_scales_adjacent(
 
 
 def assert_zero_quantized(
-    codes: torch.Tensor,
-    scales: torch.Tensor,
-    dequantized: Optional[torch.Tensor] = None,
+    codes: torch.Tensor, scales: torch.Tensor, dequantized: Optional[torch.Tensor] = None
 ) -> None:
     """An all-zero input packs to zero codes, stores a zero block scale, and dequantizes
     to exactly zero."""
@@ -125,6 +123,4 @@ def assert_zero_quantized(
         "zero input must store a zero block scale"
     )
     if dequantized is not None:
-        assert torch.count_nonzero(dequantized) == 0, (
-            "zero input must dequantize to zero"
-        )
+        assert torch.count_nonzero(dequantized) == 0, "zero input must dequantize to zero"
