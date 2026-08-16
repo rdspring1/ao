@@ -1312,6 +1312,8 @@ class _Tcgen05RowColFused:
             row_ab_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, NUM_AB_STAGE
             )
+            blk = cute.make_rmem_tensor((16,), cutlass.Float32)
+            rBlk = cute.make_rmem_tensor((16,), cutlass.BFloat16)
             for local_iter in cutlass.range(num_iters):
                 super_id = start_pid + local_iter * GRID
                 pid_m = super_id // num_tiles_ns
@@ -1328,16 +1330,15 @@ class _Tcgen05RowColFused:
                 ab_pipeline.consumer_wait(row_ab_state)  # wait sA full
                 stage = row_ab_state.index
 
-                # read this thread's M-row (128 N values across the m_mma grain), 8 SF-blocks
-                kc = k_row % cutlass.Int32(8)
-                kd = k_row // cutlass.Int32(8)
+                # read this thread's M-row (128 N values across the m_mma grain), 8 SF-blocks.
+                # The A atom is MN_SW128, so the N grain is the contiguous mode: each block of
+                # 16 is one vector copy, not 16 scalar swizzled loads (same shape as the grouped
+                # kernel's row epilogue).
+                sA_row = sA_clean[(None, k_row, stage)]
                 for b in cutlass.range_constexpr(M_TILE // 16):  # 8 blocks of 16 N
-                    blk = cute.make_rmem_tensor((16,), cutlass.Float32)
+                    cute.autovec_copy(cute.local_tile(sA_row, (16,), (b,)), rBlk)
                     for j in cutlass.range_constexpr(16):
-                        m_mma = b * 16 + j  # N position (0..127), python int
-                        blk[j] = sA_clean[
-                            ((m_mma % 64, m_mma // 64), (kc, kd), (0, stage))
-                        ].to(cutlass.Float32)
+                        blk[j] = rBlk[j].to(cutlass.Float32)
                     row_rb = None
                     if cutlass.const_expr(self.sr):
                         # This thread owns supertile row k_row, i.e. triton token tile
