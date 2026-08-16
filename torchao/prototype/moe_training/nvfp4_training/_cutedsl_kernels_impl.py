@@ -302,6 +302,162 @@ def _mul_cvt_rn_e2m1x8_acc_f32(
 
 
 @dsl_user_op
+def _mul_cvt_rs_e2m1x8_f32(
+    v0: cutlass.Float32,
+    v1: cutlass.Float32,
+    v2: cutlass.Float32,
+    v3: cutlass.Float32,
+    v4: cutlass.Float32,
+    v5: cutlass.Float32,
+    v6: cutlass.Float32,
+    v7: cutlass.Float32,
+    scale: cutlass.Float32,
+    rb0: cutlass.Uint32,
+    rb1: cutlass.Uint32,
+    *,
+    loc=None,
+    ip=None,
+) -> cutlass.Uint32:
+    """Stochastic-rounding analog of ``_mul_cvt_rn_e2m1x8_f32``.
+
+    Same packed FP32 multiplies, but the four ``cvt.rn.satfinite.e2m1x2.f32`` collapse into two
+    ``cvt.rs.satfinite.e2m1x4.f32``, each consuming one 32-bit random word: ``rb0`` covers
+    ``v0..v3``, ``rb1`` covers ``v4..v7``. ``cvt.rs`` takes its four sources most-significant
+    nibble first, so ``{a3, a2, a1, a0}`` lays ``v0..v3`` down in ascending nibble order --
+    the same nibbles ``_pack16``'s ``{$6, $2, $5, $1}`` produced from the scalar path.
+
+    The explicit clamp to +-FP4_E2M1_MAX the scalar path applied is dropped, as in
+    ``_mul_cvt_rn_e2m1x8_acc_f32``: ``.satfinite`` already saturates there.
+    """
+    return cutlass.Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [
+                v0.ir_value(loc=loc, ip=ip),
+                v1.ir_value(loc=loc, ip=ip),
+                v2.ir_value(loc=loc, ip=ip),
+                v3.ir_value(loc=loc, ip=ip),
+                v4.ir_value(loc=loc, ip=ip),
+                v5.ir_value(loc=loc, ip=ip),
+                v6.ir_value(loc=loc, ip=ip),
+                v7.ir_value(loc=loc, ip=ip),
+                scale.ir_value(loc=loc, ip=ip),
+                rb0.ir_value(loc=loc, ip=ip),
+                rb1.ir_value(loc=loc, ip=ip),
+            ],
+            (
+                "{\n"
+                ".reg .b64 s2, p01, p23, p45, p67;\n"
+                ".reg .f32 a0, a1, a2, a3, a4, a5, a6, a7;\n"
+                ".reg .b16 h0, h1;\n"
+                "mov.b64 s2, {$9, $9};\n"
+                "mov.b64 p01, {$1, $2};\n"
+                "mov.b64 p23, {$3, $4};\n"
+                "mov.b64 p45, {$5, $6};\n"
+                "mov.b64 p67, {$7, $8};\n"
+                "mul.f32x2 p01, p01, s2;\n"
+                "mul.f32x2 p23, p23, s2;\n"
+                "mul.f32x2 p45, p45, s2;\n"
+                "mul.f32x2 p67, p67, s2;\n"
+                "mov.b64 {a0, a1}, p01;\n"
+                "mov.b64 {a2, a3}, p23;\n"
+                "mov.b64 {a4, a5}, p45;\n"
+                "mov.b64 {a6, a7}, p67;\n"
+                "cvt.rs.satfinite.e2m1x4.f32 h0, {a3, a2, a1, a0}, $10;\n"
+                "cvt.rs.satfinite.e2m1x4.f32 h1, {a7, a6, a5, a4}, $11;\n"
+                "mov.b32 $0, {h0, h1};\n"
+                "}"
+            ),
+            "=r,f,f,f,f,f,f,f,f,f,r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def _mul_cvt_rs_e2m1x8_acc_f32(
+    v0: cutlass.Float32,
+    v1: cutlass.Float32,
+    v2: cutlass.Float32,
+    v3: cutlass.Float32,
+    v4: cutlass.Float32,
+    v5: cutlass.Float32,
+    v6: cutlass.Float32,
+    v7: cutlass.Float32,
+    scale: cutlass.Float32,
+    rb0: cutlass.Uint32,
+    rb1: cutlass.Uint32,
+    *,
+    loc=None,
+    ip=None,
+) -> cutlass.Uint32:
+    """``_mul_cvt_rs_e2m1x8_f32`` for raw tcgen05 RHT accumulators.
+
+    Carries the same exact-mode bfloat16 round-through as ``_mul_cvt_rn_e2m1x8_acc_f32``.
+    """
+    return cutlass.Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [
+                v0.ir_value(loc=loc, ip=ip),
+                v1.ir_value(loc=loc, ip=ip),
+                v2.ir_value(loc=loc, ip=ip),
+                v3.ir_value(loc=loc, ip=ip),
+                v4.ir_value(loc=loc, ip=ip),
+                v5.ir_value(loc=loc, ip=ip),
+                v6.ir_value(loc=loc, ip=ip),
+                v7.ir_value(loc=loc, ip=ip),
+                scale.ir_value(loc=loc, ip=ip),
+                rb0.ir_value(loc=loc, ip=ip),
+                rb1.ir_value(loc=loc, ip=ip),
+            ],
+            (
+                "{\n"
+                ".reg .b64 s2, p01, p23, p45, p67;\n"
+                ".reg .b32 t01, t23, t45, t67, e0, e1, e2, e3, e4, e5, e6, e7;\n"
+                ".reg .f32 a0, a1, a2, a3, a4, a5, a6, a7;\n"
+                ".reg .b16 h0, h1;\n"
+                "mov.b64 s2, {$9, $9};\n"
+                "cvt.rn.bf16x2.f32 t01, $2, $1;\n"
+                "cvt.rn.bf16x2.f32 t23, $4, $3;\n"
+                "cvt.rn.bf16x2.f32 t45, $6, $5;\n"
+                "cvt.rn.bf16x2.f32 t67, $8, $7;\n"
+                "shl.b32 e0, t01, 16;\n"
+                "and.b32 e1, t01, 0xffff0000;\n"
+                "shl.b32 e2, t23, 16;\n"
+                "and.b32 e3, t23, 0xffff0000;\n"
+                "shl.b32 e4, t45, 16;\n"
+                "and.b32 e5, t45, 0xffff0000;\n"
+                "shl.b32 e6, t67, 16;\n"
+                "and.b32 e7, t67, 0xffff0000;\n"
+                "mov.b64 p01, {e0, e1};\n"
+                "mov.b64 p23, {e2, e3};\n"
+                "mov.b64 p45, {e4, e5};\n"
+                "mov.b64 p67, {e6, e7};\n"
+                "mul.f32x2 p01, p01, s2;\n"
+                "mul.f32x2 p23, p23, s2;\n"
+                "mul.f32x2 p45, p45, s2;\n"
+                "mul.f32x2 p67, p67, s2;\n"
+                "mov.b64 {a0, a1}, p01;\n"
+                "mov.b64 {a2, a3}, p23;\n"
+                "mov.b64 {a4, a5}, p45;\n"
+                "mov.b64 {a6, a7}, p67;\n"
+                "cvt.rs.satfinite.e2m1x4.f32 h0, {a3, a2, a1, a0}, $10;\n"
+                "cvt.rs.satfinite.e2m1x4.f32 h1, {a7, a6, a5, a4}, $11;\n"
+                "mov.b32 $0, {h0, h1};\n"
+                "}"
+            ),
+            "=r,f,f,f,f,f,f,f,f,f,r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
 def _div_rn_f32(
     a: cutlass.Float32, b: cutlass.Float32, *, loc=None, ip=None
 ) -> cutlass.Float32:
@@ -755,6 +911,47 @@ def _pack16_rn_from_enc(vals, enc, rht_acc: cutlass.Constexpr = False):
     return w0, w1
 
 
+def _pack16_rs_from_enc(vals, enc, rb, rht_acc: cutlass.Constexpr = False):
+    """16 f32 values + encode multiplier + 4 random words -> the two packed-FP4 u32 words, SR.
+
+    The stochastic-rounding twin of ``_pack16_rn_from_enc``. ``rb`` covers the values in
+    groups of four (``rb[0]`` for ``vals[0:4]``, ``rb[1]`` for ``vals[4:8]``, ...), which is
+    the grouping ``cvt.rs`` consumes.
+    """
+    pack8 = (
+        _mul_cvt_rs_e2m1x8_acc_f32
+        if cutlass.const_expr(rht_acc)
+        else _mul_cvt_rs_e2m1x8_f32
+    )
+    w0 = pack8(
+        vals[0],
+        vals[1],
+        vals[2],
+        vals[3],
+        vals[4],
+        vals[5],
+        vals[6],
+        vals[7],
+        enc,
+        rb[0],
+        rb[1],
+    )
+    w1 = pack8(
+        vals[8],
+        vals[9],
+        vals[10],
+        vals[11],
+        vals[12],
+        vals[13],
+        vals[14],
+        vals[15],
+        enc,
+        rb[2],
+        rb[3],
+    )
+    return w0, w1
+
+
 def _quant16_from_amax(
     vals,
     amax,
@@ -773,7 +970,10 @@ def _quant16_from_amax(
     uses TE's approximate FTZ reciprocal. The caller is responsible for rounding
     ``amax`` in exact mode (see ``_round_rht_amax``)."""
     enc, pvscale_fp8 = _enc_from_amax(amax, enc_over_fp4max, dec, fast_math)
-    if cutlass.const_expr(not sr and not fast_math):
+    if cutlass.const_expr(sr):
+        w0, w1 = _pack16_rs_from_enc(vals, enc, rb, rht_acc and not fast_math)
+        return w0, w1, pvscale_fp8
+    if cutlass.const_expr(not fast_math):
         w0, w1 = _pack16_rn_from_enc(vals, enc, rht_acc)
         return w0, w1, pvscale_fp8
     q = cute.make_rmem_tensor((16,), cutlass.Float32)
