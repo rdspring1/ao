@@ -475,15 +475,104 @@ The exact sentinel commands use the public callables shown by the benchmark modu
 python -m benchmarks.prototype.nvfp4_training.bench_hadamard_quantize_row_col
 python -m benchmarks.prototype.nvfp4_training.bench_group_rht_quantize_row_col --experts 4 --rounding all
 python -m benchmarks.prototype.nvfp4_training.bench_quantize_2d
-python -m benchmarks.prototype.nvfp4_training.bench_group_quantize_2d --experts 4
-NVTE_USE_FAST_MATH=1 python -m benchmarks.prototype.nvfp4_training.bench_quantize_2d
-NVTE_USE_FAST_MATH=1 python -m benchmarks.prototype.nvfp4_training.bench_group_quantize_2d --experts 4
+python -m benchmarks.prototype.nvfp4_training.bench_group_quantize_2d
 ```
+
+`bench_group_quantize_2d` takes no arguments (`LOCAL_EXPERTS = 4` is hardcoded), and
+`bench_hadamard_quantize_row_col` benchmarks RTNE only — `--rounding` exists on the
+grouped script alone. `NVTE_USE_FAST_MATH` is a TransformerEngine variable and has no
+effect on a pure torchao run; the 1D fast rows come from `use_fast_math=True`, and the
+2D weight path has no fast-math specialization at all
+(`_cutedsl_kernels_impl.py` asserts `not (fast_math and not apply_rht)`).
 
 Remaining parity work is structural: the 2D kernel still uses a 544-thread dual
 epilogue block rather than TE's 128-thread 128x128 design, and the grouped 1D row
 scale factors remain scalar scattered stores. The geometry and store-staging variants
 tested here did not improve the representative shapes.
+
+### Epilogue SMEM-read and packing optimization
+
+A second pass profiled the compiled SASS instead of guessing at geometry
+(`CUTE_DSL_KEEP=cubin` + `cuobjdump -sass -res-usage`). The 2D weight kernel used
+**49 registers and no shared memory beyond its dynamic allocation**, so occupancy was
+never register-limited; instead **53% of its 3432 static instructions were address
+arithmetic** feeding 256 scalar `LDS.U16`. That measurement, not the thread count,
+explained the TE gap, and it identified three changes:
+
+1. **Vectorized rowwise SMEM reads.** The A operand uses an `MN_SW128` atom, so the N
+   grain is contiguous and each 16-element block is one vector copy. The row epilogue
+   was re-deriving a swizzled address per element; it now uses the same
+   `cute.autovec_copy` shape the grouped 1D row epilogue already used. 128 `LDS.U16`
+   became 16 `LDS.128`, and the static instruction count fell to 3048.
+2. **Paired columnwise SMEM reads.** A column thread now owns the adjacent N-row pair
+   `(nrow, nrow+1)` and a quarter of the col-group blocks, rather than one row and a
+   half. Because N is the contiguous mode the pair is one 32-bit load, so a warp moves
+   the full 128 B instead of 64 B; and because both rows sit in the same 16x16 block
+   they share one amax, one E4M3 scale and one exact reciprocal, halving the per-block
+   scale work. 128 `LDS.U16` became 64 32-bit `LDS`; 2712 static instructions.
+   The 16x16 amax butterfly correspondingly drops to the 8-lane offsets (4/2/1) after
+   an in-register fold of the pair.
+3. **Fused RHT-accumulator epilogue.** The 1D columnwise path was the one place the
+   earlier `_mul_cvt_rn_e2m1x8_f32` win had not been applied: it rounded the tcgen05
+   accumulator through bfloat16, re-widened by shift/mask, multiplied scalar-wise and
+   clamped, then packed. `_mul_cvt_rn_e2m1x8_acc_f32` folds all of that into one asm
+   block; the explicit `min.xorsign.abs` clamp is dropped because
+   `cvt.rn.satfinite.e2m1x2.f32` already saturates at +-6, matching what TE's
+   `mul_cvt_bf16_to_fp4_8x_round_to_nearest` relies on.
+
+| family | projection | math | rounding | before (us) | after (us) | change |
+|---|---|---|---|---:|---:|---:|
+| 1D linear | gate/up | standard | RTNE | 23.2411 | 19.5444 | 15.9% faster |
+| 1D linear | gate/up | standard | SR | 51.0504 | 46.4310 | 9.0% faster |
+| 1D linear | gate/up | fast | RTNE | 18.8167 | 14.8403 | 21.1% faster |
+| 1D linear | gate/up | fast | SR | 34.6773 | 33.0158 | 4.8% faster |
+| 1D linear | down | standard | RTNE | 23.3231 | 19.5522 | 16.2% faster |
+| 1D linear | down | standard | SR | 50.6500 | 46.3109 | 8.6% faster |
+| 1D linear | down | fast | RTNE | 18.7982 | 14.8500 | 21.0% faster |
+| 1D linear | down | fast | SR | 34.5102 | 32.9883 | 4.4% faster |
+| 1D grouped, E=4 | gate/up | standard | RTNE | 61.6432 | 57.5612 | 6.6% faster |
+| 1D grouped, E=4 | gate/up | standard | SR | 149.5823 | 150.9141 | 0.89% slower |
+| 1D grouped, E=4 | gate/up | fast | RTNE | 45.3090 | 45.5933 | 0.63% slower |
+| 1D grouped, E=4 | gate/up | fast | SR | 115.1210 | 114.9064 | 0.19% faster |
+| 1D grouped, E=4 | down | standard | RTNE | 63.2194 | 58.4040 | 7.6% faster |
+| 1D grouped, E=4 | down | standard | SR | 150.8909 | 151.1979 | 0.20% slower |
+| 1D grouped, E=4 | down | fast | RTNE | 46.2625 | 46.1014 | 0.35% faster |
+| 1D grouped, E=4 | down | fast | SR | 115.8542 | 115.8348 | 0.02% faster |
+| 2D linear | gate/up | standard | RTNE | 23.2973 | 16.5665 | 28.9% faster |
+| 2D linear | down | standard | RTNE | 23.2692 | 16.5806 | 28.7% faster |
+| 2D grouped, E=4 | gate/up | standard | RTNE | 87.3549 | 60.5176 | 30.7% faster |
+| 2D grouped, E=4 | down | standard | RTNE | 87.4361 | 60.7924 | 30.5% faster |
+
+Aggregate device time across these 20 cases improved 8.3%; the largest regression was
+0.89%, below the 2% limit. The aggregate is dominated by the four grouped SR rows,
+which are unchanged because stochastic rounding takes neither new packing primitive
+and the grouped 1D row epilogue already read SMEM with `cute.autovec_copy`.
+
+Against TransformerEngine the 2D gap narrows substantially:
+
+| projection | E | CuteDSL (us) | TE (us) | TE speedup before | TE speedup now |
+|---|---:|---:|---:|---:|---:|
+| 2D linear gate/up | 1 | 16.5665 | 13.64 | 1.71x | 1.21x |
+| 2D grouped gate/up | 4 | 60.5176 | 54.56 (single x4) | 1.70x | 1.11x |
+| 2D grouped down | 4 | 60.7924 | 54.62 (single x4) | 1.69x | 1.11x |
+
+Every result above is bitwise identical to both oracles: the Triton backend (45 cases,
+including stochastic rounding) and the TE-derived PyTorch reference in
+`test/prototype/moe_training/nvfp4_training/nvfp4_reference.py` (54 CuteDSL cases).
+
+#### Rejected in this pass
+
+| experiment | result | outcome |
+|---|---:|---|
+| hoisting the N-row slice out of the col inner loop | 3072 vs 3048 static instrs | reverted |
+| two co-resident CTAs (128-row supertile, grid = 2x SMs) | 16.18 vs 16.48 us, 1.81% | reverted |
+
+Registers (49 before, 56 after) and shared memory do permit two 416-thread CTAs per
+SM, so the co-residency experiment ran as intended rather than being blocked — it
+simply did not clear the 2% bar, and it would have forced the 128-row geometry on
+every weight shape. This is distinct from the earlier 128-row supertile experiment,
+which kept `GRID = min(NUM_SMS, num_super)` and therefore never changed occupancy at
+all.
 
 ### Grouped Weight Amax
 
