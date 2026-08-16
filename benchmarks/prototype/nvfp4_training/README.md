@@ -413,6 +413,78 @@ persistent load balance. Remaining grouped work should preserve the 8-tile sched
 and focus on eliminating scalar scale-factor scatters or capacity handling when the
 logical packed length is smaller than capacity.
 
+#### 2D linear and grouped optimization results
+
+The 2D linear `(2048, 7168)` baseline was 24.7719 us. Selecting the existing
+128-row/416-thread geometry produced 24.7887 us and was reverted. A shared exact-mode
+RTNE primitive now scales eight BF16-origin values with four packed `mul.f32x2`
+instructions and immediately converts them to four packed FP4 bytes. It removes the
+intermediate 16-element scaled FP32 tensor when no RHT rounding or stochastic rounding
+is required.
+
+The primitive reduced the final 2D linear gate/up median to 23.2973 us (5.95%) and is
+bitwise identical to Triton. Grouped 2D inherits the same implementation on both
+output orientations: gate/up improved from 92.74 to 87.3549 us (5.81%), and down from
+92.57 to 87.4361 us (5.55%). Relative to TE's single-expert time multiplied by four,
+the grouped gap narrows from about 1.70x to 1.60x. The linear gap is about 1.71x.
+
+#### Final CuTeDSL validation matrix
+
+Each entry is the median of three samples. Every sample uses 15 warmups and 50 timed
+CUDA-profiler iterations and reports device kernel self-time in microseconds. The 1D
+rows measure the fused quantize stage with precomputed amaxes; the 2D rows consume
+precomputed weight amaxes.
+
+| family | projection | math/environment | rounding | median (us) |
+|---|---|---|---|---:|
+| 1D linear | gate/up | standard | RTNE | 23.2411 |
+| 1D linear | gate/up | standard | SR | 51.0504 |
+| 1D linear | gate/up | fast | RTNE | 18.8167 |
+| 1D linear | gate/up | fast | SR | 34.6773 |
+| 1D linear | down | standard | RTNE | 23.3231 |
+| 1D linear | down | standard | SR | 50.6500 |
+| 1D linear | down | fast | RTNE | 18.7982 |
+| 1D linear | down | fast | SR | 34.5102 |
+| 1D grouped, E=4 | gate/up | standard | RTNE | 61.6432 |
+| 1D grouped, E=4 | gate/up | standard | SR | 149.5823 |
+| 1D grouped, E=4 | gate/up | fast | RTNE | 45.3090 |
+| 1D grouped, E=4 | gate/up | fast | SR | 115.1210 |
+| 1D grouped, E=4 | down | standard | RTNE | 63.2194 |
+| 1D grouped, E=4 | down | standard | SR | 150.8909 |
+| 1D grouped, E=4 | down | fast | RTNE | 46.2625 |
+| 1D grouped, E=4 | down | fast | SR | 115.8542 |
+| 2D linear | gate/up | standard environment | RTNE | 23.2973 |
+| 2D linear | down | standard environment | RTNE | 23.2692 |
+| 2D linear | gate/up | `NVTE_USE_FAST_MATH=1` | RTNE | 23.2896 |
+| 2D linear | down | `NVTE_USE_FAST_MATH=1` | RTNE | 23.2834 |
+| 2D grouped, E=4 | gate/up | standard environment | RTNE | 87.3549 |
+| 2D grouped, E=4 | down | standard environment | RTNE | 87.4361 |
+| 2D grouped, E=4 | gate/up | `NVTE_USE_FAST_MATH=1` | RTNE | 87.3904 |
+| 2D grouped, E=4 | down | `NVTE_USE_FAST_MATH=1` | RTNE | 87.3985 |
+
+Across the six cases with saved directly comparable baselines, aggregate time improved
+3.28%. The largest regression was 0.76% (grouped 1D gate/up RTNE), below the 2%
+limit. The 2D fast-environment differences were at most 0.04%, confirming that this
+environment variable does not specialize the public 2D path.
+
+The exact sentinel commands use the public callables shown by the benchmark modules:
+
+```bash
+# Run each command three times for the reported medians (15 warmups/50 iterations
+# are the defaults in bench_utils.kernel_time_us).
+python -m benchmarks.prototype.nvfp4_training.bench_hadamard_quantize_row_col
+python -m benchmarks.prototype.nvfp4_training.bench_group_rht_quantize_row_col --experts 4 --rounding all
+python -m benchmarks.prototype.nvfp4_training.bench_quantize_2d
+python -m benchmarks.prototype.nvfp4_training.bench_group_quantize_2d --experts 4
+NVTE_USE_FAST_MATH=1 python -m benchmarks.prototype.nvfp4_training.bench_quantize_2d
+NVTE_USE_FAST_MATH=1 python -m benchmarks.prototype.nvfp4_training.bench_group_quantize_2d --experts 4
+```
+
+Remaining parity work is structural: the 2D kernel still uses a 544-thread dual
+epilogue block rather than TE's 128-thread 128x128 design, and the grouped 1D row
+scale factors remain scalar scattered stores. The geometry and store-staging variants
+tested here did not improve the representative shapes.
+
 ### Grouped Weight Amax
 
 Benchmarks `triton_group_weight_amax` — the input-side twin of the grouped 2D weight
