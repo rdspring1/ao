@@ -41,3 +41,139 @@ mask hypothesis is rejected.
 - Result: Gate/up 92.820 / 62.367 / 47.930 us; down 92.297 / 64.122 / 48.003 us.
 - Interpretation: Grouped TE is valid and is the RHT comparator. Four single TE calls remain necessary only for 2D weight quantization.
 - Failure classification: resolved harness bug.
+
+## Experiment 5
+
+- Hypothesis: Replacing opaque inline PTX `div.rn.f32` with CuteDSL's compiler-visible FP32 division preserves TE-default RTNE bits while allowing better scheduling.
+- Action: Ran one midpoint-sensitive linear TE-reference case and one grouped TE-reference case after changing only `_div_rn_f32`.
+- Exact command: `pytest -q 'test/prototype/moe_training/nvfp4_training/test_hadamard_quantize_row_col.py::test_rht_quantize_rtne_vs_transformer_engine_reference[bounded_integer-256x256-cutedsl]' 'test/prototype/moe_training/nvfp4_training/test_group_rht_quantize_row_col.py::test_group_rht_correctness[seed223-cutedsl]'`
+- Result: The linear case passed. The grouped case passed its row/column scale and code bitwise assertions, then failed in the subsequent independent cross-check with `NameError: name 'group_tensors' is not defined` at test line 370.
+- Interpretation: The candidate preserves the targeted TE-default numerics. The failure is a pre-existing test-body defect after the relevant assertions, not a kernel result; do not broaden this optimization to fix it.
+- Canonical-command status: Canonical targeted pytest cases; grouped case is partially unusable because of the unrelated test defect.
+- Failure classification: pre-existing test defect after successful kernel validation.
+
+### Performance result
+
+- Exact command: `env -u NVTE_USE_FAST_MATH python -` importing `time_grouped_rht` and timing only E=4 `(2048, 7168)` and `(7168, 2048)`.
+- Result: Candidate CuteDSL measured 64.857 / 66.796 us versus the prior 62.367 / 64.122 us; TE remained 48.076 / 48.007 us.
+- Interpretation: Compiler-visible scalar division is slower, not faster. Reject the hypothesis and restore explicit `div.rn.f32`.
+- Failure classification: supported optimization hypothesis rejected by performance validation.
+
+## Experiment 6
+
+- Hypothesis: Batching per-block exact reciprocals ahead of FP4 conversion will expose the same division ILP used by TE's vector scale phase.
+- Action: Split grouped row/column epilogues into a scale pass and quantization pass, rereading each fragment in the second pass.
+- Exact command: `env -u NVTE_USE_FAST_MATH python -` running `compare_grouped(4, 2048, 7168)` and `time_grouped_rht` for only the two E=4 671B shapes.
+- Result: All TE comparisons remained at 0% differing bytes. CuteDSL regressed to 82.717 / 84.739 us from 62.367 / 64.122 us.
+- Interpretation: Duplicate TMEM/SMEM fragment reads overwhelm any division overlap. Retain the batching hypothesis for one discriminating variant that keeps fragments in the epilogue's allocated registers; stop this experiment family if register pressure also loses.
+- Failure classification: implementation layout rejected; arithmetic hypothesis remains supported by serialized SASS.
+
+### Register-retention result
+
+- Exact command: `env -u NVTE_USE_FAST_MATH python -` running `time_grouped_rht(4, 2048, 7168)` only.
+- Result: Retaining all eight column fragments and four row fragments increased CuteDSL to 94.870 us.
+- Interpretation: Register pressure is worse than rereading. Reject division batching within the current warp-owned epilogue and restore the original code.
+- Failure classification: optimization family rejected for the current epilogue architecture.
+
+## Experiment 7: Direct TE Source Comparison
+
+- Observed: TE column copies the complete TMEM partition to registers, fences, and releases the accumulator pipeline before BF16 rounding, amax, division, and conversion (`graph_safe_group_row_cast_col_hadamard_transform_cast_fusion.cu:819-925`).
+- Observed: CuteDSL loads and quantizes eight 16-value TMEM fragments serially, releasing the accumulator pipeline only afterward (`_cutedsl_group_kernels_impl.py:754-783`).
+- Observed: TE row copies the complete SMEM partition and releases the mainloop pipeline before its per-vector quantization loop (`.cu:1041-1069`); CuteDSL releases only after four load/quantize passes (`.py:872-910`).
+- Interpretation: The failed register-retention experiment preserved CuteDSL's late release and duplicated a 16-value temporary, so it did not reproduce TE's defining lifetime/layout optimization. The next change should directly port compact bulk fragment ownership and early release.
+
+## Experiment 8
+
+- Hypothesis: Merging the eight UMMA-N modes and asking CuteDSL's generic TMEM selector for a 128x128 epilogue will reproduce TE's bulk column fragment.
+- Exact command: `env -u NVTE_USE_FAST_MATH python -` running only `time_grouped_rht(4, 2048, 7168)`.
+- Result: Compile-time failure before GPU execution. The selected partition had shape `(((128, 32), 1), 1, 1)` (4096 values per thread), not the required 128, so reshaping to `(8, 16)` failed.
+- Interpretation: TE uses the explicit `SM100_TMEM_LOAD_32dp32b64x` atom; the generic helper cannot infer that atom from the enlarged tile with the current layout. Select the equivalent explicit CuTeDSL atom rather than varying layout guesses.
+- Canonical-command status: Canonical one-shape timing entry; compilation failed before timing.
+- Failure classification: incorrect TMEM copy atom selection.
+
+### Layout follow-up
+
+- Selecting FP4 as the destination type did choose the TE-equivalent 32-data-path atom, but the partition remained 4096 values per thread.
+- Compile-time layouts showed transformed TMEM `((128,1),((16,1),8),4)` with strides `((65536,0),((1,0),16),128)`. Merging N/U produced logical `(128,128,4)` but lost the data-path partition required by the atom; leaving it nested caused `flat_divide` to leave an extra eight-mode and was not congruent with the tile slice.
+- This is the third occurrence of the same bulk-TMEM-layout blocker. The working scalar-fragment kernel was restored per the debug churn guard.
+
+## Experiment 9: Direct MMA Bulk Fragment
+
+- Hypothesis: `partition_shape_C((128, 128))` can alias the existing TMEM allocation with TE's full-fragment ownership and `SM100_TMEM_LOAD_32dp32b64x` equivalent.
+- Exact command: `env -u NVTE_USE_FAST_MATH python -` invoking one E=1 `(128, 128)` zero-input CuteDSL grouped quantization.
+- Result: The layout probe succeeded: the bulk fragment is `((128,16),1,8,4):((65536,1),0,16,128)`, exactly matching the existing physical offsets with its zero-stride mode removed. The x64 copy partition exposes 64 values x 2 residual tiles per thread (128 total). The first production compile then failed only because CuTe tensor indexing rejects a Python `slice` on the loaded register tensor.
+- Interpretation: The prior 4096-size reading incorrectly counted the copy atom's 32 collective data paths as per-thread values. The layout/copy hypothesis is supported; reshape the register tensor to `(8, 16)` and select a block with a CuTe coordinate.
+- Canonical-command status: Compile-only minimal shape; no performance or correctness test ran.
+- Failure classification: register-tensor indexing API mismatch.
+
+### Bulk-load result
+
+- Gate/up timing improved from 62.367 to 60.976 us (TE 47.830 us; Triton 92.805 us).
+- Actual grouped TE comparison failed for CuteDSL column output: codes 99.4856% different and scales 82.4229% different; row codes/scales remained 0% different.
+- Interpretation: The early-release structure is measurably faster, but the x64 register fragment's logical ordering is not eight contiguous 16-value blocks. Do not use this commit as a correct kernel; the next action is to derive the register permutation from the copy atom and restore TE-exact column ordering before any further timing.
+- Failure classification: incorrect bulk-fragment register ordering.
+
+## Experiment 10: CuTe Register-Mode Order
+
+- Hypothesis: The x64 load already returns contiguous TMEM columns, but
+  `reshape((8, 16))` treats the eight-block mode as CuTe's fastest mode and makes
+  each selected block stride by eight registers.
+- Evidence: `SM100_TMEM_LOAD_32dp32b64x` returns registers in increasing TMEM-column
+  order, and CuTe compact layouts make mode 0 contiguous. The physical accumulator
+  layout places each 16-token block contiguously at stride 16.
+- Action: Reshape the 128-register fragment as `(16, 8)` and select `(None, u)` so
+  each `_quant16` receives one contiguous token block.
+- Success criterion: The focused grouped TE comparison reports 0% differing bytes
+  for column codes and scales; do not benchmark before that passes.
+
+### Focused-oracle result
+
+- Exact command: `env -u NVTE_USE_FAST_MATH pytest -q 'test/prototype/moe_training/nvfp4_training/test_group_rht_quantize_row_col.py::test_group_rht_correctness[seed223-cutedsl]'`
+- Result: All four TE-derived bitwise assertions passed. The test then reached the
+  known unrelated `NameError: group_tensors` in its independent cross-check.
+- Interpretation: The `(16, 8)` mode order restores the expected contiguous blocks.
+  Run the actual grouped TE comparator once before accepting the fix.
+- Failure classification: pre-existing test defect after successful kernel validation.
+
+### Direct-TE invocation setup
+
+- Exact command: `env -u NVTE_USE_FAST_MATH python -` importing
+  `transformer_engine_torch` before the Python package.
+- Result: Import failed with undefined symbol
+  `_ZTIN18transformer_engine15CommOverlapBaseE`; no kernel ran.
+- Interpretation: Initialize `transformer_engine.pytorch` before importing its extension,
+  matching TE's supported import path.
+- Failure classification: invocation mismatch.
+
+### Direct grouped-TE result
+
+- Exact command: `env -u NVTE_USE_FAST_MATH python -` comparing E=4, M=N=128
+  CuteDSL outputs with `tex.split_quantize` grouped NVFP4 outputs.
+- Result: Row codes differed in 0/32768 bytes and column codes in 0/32768 bytes.
+  Naively flattened scale storage differed in 3665/4096 row bytes and 3656/4096
+  column bytes.
+- Interpretation: Exact codes confirm the register permutation. TE's opaque scale
+  storage and TorchAO's logical blocked scale views require the established layout
+  conversion before positional comparison; do not infer an arithmetic regression from
+  naive flattening.
+- Best next experiment: Compare scale bytes after applying the repo's blocked-layout
+  transforms, with no kernel edit.
+
+### Layout-aware grouped-TE result
+
+- Exact command: `env -u NVTE_USE_FAST_MATH python -` on E=4, M=N=128, applying
+  `to_blocked` to TE row scales and `to_blocked_grouped` to TE column scales.
+- Result: Row codes, row scales, column codes, and column scales each differed in
+  0 bytes.
+- Interpretation: The register-mode fix is numerically exact against actual grouped
+  TransformerEngine default output. The bulk-load optimization may now be benchmarked.
+- Failure classification: supported hypothesis; implementation validated.
+
+### Target performance result
+
+- Exact command: `env -u NVTE_USE_FAST_MATH python -` calling `run_experiment` only
+  for E=4 `(2048, 7168)` and `(7168, 2048)` RTNE.
+- Result: CuteDSL measured 61.190 / 62.935 us; Triton measured 92.787 / 92.267 us.
+- Interpretation: The corrected bulk load improves both CuteDSL targets by about 1.9%
+  from the 62.367 / 64.122 us baseline.
+- Failure classification: optimization validated.

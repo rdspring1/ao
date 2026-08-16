@@ -699,24 +699,29 @@ class _Tcgen05GroupRowColFused(_GroupRhtMainloop):
             tmem.allocate(num_tmem_alloc_cols)
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(cutlass.Float32)
-            tCtAcc_base = cute.make_tensor(tmem_ptr, acc_fake_layout)
 
-            copy_atom_t2r = sm100_utils.get_tmem_load_op(
-                MMA_TILER,
-                self.c_layout,
-                cutlass.Float32,
-                cutlass.Float32,
-                MMA_TILER[:2],
-                False,
+            # TE loads this thread's full 8x16 accumulator fragment before
+            # releasing the producer. Preserve the MMA's physical TMEM strides
+            # while presenting the eight N subtiles as one 128-column tile.
+            bulk_tCtAcc = cute.make_tensor(
+                tmem_ptr,
+                cute.make_layout(
+                    (M_TILE, (N_TILE, EPI_UNROLL), ACC_STAGES),
+                    stride=(65536, (1, N_TILE), M_TILE),
+                ),
             )
-            tAcc = transform_partitioned_tensor_layout(tCtAcc_base)
-            tAcc_epi = cute.flat_divide(tAcc, MMA_TILER[:2])
-            tiled_copy_t2r = tcgen05.make_tmem_copy(
-                copy_atom_t2r, tAcc_epi[(None, None, 0, 0, 0, 0)]
+            bulk_copy_atom_t2r = cute.make_copy_atom(
+                tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition.x64),
+                cutlass.Float32,
             )
-            thr_copy_t2r = tiled_copy_t2r.get_slice(tidx)
-            tTR_tAcc = thr_copy_t2r.partition_S(tAcc_epi)
-            tTR_rAcc = cute.make_rmem_tensor(((16, 1), 1, 1), cutlass.Float32)
+            bulk_tiled_copy_t2r = tcgen05.make_tmem_copy(
+                bulk_copy_atom_t2r, bulk_tCtAcc[(None, None, 0)]
+            )
+            bulk_thr_copy_t2r = bulk_tiled_copy_t2r.get_slice(tidx)
+            bulk_tTR_tAcc = bulk_thr_copy_t2r.partition_S(bulk_tCtAcc)
+            bulk_tTR_rAcc = cute.make_rmem_tensor(
+                ((64, 1), 1, 2), cutlass.Float32
+            )
 
             # This thread owns one hidden row and, per sub-tile, the 16 tokens
             # of one NVFP4 block -> 8 blocks (128 tokens) per epilogue tile.
@@ -752,15 +757,21 @@ class _Tcgen05GroupRowColFused(_GroupRhtMainloop):
                     tile_id = tile_n * tiles_in_h + tile_m
 
                     acc_pipeline.consumer_wait(acc_consumer_state)
+                    cute.copy(
+                        bulk_tiled_copy_t2r,
+                        bulk_tTR_tAcc[
+                            (None, None, None, acc_consumer_state.index)
+                        ],
+                        bulk_tTR_rAcc,
+                    )
+                    bulk_vals = bulk_tTR_rAcc.load().reshape((16, 8))
+                    cute.arch.fence_view_async_tmem_load()
+                    with cute.arch.elect_one():
+                        acc_pipeline.consumer_release(acc_consumer_state)
+                    acc_consumer_state.advance()
+
                     for u in cutlass.range_constexpr(EPI_UNROLL):
-                        cute.copy(
-                            tiled_copy_t2r,
-                            tTR_tAcc[
-                                (None, None, None, 0, 0, u, acc_consumer_state.index)
-                            ],
-                            tTR_rAcc,
-                        )
-                        vals = tTR_rAcc.load().reshape((16,))
+                        vals = bulk_vals[(None, u)]
                         col_rb = None
                         if cutlass.const_expr(self.sr):
                             # Triton's columnwise scaled tile is (hidden, tokens), so its
@@ -777,10 +788,6 @@ class _Tcgen05GroupRowColFused(_GroupRhtMainloop):
                         rCol[u * 2] = w0
                         rCol[u * 2 + 1] = w1
                         rColSF[u] = sf
-                    cute.arch.fence_view_async_tmem_load()
-                    with cute.arch.elect_one():
-                        acc_pipeline.consumer_release(acc_consumer_state)
-                    acc_consumer_state.advance()
 
                     gCol = cute.local_tile(
                         mColFP4, (M_TILE, TOKEN_TILE // 8), (tile_m, tile_n)

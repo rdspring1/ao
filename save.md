@@ -1,48 +1,64 @@
-# TE-Default NVFP4 Division Alignment
+# CuteDSL TE-Default RTNE Quantization Optimization
 
-Status: COMPLETE
+Status: COMPLETE — BULK LOAD IS TE-EXACT AND FASTER
 
 ## Goal
 
-Make Triton and CuteDSL NVFP4 quantization follow TransformerEngine's default numeric recipe by using correctly rounded FP32 division throughout the scale chain, validate exact RTNE output against the TE-derived PyTorch oracle and actual TE, and measure DeepSeek-V3 671B performance at E=4 without running the full test matrix.
+Reduce the CuteDSL grouped RTNE RHT quantization gap against TransformerEngine default
+at DeepSeek-V3 671B E=4 sizes without changing any TE-default output bits.
 
 ## Success Criterion
 
-- Triton and CuteDSL use `div.rn.f32` for the final per-block encode reciprocal.
-- CuteDSL also makes the existing global scale divisions explicitly `div.rn.f32`.
-- A targeted midpoint-sensitive test establishes that the PyTorch oracle can assert RTNE FP4 codes bitwise.
-- TE-default timings are collected for the 671B gate/up and down shapes; grouped E=4 timings are reported separately where TE has no validated equivalent.
+- Row/column FP4 codes and scales remain byte-for-byte equal to TE default.
+- Gate/up and down E=4 CuteDSL latency materially improves from 62.367 / 64.122 us.
+- Only the two requested performance shapes and focused correctness oracles run.
 
 ## Scope Fence
 
-- NVFP4 Triton and CuteDSL scale-chain arithmetic
-- Existing TE-derived assertions and focused tests needed to express exact RTNE equality
-- Targeted correction of the out-of-tree TE benchmark harness's grouped offset metadata
-- Read-only execution of targeted correctness and benchmark commands
-- No stochastic-rounding redesign, kernel scheduling changes, or full-suite execution
+- Grouped CuteDSL RTNE RHT quantization only.
+- Preserve exact `div.rn.f32` and BF16 RHT ordering.
+- No stochastic-rounding work, Triton changes, full test sweep, or unrelated test repair.
 
 ## Preflight
 
-Use TE default numerics as the sole correctness target. Make one bounded arithmetic change, run one focused validation, enter hypothesis-first debug if it fails, and only benchmark after correctness passes. Do not run the full expensive matrix.
+Start from the committed TE-default implementation. Make one bounded scheduling change,
+validate one midpoint-sensitive case and one grouped TE comparison, then benchmark only
+the two E=4 shapes. Restore immediately on regression.
 
 ## Surgical Simplicity
 
-One new internal numeric primitive is justified because both CuteDSL kernel modules need an explicit, instruction-level `div.rn.f32` contract. Existing tests and helpers will be revised in place; no new test file or public API is planned.
+The surviving kernel fix is a two-line register-layout correction on the already committed
+bulk-load implementation. No new API, file, fixture, abstraction, or parameter was added.
 
 ## What Changed
 
-- Replaced Triton's final per-block `rcp.approx.f32` with `tl.div_rn` in the shared RHT helper and 2D weight kernel.
-- Replaced CuteDSL's approximate reciprocal helper with explicit `div.rn.f32` and used it for all three TE scale-chain divisions in linear and grouped kernels.
-- Tightened the TE-derived PyTorch oracle contract from bracketed FP4 codes to byte-for-byte RTNE code equality; removed the obsolete bracket machinery.
+- Corrected the source-derived bulk `SM100_TMEM_LOAD_32dp32b64x`-equivalent column load's
+  register view from `(8, 16)` / `(u, None)` to CuTe's mode-0-contiguous `(16, 8)` /
+  `(None, u)`. Each `_quant16` now receives its original contiguous 16-token block while
+  retaining the early accumulator-pipeline release.
+
+- Tested compiler-visible scalar division: bitwise correct, but 64.857 / 66.796 us.
+- SASS showed each block's exact reciprocal serialized with its full conversion sequence.
+- Tested eight/four-block scale batching with fragment rereads: bitwise correct, but
+  82.717 / 84.739 us.
+- Tested retaining all fragments in registers: gate/up regressed to 94.870 us.
+- Exhaustively rejected replacing division with `global_encode * reciprocal(E4M3)`:
+  1,746,152 of 4,112,514 pairs differed (42.459%).
+- Restored both kernel files exactly to committed state after each regression.
 
 ## Validation
 
-- Static compilation and `git diff --check` passed.
-- Actual TE-default conformance at 256x256 passed all 16 byte comparisons: Triton/CuteDSL, RHT/2D, row/column codes and scales all had 0% differing bytes.
-- Midpoint-sensitive PyTorch-oracle test: 2 passed, 148 deselected.
-- Grouped E=4 TE-derived oracle tests: 4 passed.
-- Actual grouped TE conformance: E=1 grouped matched TE single exactly; at E=4 both TorchAO backends had 0% differing bytes from grouped TE across row/column codes and scales.
-- Ruff was unavailable, and this checkout has no `.lintrunner.toml`; no package installation was attempted.
+- Midpoint-sensitive linear TE-derived oracle passed for the scalar candidate.
+- Grouped row/column code and scale bitwise assertions passed before a pre-existing
+  `NameError: group_tensors` later in the test body.
+- Actual grouped TE comparison for the batching candidate reported 0% differing bytes
+  for all row/column codes and scales.
+- The corrected bulk-load kernel reported 0 differing bytes for row codes, row scales,
+  column codes, and column scales against actual grouped TransformerEngine default output.
+- The focused grouped pytest passed all four TE-derived bitwise assertions before its
+  pre-existing post-assertion `NameError: group_tensors`.
+- Target-only performance validation measured 61.190 / 62.935 us, improving the committed
+  62.367 / 64.122 us baseline by about 1.9% on both shapes.
 
 ## 671B TE-Default Performance
 
@@ -67,8 +83,18 @@ TE 2.19 lacks grouped 2D weight quantization. TE amax-only remains unavailable.
 
 ## Next Action
 
-Review and commit the bounded TE-default arithmetic/oracle change. The full expensive matrix is intentionally deferred until pre-merge validation.
+Review and commit the two-line register-layout correction plus its durable validation record.
+
+## Debug Checkpoint
+
+- Supported conclusion: the x64 atom returns increasing TMEM columns, and CuTe mode 0 is
+  contiguous; `(16, 8)` is the required per-thread register view.
+- Missing source data: none.
+- Confidence: HIGH.
+- Best next mode: vet or commit.
 
 ## Risk
 
-LOW-MEDIUM: targeted TE, midpoint, grouped, and performance validation passed. The intended performance regression from precise division is measured; repository lint tooling was unavailable in this checkout.
+LOW: the grouped pytest case still has an unrelated pre-existing post-assertion
+`NameError`, but both its four relevant assertions and the independent actual grouped TE
+comparison passed bitwise. Performance improvement is modest and may vary slightly by run.
