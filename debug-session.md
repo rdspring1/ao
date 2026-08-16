@@ -177,3 +177,27 @@ mask hypothesis is rejected.
 - Interpretation: The corrected bulk load improves both CuteDSL targets by about 1.9%
   from the 62.367 / 64.122 us baseline.
 - Failure classification: optimization validated.
+
+## Oracle Move Validation
+
+- Hypothesis: Moving the test-only oracle and updating its seven consumers preserves test
+  collection and removes all imports of the old production module path.
+- Exact command: `git diff --check && ! rg -n
+  "torchao\\.prototype\\.moe_training\\.nvfp4_training\\.nvfp4_reference|from
+  \\.hadamard_utils" test torchao benchmarks -g '*.py' && pytest --collect-only ...`
+- Result: The guard matched legitimate relative `hadamard_utils` imports in three unrelated
+  production modules, so pytest did not run.
+- Interpretation: Narrow the relative-import check to the moved oracle file; retain the
+  repository-wide check only for the removed fully qualified oracle path.
+- Canonical-command status: pytest collection is canonical; the preceding custom guard was
+  overly broad.
+- Failure classification: invocation mismatch.
+
+### Corrected oracle-move validation
+
+- Exact command: `git diff --check`, narrow stale-path guards, and `pytest
+  --collect-only -q` over the six consuming NVFP4 test modules.
+- Result: No stale imports, clean diff check, and 570 tests collected successfully.
+- Interpretation: The oracle move preserves all repository consumers and removes the
+  test-only implementation from the production package.
+- Failure classification: implementation validated.

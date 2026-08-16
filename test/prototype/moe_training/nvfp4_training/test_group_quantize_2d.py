@@ -14,7 +14,7 @@ from test.prototype.moe_training.nvfp4_training._assertions import (
 from test.prototype.moe_training.nvfp4_training.test_quantize_2d import (
     _assert_scales_match_up_to_rounding_ties,
 )
-from torchao.prototype.moe_training.nvfp4_training.nvfp4_reference import (
+from test.prototype.moe_training.nvfp4_training.nvfp4_reference import (
     reference_group_weight_quantize_2d,
 )
 from torchao.prototype.moe_training.nvfp4_training.group_quantize_2d_cutedsl import (

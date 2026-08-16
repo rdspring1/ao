@@ -22,7 +22,7 @@ from torchao.prototype.moe_training.nvfp4_training.hadamard_utils import (
     get_rht_matrix,
     get_wgrad_sign_vector,
 )
-from torchao.prototype.moe_training.nvfp4_training.nvfp4_reference import (
+from test.prototype.moe_training.nvfp4_training.nvfp4_reference import (
     reference_rht_amax,
 )
 from torchao.utils import is_sm_at_least_100, torch_version_at_least

@@ -28,7 +28,7 @@ from torchao.prototype.moe_training.nvfp4_training.hadamard_cutedsl_utils import
 from torchao.prototype.moe_training.nvfp4_training.hadamard_utils import (
     DEFAULT_SIGN_VECTOR,
 )
-from torchao.prototype.moe_training.nvfp4_training.nvfp4_reference import (
+from test.prototype.moe_training.nvfp4_training.nvfp4_reference import (
     reference_group_rht_amax,
 )
 from torchao.utils import is_sm_at_least_100, torch_version_at_least

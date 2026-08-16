@@ -75,7 +75,7 @@ from torchao.prototype.moe_training.nvfp4_training.hadamard_utils import (
     get_rht_matrix,
     prepare_for_cuda_graph,
 )
-from torchao.prototype.moe_training.nvfp4_training.nvfp4_reference import (
+from test.prototype.moe_training.nvfp4_training.nvfp4_reference import (
     reference_rht,
     reference_rht_quantize_row_col,
 )

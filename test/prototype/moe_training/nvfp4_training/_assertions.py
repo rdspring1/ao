@@ -8,7 +8,7 @@
 
 Deliberately pytest-free so an out-of-tree comparison script can reuse them. The
 vocabulary here is what each output can honestly be held to against the plain-PyTorch
-reference in ``torchao.prototype.moe_training.nvfp4_training.nvfp4_reference``. Scales,
+reference in ``test.prototype.moe_training.nvfp4_training.nvfp4_reference``. Scales,
 amaxes, and RTNE FP4 codes are all bitwise under TransformerEngine's default recipe.
 """
 

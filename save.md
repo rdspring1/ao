@@ -1,6 +1,31 @@
 # CuteDSL TE-Default RTNE Quantization Optimization
 
-Status: COMPLETE — BULK LOAD IS TE-EXACT AND FASTER
+Status: COMPLETE — TEST-ONLY NVFP4 ORACLE MOVED UNDER TEST
+
+### Preflight
+
+Move the TE-derived PyTorch oracle from the production prototype package to the
+equivalent NVFP4 test directory, update only its consumers and its runtime-helper import,
+then validate test collection/imports. Preserve the oracle implementation unchanged.
+
+### What Changed
+
+Moved `nvfp4_reference.py` from the production prototype package to the equivalent test
+directory. Updated all seven test consumers and changed the moved module's relative
+`hadamard_utils` import to its production-qualified path. Oracle arithmetic is unchanged.
+
+### Move Validation
+
+- No imports of the removed production oracle path remain.
+- `git diff --check` passed.
+- All 570 tests in the six consuming test modules collected successfully.
+- One initial stale-import guard was too broad and matched unrelated valid relative imports;
+  `debug-session.md` records the corrected invocation.
+
+### Surgical Simplicity
+
+The file move is justified because all seven consumers are tests and no production or
+benchmark module imports the oracle. No oracle logic, API, fixture, or test was added.
 
 ## Goal
 
@@ -83,7 +108,7 @@ TE 2.19 lacks grouped 2D weight quantization. TE amax-only remains unavailable.
 
 ## Next Action
 
-Review and commit the two-line register-layout correction plus its durable validation record.
+Review and commit the test-only oracle relocation and updated imports.
 
 ## Debug Checkpoint
 

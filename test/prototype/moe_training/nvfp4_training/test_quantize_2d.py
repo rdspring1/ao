@@ -23,7 +23,7 @@ from test.prototype.moe_training.nvfp4_training._assertions import (
 from torchao.prototype.moe_training.nvfp4_training.hadamard_utils import (
     prepare_for_cuda_graph,
 )
-from torchao.prototype.moe_training.nvfp4_training.nvfp4_reference import (
+from test.prototype.moe_training.nvfp4_training.nvfp4_reference import (
     reference_weight_quantize_2d,
 )
 from torchao.prototype.moe_training.nvfp4_training.quantize_2d_cutedsl import (
