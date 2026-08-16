@@ -244,3 +244,47 @@ mask hypothesis is rejected.
 - Corrected result: Triton and CuTeDSL each reported zero differing bytes for row codes,
   row scales, column codes, and column scales in all three operations.
 - Failure classification: resolved invocation mismatch; implementation validated.
+
+## Full Repository Test Suite
+
+- Hypothesis: `python -m pytest` from the repository root is the full-suite invocation.
+- Exact command: `python -m pytest`.
+- Result: Collection stopped after finding 10,588 tests with 24 errors and 5 skips.
+  Errors included missing optional packages, vendored CUTLASS tests outside TorchAO's suite,
+  macOS-only MPS binaries, and prototype files outside the canonical test root.
+- Interpretation: This was an invocation/environment mismatch, not a test assertion
+  failure. Repository CI defines the full regression suite as `pytest test --verbose -s
+  --ignore=test/quantization/pt2e` after installing `dev-requirements.txt`; PT2E has its
+  own dedicated suite.
+- Canonical-command status: Root-wide discovery is noncanonical. Install the pinned dev
+  dependencies, run the canonical regression suite, then run the dedicated PT2E suite.
+- Failure classification: invocation and environment mismatch.
+
+## Full NVFP4 Test Suite
+
+- Hypothesis: Every NVFP4 pytest module passes on the rewritten CuTeDSL branch.
+- Exact command: `pytest -q test/prototype/moe_training/nvfp4_training
+  test/prototype/moe_training/test_nvfp4_grouped_mm.py
+  test/prototype/mx_formats/test_nvfp4_tensor.py`.
+- Result: 1,162 tests collected; 747 passed, 46 skipped, 56 xfailed, and 314 failed in
+  739.40 seconds. Grouped RHT correctness failures reached the already validated TE
+  bitwise assertions and then hit `NameError: group_tensors`; many remaining failures are
+  concentrated in the MX-format NVFP4 test matrix.
+- Interpretation: The suite is not green. Group failures by file and test family, then
+  rerun one representative MX-format failure in isolation to distinguish an independent
+  defect from cascading CUDA state after earlier failures.
+- Canonical-command status: Complete repository NVFP4 pytest scope.
+- Failure classification: mixed; one known test-body defect, remaining failures pending
+  isolation.
+
+### MX-format isolation
+
+- Hypothesis: The 294 MX-format failures are a cascade from earlier grouped-test failures.
+- Exact command: `pytest -q -vv
+  'test/prototype/mx_formats/test_nvfp4_tensor.py::test_triton_nvfp4_quantize_equivalence[bf16-block_scale-N128-M100]'`.
+- Result: Failed independently with `AssertionError: mslk is required for NVFP4 triton
+  quantization` in `torchao/prototype/mx_formats/kernels.py:1232`.
+- Interpretation: The MX-format family is blocked by the missing optional MSLK dependency,
+  not by CUDA state from the grouped test defect. No source fix is supported by this
+  evidence.
+- Failure classification: environment requirement mismatch.

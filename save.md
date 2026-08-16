@@ -1,5 +1,35 @@
 # CuteDSL TE-Default RTNE Quantization Optimization
 
+## Full Test Suite Preflight
+
+Status: COMPLETE — NVFP4 SUITE RAN, FAILURES FOUND
+
+### Preflight
+
+Run the repository-wide pytest suite once from clean `nvfp4_moe_cutedsl` at
+`9d9858b9`. Do not edit implementation files in this run. If the suite fails, switch to
+debug mode, record the exact failure and classify it before deciding whether any rerun is
+supported.
+
+### Observable Success Criterion
+
+`python -m pytest` completes with no failures or errors, after which the temporary
+preflight is removed from the ledger-free product branch and the worktree is clean.
+
+### What Changed
+
+No product change. The initial root-wide invocation was noncanonical and failed collection
+on optional and vendored tests. Install `dev-requirements.txt` as CI does, then run the
+canonical regression suite and the separately defined PT2E suite.
+
+The user narrowed the request to all NVFP4 tests. That 1,162-test suite completed with
+747 passed, 46 skipped, 56 xfailed, and 314 failed. Debug classification is in progress;
+no implementation edit has been made. Exactly 20 failures are the known grouped-RHT
+test-body `NameError` after the TE bitwise assertions pass. The other 294 failures are in
+the MX-format module; an isolated representative fails because optional MSLK is not
+installed. Installing `dev-requirements.txt` also changed the shared Python environment
+and pip reported unrelated `rockset`/`urllib3` and `spin`/`click` version conflicts.
+
 ## Local NVFP4 History Rewrite Preflight
 
 Status: COMPLETE
