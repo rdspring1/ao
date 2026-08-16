@@ -373,6 +373,27 @@ The public CuteDSL 2D weight path has no fast-math specialization. Repeating und
 down (CuteDSL grouped/TE single x E), which is measurement noise. Fast math improved
 the complete CuteDSL activation pipeline by 20-21% and the TE pipeline by 13%.
 
+#### 1D linear optimization sweep
+
+The default-math RTNE `(2048, 7168)` sentinel measured the standalone
+`cutedsl_rht_quantize_row_col` kernel with 15 warmups and 50 profiler iterations.
+None of the first three bounded experiments met the approximately 2% acceptance
+threshold, so all source changes were reverted.
+
+| experiment | median (us) | change vs baseline | outcome |
+|---|---:|---:|---|
+| baseline, 256-row supertile | 23.6610 | — | retained |
+| existing 128-row supertile | 23.6493 | 0.05% faster | reverted |
+| packed FP32x2 multiply and FP4 conversion | 23.3460 | 1.33% faster | reverted |
+| double-buffered column TMA stores | 23.7940 | 0.56% slower | reverted |
+
+The packed conversion experiment confirmed the epilogue hypothesis directionally,
+but its gain was too small to justify a shared primitive that would also broaden the
+2D kernel's validation surface. The store experiment showed that, for the three
+persistent iterations used by this sentinel, a second column staging buffer costs
+more than the overlap saves. Remaining 1D linear work should focus on a larger
+structural reduction in row-epilogue work rather than tile geometry or store staging.
+
 ### Grouped Weight Amax
 
 Benchmarks `triton_group_weight_amax` — the input-side twin of the grouped 2D weight
