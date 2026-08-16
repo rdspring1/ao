@@ -394,6 +394,25 @@ persistent iterations used by this sentinel, a second column staging buffer cost
 more than the overlap saves. Remaining 1D linear work should focus on a larger
 structural reduction in row-epilogue work rather than tile geometry or store staging.
 
+#### 1D grouped optimization sweep
+
+The default-math RTNE `E=4`, per-expert `(2048, 7168)` sentinel measured the
+standalone `cutedsl_group_rht_quantize_row_col` kernel with the same 15/50 timing
+parameters. The existing kernel already caches each binary group lookup across an
+8-tile scheduler work item.
+
+| experiment | time (us) | change vs baseline | outcome |
+|---|---:|---:|---|
+| baseline | 61.3872 | — | retained |
+| aligned two-word row-code vector stores | 62.2391 | 1.39% slower | reverted |
+| 16-tile scheduler work items | 77.6977 | 26.57% slower | reverted |
+
+Autovectorizing the already aligned output pair introduced register/copy overhead.
+Doubling scheduler work length reduced CLC and lookup work but severely damaged
+persistent load balance. Remaining grouped work should preserve the 8-tile scheduler
+and focus on eliminating scalar scale-factor scatters or capacity handling when the
+logical packed length is smaller than capacity.
+
 ### Grouped Weight Amax
 
 Benchmarks `triton_group_weight_amax` — the input-side twin of the grouped 2D weight
