@@ -150,6 +150,34 @@ def test_forward_sqnr_and_finite_grads(kernel_preference):
 
 
 @pytest.mark.parametrize("kernel_preference", _KERNEL_PREFS)
+@torch.no_grad()
+def test_fast_math_defaults_on_and_is_observable(kernel_preference):
+    """nvfp4_linear defaults to fast math, and turning it off changes the result.
+
+    Without this the default would be untestable from outside: fast and exact differ by
+    ~48 dB SQNR, so every reconstruction bar in this file passes either way. Asserting
+    the default *equals* the explicit True and *differs* from False pins which one the
+    module actually selects.
+    """
+    torch.manual_seed(0)
+    x = torch.randn(_M, _K, dtype=torch.bfloat16, device="cuda")
+    W = torch.randn(_N, _K, dtype=torch.bfloat16, device="cuda")
+    kwargs = dict(
+        sign_vector=_HARDCODED_SIGN_VECTOR, kernel_preference=kernel_preference
+    )
+
+    default = nvfp4_linear(x, W, None, **kwargs)
+    fast = nvfp4_linear(x, W, None, use_fast_math=True, **kwargs)
+    exact = nvfp4_linear(x, W, None, use_fast_math=False, **kwargs)
+
+    assert torch.equal(default, fast), "nvfp4_linear no longer defaults to fast math"
+    assert not torch.equal(fast, exact), (
+        "fast and exact math produced identical output; the flag is not reaching "
+        "the quantize kernels"
+    )
+
+
+@pytest.mark.parametrize("kernel_preference", _KERNEL_PREFS)
 def test_config_swap_sets_preference(kernel_preference):
     m = torch.nn.Sequential(torch.nn.Linear(_K, _N, bias=False)).cuda().bfloat16()
     quantize_(m, NVFP4TrainingConfig(kernel_preference=kernel_preference))

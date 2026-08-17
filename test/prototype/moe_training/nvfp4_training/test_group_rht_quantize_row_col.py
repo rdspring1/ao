@@ -400,10 +400,77 @@ def test_group_rht_deepseek_dimensions_correctness(deepseek_graph_case, kernel):
 
 
 @_maybe_sm100
-@_skip_no_cutedsl
+@pytest.mark.parametrize("kernel", _KERNELS)
 @torch.no_grad()
-def test_cutedsl_group_fast_math_matches_transformer_engine(monkeypatch):
-    """The grouped compile specialization is byte-identical to actual TE fast math."""
+def test_group_rht_fast_math_sqnr(graph_case, kernel):
+    """Fast math costs little against the exact path it replaces.
+
+    The grouped twin of test_rht_quantize_fast_math_sqnr; see that test for why both
+    paths share one loose floor. Columnwise is stable here at 30.4-31.9 dB. Rowwise is
+    bitwise identical for two of these four fixtures and 41-49 dB for the other two, and
+    the flips are not spread evenly -- for seed224 all 185 land in group 1 and none in
+    group 0, because each group's decode scale gives its own small set of denominators
+    and only some of them are ones where ``rcp.approx`` and ``div_rn`` disagree.
+
+    The exact path is bitwise against nvfp4_reference, so bounding fast against exact
+    transitively grounds fast math in the PyTorch oracle, which cannot host
+    ``rcp.approx.ftz.f32`` itself. Compare NVFP4's own quantization noise, floored at
+    20 dB by the RTNE reconstruction test.
+    """
+    spec, A, _, offsets, amax_row, amax_col, _, _ = graph_case
+    psl, hs = A.shape
+    num_groups = len(spec.groups)
+    _skip_if_unsupported_groups(kernel, num_groups)
+
+    def run(use_fast_math):
+        return _group_quantize(
+            kernel,
+            A,
+            list(_HARDCODED_SIGN_VECTOR),
+            offsets,
+            num_groups,
+            psl,
+            hs,
+            spec.shape_rep,
+            amax_row,
+            amax_col,
+            None,
+            False,
+            use_fast_math=use_fast_math,
+        )
+
+    e_qa, e_sfa, e_qd, e_sfd = run(False)
+    f_qa, f_sfa, f_qd, f_sfd = run(True)
+
+    # One group's global amax stands in for all of them, unlike the per-group slicing in
+    # _assert_group_rht_correctness. Both sides are dequantized identically, so a group
+    # whose true scale differs is off by the same constant in each and the comparison
+    # stays a valid fast-vs-exact bound -- it just weights the groups uniformly rather
+    # than by their amax. Correctness of the per-group scales is covered elsewhere.
+    e_row = _dequantize_plain(e_qa, from_blocked(e_sfa, psl, hs // 16), amax_row[0])
+    f_row = _dequantize_plain(f_qa, from_blocked(f_sfa, psl, hs // 16), amax_row[0])
+    row_sqnr = compute_error(e_row, f_row)
+    assert row_sqnr >= 25.0, f"Row fast-vs-exact SQNR {row_sqnr:.2f} dB < 25.0 dB"
+
+    e_col_sf = _from_blocked_grouped(e_sfd, hs, spec.groups)
+    f_col_sf = _from_blocked_grouped(f_sfd, hs, spec.groups)
+    col_sqnr = compute_error(
+        _dequantize_plain(e_qd, e_col_sf, amax_col[0]),
+        _dequantize_plain(f_qd, f_col_sf, amax_col[0]),
+    )
+    assert col_sqnr >= 25.0, f"Col fast-vs-exact SQNR {col_sqnr:.2f} dB < 25.0 dB"
+
+
+@_maybe_sm100
+@pytest.mark.parametrize("kernel", _KERNELS)
+@torch.no_grad()
+def test_group_fast_math_matches_transformer_engine(kernel, monkeypatch):
+    """Both grouped fast paths are byte-identical to actual TE fast math.
+
+    The triton half is what lets triton stand in as the fast-path oracle: TE's fast
+    encode scale is ``rcp.approx.ftz.f32`` and no ATen op lowers to that instruction,
+    so ``nvfp4_reference`` models the exact path only.
+    """
     monkeypatch.setenv("NVTE_USE_FAST_MATH", "1")
     te = pytest.importorskip("transformer_engine.pytorch")
     tex = pytest.importorskip("transformer_engine_torch")
@@ -440,7 +507,9 @@ def test_cutedsl_group_fast_math_matches_transformer_engine(monkeypatch):
         cutedsl_group_rht_amax,
     )
 
-    col_amax, row_amax = cutedsl_group_rht_amax(
+    # The amax kernels have no fast-math variant (neither do TE's).
+    group_amax = triton_group_rht_amax if kernel == "triton" else cutedsl_group_rht_amax
+    col_amax, row_amax = group_amax(
         A,
         list(_HARDCODED_SIGN_VECTOR),
         offsets,
@@ -450,7 +519,8 @@ def test_cutedsl_group_fast_math_matches_transformer_engine(monkeypatch):
         0,
         logical_packed_length=logical_packed_length,
     )
-    qa, sfa, qd, sfd = cutedsl_group_rht_quantize_row_col(
+    qa, sfa, qd, sfd = _group_quantize(
+        kernel,
         A,
         list(_HARDCODED_SIGN_VECTOR),
         offsets,
@@ -707,7 +777,7 @@ def test_cutedsl_group_quantize_matches_triton_bitwise(graph_case):
         assert torch.equal(c, t), f"{name} differs between backends"
 
 
-def _run_sr(graph_case, rng_state, kernel="triton"):
+def _run_sr(graph_case, rng_state, kernel="triton", use_fast_math=False):
     spec, A, B, offsets, amax_row, amax_col, _, _ = graph_case
     psl, hs = A.shape
     return _group_quantize(
@@ -723,6 +793,7 @@ def _run_sr(graph_case, rng_state, kernel="triton"):
         amax_col,
         rng_state,
         True,
+        use_fast_math=use_fast_math,
     )
 
 
@@ -766,8 +837,9 @@ def test_group_rht_sr_reconstructs(graph_case, kernel):
 
 @_maybe_sm100
 @pytest.mark.parametrize("kernel", _KERNELS)
+@pytest.mark.parametrize("use_fast_math", [False, True], ids=["exact", "fast"])
 @torch.no_grad()
-def test_group_rht_sr_unbiased(kernel):
+def test_group_rht_sr_unbiased(kernel, use_fast_math):
     """Hardware stochastic rounding recovers the FP32 value in expectation.
 
     Feed the rowwise path elements that land EXACTLY halfway between FP4 grid points
@@ -809,6 +881,7 @@ def test_group_rht_sr_unbiased(kernel):
             amax,
             rng_state,
             sr,
+            use_fast_math=use_fast_math,
         )
         sf_plain = from_blocked(sfa, psl, hidden // 16)
         return _dequantize_plain(qa, sf_plain, amax[0])[:, halfway]
@@ -838,21 +911,33 @@ def test_group_rht_sr_unbiased(kernel):
 
 @_maybe_sm100
 @pytest.mark.parametrize("kernel", _KERNELS)
+@pytest.mark.parametrize("use_fast_math", [False, True], ids=["exact", "fast"])
 @torch.no_grad()
-def test_group_rht_rng_state_controls_stochastic_rounding(graph_case, kernel):
+def test_group_rht_rng_state_controls_stochastic_rounding(
+    graph_case, kernel, use_fast_math
+):
     """Same rng_state -> identical packed codes; advanced state -> codes differ."""
     _skip_if_unsupported_groups(kernel, len(graph_case[0].groups))
     qa1, _, qd1, _ = _run_sr(
-        graph_case, _make_rng_state(graph_case[1].device, (11, 22, 33, 44)), kernel
+        graph_case,
+        _make_rng_state(graph_case[1].device, (11, 22, 33, 44)),
+        kernel,
+        use_fast_math,
     )
     qa2, _, qd2, _ = _run_sr(
-        graph_case, _make_rng_state(graph_case[1].device, (11, 22, 33, 44)), kernel
+        graph_case,
+        _make_rng_state(graph_case[1].device, (11, 22, 33, 44)),
+        kernel,
+        use_fast_math,
     )
     assert torch.equal(qa1, qa2), "Same rng_state must yield identical row FP4 codes"
     assert torch.equal(qd1, qd2), "Same rng_state must yield identical col FP4 codes"
 
     qa3, _, qd3, _ = _run_sr(
-        graph_case, _make_rng_state(graph_case[1].device, (11, 9999, 33, 8888)), kernel
+        graph_case,
+        _make_rng_state(graph_case[1].device, (11, 9999, 33, 8888)),
+        kernel,
+        use_fast_math,
     )
     assert not torch.equal(qa1, qa3), "Advanced rng_state must change row FP4 codes"
     assert not torch.equal(qd1, qd3), "Advanced rng_state must change col FP4 codes"

@@ -66,7 +66,7 @@ if torch_version_at_least("2.10.0") and has_triton():
     # cold key), for no config gain. Sweep-validated stable across M at fixed N.
     @triton.autotune(
         configs=_GROUP_QUANTIZE_CONFIGS,
-        key=["N", "STOCHASTIC_ROUNDING"],
+        key=["N", "STOCHASTIC_ROUNDING", "FAST_MATH"],
     )
     @triton.jit
     def _group_rht_quantize_row_col_kernel(
@@ -87,6 +87,7 @@ if torch_version_at_least("2.10.0") and has_triton():
         N,
         num_tensors: tl.constexpr,
         STOCHASTIC_ROUNDING: tl.constexpr,
+        FAST_MATH: tl.constexpr,
         SHAPE_REP: tl.constexpr,
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
@@ -130,10 +131,13 @@ if torch_version_at_least("2.10.0") and has_triton():
         a_t = tl.trans(a)
         a_t_reshape = tl.reshape(a_t, [BLOCK_N * BLOCK_M // 16, 16])
         a_t_rht = tl.dot(a_t_reshape, hadamard)
-        a_t_rht = a_t_rht.to(tl.bfloat16)
+        # TE's fast math consumes the fp32 accumulator directly, so the bfloat16
+        # round-through is exact-mode only.
+        if not FAST_MATH:
+            a_t_rht = a_t_rht.to(tl.bfloat16)
 
         col_scale, col_scaled = _nvfp4_quantize(
-            a_t_rht, colwise_global_amax, BLOCK_N, BLOCK_M
+            a_t_rht, colwise_global_amax, BLOCK_N, BLOCK_M, FAST_MATH
         )
         col_fp4 = _pack_fp4(
             col_scaled,
@@ -167,7 +171,7 @@ if torch_version_at_least("2.10.0") and has_triton():
 
         rowwise_global_amax = tl.load(global_amax_row_ptr + group_idx)
         row_scale, row_scaled = _nvfp4_quantize(
-            a, rowwise_global_amax, BLOCK_M, BLOCK_N
+            a, rowwise_global_amax, BLOCK_M, BLOCK_N, FAST_MATH
         )
         row_fp4 = _pack_fp4(
             row_scaled,
@@ -260,6 +264,7 @@ if torch_version_at_least("2.10.0") and has_triton():
         rng_state: Optional[torch.Tensor],
         enable_stochastic_rounding: bool,
         logical_packed_length: Optional[torch.Tensor] = None,
+        use_fast_math: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Grouped fused RHT columnwise + direct rowwise NVFP4 E2M1 quantization.
 
@@ -353,6 +358,7 @@ if torch_version_at_least("2.10.0") and has_triton():
             n,
             num_tensors=num_tensors,
             STOCHASTIC_ROUNDING=enable_stochastic_rounding,
+            FAST_MATH=use_fast_math,
             SHAPE_REP=shape_rep,
             BLOCK_M=BLOCK_M,
             BLOCK_N=BLOCK_N,
@@ -374,6 +380,7 @@ if torch_version_at_least("2.10.0") and has_triton():
         rng_state,
         enable_stochastic_rounding,
         logical_packed_length=None,
+        use_fast_math=False,
     ):
         qa_base = A.new_empty(
             (packed_sequence_length, hidden_size // 2), dtype=torch.uint8
@@ -403,6 +410,7 @@ else:
         rng_state,
         enable_stochastic_rounding: bool,
         logical_packed_length: Optional[torch.Tensor] = None,
+        use_fast_math: bool = False,
     ):
         raise NotImplementedError(
             "triton_group_rht_quantize_row_col requires torch 2.10.0+ and triton installed"

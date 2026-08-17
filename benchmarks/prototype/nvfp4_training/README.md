@@ -197,6 +197,27 @@ absolute numbers are not comparable to these on either backend.
 | Llama 3 70B | hidden-state input | 2048 | 8192 | 23.12 | 38.37 | 1.66x | 2268.0 |
 | Llama 3 70B | mlp.down input | 2048 | 28672 | 70.98 | 113.11 | 1.59x | 2585.1 |
 
+The same shapes with `--math fast`. Both backends implement fast math and stay bitwise
+identical to each other and to TE, so this is a free choice at the same numerics; it is
+the `nvfp4_linear` default. `fast/exact` is each backend against its own exact time from
+the run that produced this table, so the ratio is internally consistent; that run's exact
+column reproduced the one above to within 1%.
+
+| Model | Shape | M | N | cutedsl_kernel_us | triton_kernel_us | speedup | cutedsl_gbps | pct_peak_bw | cutedsl fast/exact | triton fast/exact |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Llama 3 8B | hidden-state input | 2048 | 4096 | 9.05 | 22.32 | 2.47x | 2895.7 | 36.5 | 1.55x | 1.13x |
+| Llama 3 8B | mlp.down input | 2048 | 14336 | 19.09 | 50.82 | 2.66x | 4805.7 | 60.6 | 1.86x | 1.20x |
+| Llama 3 70B | hidden-state input | 2048 | 8192 | 13.87 | 32.77 | 2.36x | 3781.4 | 47.7 | 1.66x | 1.17x |
+| Llama 3 70B | mlp.down input | 2048 | 28672 | 36.00 | 93.03 | 2.58x | 5097.4 | 64.3 | 1.95x | 1.21x |
+
+Fast math is worth far more to CuteDSL (1.55-1.95x) than to Triton (1.13-1.21x), and
+worth more on the linear path than on the grouped one below (~1.37x). CuteDSL at 28672
+goes from 32.9% to 64.3% of peak bandwidth. The split is structural: fast math removes
+the bfloat16 round-through of the RHT accumulator and the `div.rn` reciprocal, and those
+are a much larger share of what the CuteDSL epilogue does once its other work is fused
+(see **Columnwise scale-factor store packing** below, whose win also landed almost
+entirely on fast math).
+
 ### 2D Weight Quantize (`cutedsl_weight_quantize_2d` vs `triton_weight_quantize_2d`, no RHT)
 
 Both kernels emit 2D 16x16 weight block scaling.
@@ -310,6 +331,30 @@ Stochastic rounding (`rs`):
 | 16B | down (w2) | 4 | 2048 | 1408 | 25.03 | 37.90 | 1.51x | 1440.0 | 18.16 |
 | 671B | gate/up (w1/w3) | 4 | 2048 | 7168 | 75.93 | 167.51 | 2.21x | 2416.6 | 30.48 |
 | 671B | down (w2) | 4 | 7168 | 2048 | 77.53 | 167.03 | 2.15x | 2367.0 | 29.86 |
+
+With `--math fast`, both rounding modes. `fast/exact` is each backend against its own
+exact time from the run that produced this table, so the ratio is internally consistent;
+that run's exact columns reproduced the two above to within 1% for RTNE and 2% for SR.
+
+| model | projection | E | M | N | rounding | cutedsl_us | triton_us | speedup | cutedsl_gbps | pct_peak | cutedsl fast/exact | triton fast/exact |
+|---|---|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|
+| debugmodel | gate/up (w1/w3) | 4 | 256 | 256 | rtne | 15.24 | 5.86 | 0.38x | 53.7 | 0.68 | 1.37x | 1.30x |
+| debugmodel | down (w2) | 4 | 256 | 256 | rtne | 15.27 | 5.86 | 0.38x | 53.7 | 0.68 | 1.37x | 1.29x |
+| 16B | gate/up (w1/w3) | 4 | 1408 | 2048 | rtne | 14.83 | 15.66 | 1.06x | 2430.9 | 30.66 | 1.39x | 1.36x |
+| 16B | down (w2) | 4 | 2048 | 1408 | rtne | 13.70 | 15.63 | 1.14x | 2630.7 | 33.18 | 1.40x | 1.36x |
+| 671B | gate/up (w1/w3) | 4 | 2048 | 7168 | rtne | 42.22 | 71.46 | 1.69x | 4346.6 | 54.83 | 1.35x | 1.30x |
+| 671B | down (w2) | 4 | 7168 | 2048 | rtne | 43.24 | 71.08 | 1.64x | 4244.2 | 53.53 | 1.35x | 1.29x |
+| debugmodel | gate/up (w1/w3) | 4 | 256 | 256 | rs | 20.82 | 10.98 | 0.53x | 39.4 | 0.50 | 1.28x | 1.11x |
+| debugmodel | down (w2) | 4 | 256 | 256 | rs | 20.79 | 10.99 | 0.53x | 39.4 | 0.50 | 1.28x | 1.11x |
+| 16B | gate/up (w1/w3) | 4 | 1408 | 2048 | rs | 21.15 | 33.74 | 1.60x | 1704.5 | 21.50 | 1.24x | 1.11x |
+| 16B | down (w2) | 4 | 2048 | 1408 | rs | 19.85 | 33.72 | 1.70x | 1815.4 | 22.90 | 1.27x | 1.11x |
+| 671B | gate/up (w1/w3) | 4 | 2048 | 7168 | rs | 57.64 | 152.31 | 2.64x | 3183.3 | 40.15 | 1.35x | 1.10x |
+| 671B | down (w2) | 4 | 7168 | 2048 | rs | 58.65 | 152.55 | 2.60x | 3128.5 | 39.46 | 1.35x | 1.10x |
+
+Grouped fast math is flatter than linear: CuteDSL gains 1.24-1.40x across every shape and
+both rounding modes, matching the "about 25% of the quantize stage" the grouped op's
+docstring claims. Triton gains 1.29-1.36x under RTNE but only ~1.10x under SR, where the
+Philox work it still carries dominates what fast math removes.
 
 Stochastic rounding now costs CuteDSL about 1.3x its own RTNE time against Triton's
 1.8x, which is what turns a 1.6x RTNE lead into a 2.2x SR lead at 671B. Both run the
@@ -531,16 +576,19 @@ The exact sentinel commands use the public callables the benchmark modules show:
 ```bash
 # Run each three times for the reported medians (15 warmups / 50 iterations are the
 # defaults in bench_utils.kernel_time_us).
-python -m benchmarks.prototype.nvfp4_training.bench_hadamard_quantize_row_col
-python -m benchmarks.prototype.nvfp4_training.bench_group_rht_quantize_row_col --experts 4
+python -m benchmarks.prototype.nvfp4_training.bench_hadamard_quantize_row_col --math all
+python -m benchmarks.prototype.nvfp4_training.bench_group_rht_quantize_row_col --experts 4 --math all
 python -m benchmarks.prototype.nvfp4_training.bench_quantize_2d
 python -m benchmarks.prototype.nvfp4_training.bench_group_quantize_2d
 ```
 
 `bench_group_quantize_2d` takes no arguments (`LOCAL_EXPERTS = 4` is hardcoded), and
 `bench_hadamard_quantize_row_col` benchmarks RTNE only — `--rounding` exists on the
-grouped script alone. `NVTE_USE_FAST_MATH` is a TransformerEngine variable with no effect
-on a pure torchao run; the 1D fast rows come from `use_fast_math=True`.
+grouped script alone. Both RHT quantize scripts take `--math {exact,fast,all}` (default
+`all`) and report a `math` column; the fast rows are now reproducible from the checked-in
+scripts rather than measured out of band. `NVTE_USE_FAST_MATH` is a TransformerEngine
+variable with no effect on a pure torchao run — the torchao equivalent is `--math fast`,
+which passes `use_fast_math=True` to both backends.
 
 ### Epilogue SMEM-read and packing optimization
 

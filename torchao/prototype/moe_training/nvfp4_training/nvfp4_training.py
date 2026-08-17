@@ -101,12 +101,18 @@ class NVFP4TrainingConfig(AOBaseConfig):
             consistency should broadcast a single vector before calling
             quantize_() and pass it here.  The TP path always enforces
             consistency via _replicate_rht_sign_vector regardless of this field.
+        use_fast_math: Match TransformerEngine under ``NVTE_USE_FAST_MATH=1``: the RHT
+            quantize consumes the FP32 accumulator directly and takes an approximate
+            reciprocal. On by default; both backends implement it and remain bitwise
+            identical to TE and to each other. Set False to recover the exact-math
+            arithmetic.  Default: True.
     """
 
     kernel_preference: KernelPreference = KernelPreference.AUTO
     process_group: Optional[object] = field(default=None, compare=False)
     world_size: Optional[int] = None
     rht_sign_vector: Optional[object] = field(default=None, compare=False)
+    use_fast_math: bool = True
 
 
 class NVFP4Linear(nn.Linear):
@@ -130,9 +136,11 @@ class NVFP4Linear(nn.Linear):
         device=None,
         dtype=None,
         rht_sign_vector: torch.Tensor | tuple[int, ...] | list[int] | None = None,
+        use_fast_math: bool = True,
     ):
         super().__init__(in_features, out_features, bias, device=device, dtype=dtype)
         self.kernel_preference = kernel_preference
+        self.use_fast_math = use_fast_math
         self.process_group = process_group
         self.world_size = world_size
         self.tensor_parallel_style = "colwise"
@@ -206,6 +214,7 @@ class NVFP4Linear(nn.Linear):
                 # fall back on and a misaligned shard would turn a working default into
                 # an error. TP stays on Triton until that check is available as a bool.
                 use_cutedsl=self.kernel_preference == KernelPreference.CUTEDSL,
+                use_fast_math=self.use_fast_math,
             )
         return nvfp4_linear(
             x,
@@ -214,6 +223,7 @@ class NVFP4Linear(nn.Linear):
             kernel_preference=self.kernel_preference,
             sr_seed=self._sr_seed,
             sign_vector=self.rht_sign_vector,
+            use_fast_math=self.use_fast_math,
         )
 
     @classmethod
@@ -224,6 +234,7 @@ class NVFP4Linear(nn.Linear):
         process_group=None,
         world_size: Optional[int] = None,
         rht_sign_vector: torch.Tensor | tuple[int, ...] | list[int] | None = None,
+        use_fast_math: bool = True,
     ) -> "NVFP4Linear":
         if rht_sign_vector is None:
             rht_sign_vector = getattr(mod, "_rht_sign_vector", None)
@@ -237,6 +248,7 @@ class NVFP4Linear(nn.Linear):
             device=mod.weight.device,
             dtype=mod.weight.dtype,
             rht_sign_vector=rht_sign_vector,
+            use_fast_math=use_fast_math,
         )
         # Copy weights (don't re-init)
         if mod.weight.device != torch.device("meta"):
@@ -262,5 +274,6 @@ def _nvfp4_training_transform(
             process_group=config.process_group,
             world_size=config.world_size,
             rht_sign_vector=config.rht_sign_vector,
+            use_fast_math=config.use_fast_math,
         )
     return module

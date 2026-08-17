@@ -127,12 +127,13 @@ def _to_nvfp4_rht_rs_then_scaled_grouped_mm(
     CUTEDSL demands CuteDSL and raises if it cannot run. The per-expert weight amax
     is Triton on every path -- it has no CuteDSL twin.
 
-    ``use_fast_math`` selects the CuteDSL RHT quantize variant that consumes the FP32
-    tcgen05 accumulator directly and takes an approximate reciprocal, matching
-    TransformerEngine under ``NVTE_USE_FAST_MATH=1``. It is worth about 25% of the
-    quantize stage at production shapes, which is why it defaults on. Triton has no
-    fast-math variant, so the flag only affects ops that land on CuteDSL -- meaning
-    AUTO and TRITON stop being bitwise identical unless it is turned off.
+    ``use_fast_math`` selects the RHT quantize variant that consumes the FP32 accumulator
+    directly and takes an approximate reciprocal, matching TransformerEngine under
+    ``NVTE_USE_FAST_MATH=1``. It is worth about 25% of the quantize stage at production
+    shapes, which is why it defaults on. Both backends implement it and both stay bitwise
+    identical to TE and to each other, so AUTO and TRITON agree either way. The per-expert
+    weight amax and the 2D weight quantize are unaffected: without an RHT there is no
+    accumulator round-through to skip, which is also why TE has no 2D fast path.
     """
     output = _NVFP4GroupedMM.apply(
         A,
@@ -257,9 +258,6 @@ class _NVFP4GroupedMM(torch.autograd.Function):
             if use_cutedsl_rht
             else triton_group_rht_quantize_row_col
         )
-        # Triton has no fast-math variant, so the flag only rides along when this
-        # op landed on CuteDSL.
-        fast_math_kwargs = {"use_fast_math": use_fast_math} if use_cutedsl_rht else {}
         x_col_amax, x_row_amax = group_rht_amax(
             input_act,
             sign_vector_list,
@@ -283,7 +281,7 @@ class _NVFP4GroupedMM(torch.autograd.Function):
             rng_state=None,
             enable_stochastic_rounding=False,
             logical_packed_length=logical_packed_length,
-            **fast_math_kwargs,
+            use_fast_math=use_fast_math,
         )
 
         weight_amax = triton_group_weight_amax(weight, num_experts)
@@ -374,11 +372,6 @@ class _NVFP4GroupedMM(torch.autograd.Function):
             if ctx.use_cutedsl_rht
             else triton_group_rht_quantize_row_col
         )
-        # Triton has no fast-math variant, so the flag only rides along when this
-        # op landed on CuteDSL.
-        fast_math_kwargs = (
-            {"use_fast_math": ctx.use_fast_math} if ctx.use_cutedsl_rht else {}
-        )
         dy_col_amax, dy_row_amax = group_rht_amax(
             grad_output,
             sign_vector_list,
@@ -410,7 +403,7 @@ class _NVFP4GroupedMM(torch.autograd.Function):
             rng_state,
             enable_stochastic_rounding=True,
             logical_packed_length=logical_packed_length,
-            **fast_math_kwargs,
+            use_fast_math=ctx.use_fast_math,
         )
 
         grad_input = F.scaled_grouped_mm(
