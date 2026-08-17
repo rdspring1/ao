@@ -323,3 +323,42 @@
   remaining gap is no longer SR-specific -- it is the RTNE gap, and it sits entirely in
   the quantize kernel, since the amax stage is at parity everywhere.
 - Failure classification: none; measurement only.
+
+## Experiment 19 — One Philox draw per block, linear path
+
+- Hypothesis: the linear kernels already inherited the fused packing through the shared
+  `_quant16_from_amax`, so the only grouped win they are missing is the RNG, and the same
+  one-draw-per-block change should pay off at least as well.
+- Evidence: linear SASS, SR vs RTNE. `FMUL` and `FMNMX` excess is already **0**, i.e.
+  Experiments 15/16 did reach this path (linear SR `46.4310 -> 41.5547 us`, RTNE fast math
+  `14.8403 -> 12.9741`, with no linear-specific change). `IMAD` +2007 and `LOP3` +1530 are
+  3537 of the 3872-instruction excess, **91%** -- proportionally a larger Philox burden
+  than grouped carried before Experiment 17 (76%).
+- Blocker, and the decision: applying `philox4_all` here breaks the linear path's triton
+  SR bitwise parity, which was the **only** bitwise oracle for stochastic rounding in the
+  project -- there is no TE SR reference, since TE's stream differs by construction. It is
+  also the oracle Experiment 15 used to settle the dropped clamp. Raised with the user
+  with three options (apply and streamline / apply but keep a test-only parity variant /
+  leave linear alone); the user chose to apply and streamline.
+- Action: both linear epilogues switched to `philox4_all` with a coordinate-derived
+  counter (`tile_id * TILE_BLOCKS + ...`, the old packed-byte expression divided by 8).
+  Deleted `philox4`, `triton_tile_id`, `_GROUP_SIZE_N`, `TRITON_TILE_PACKED`; moved
+  `TILE_BLOCKS` into the shared module, replacing the grouped module's copy and its now
+  unused `TILE_PACKED`.
+- Test replacement, which came out stronger than planned: rather than add a reconstruction
+  test, `test_triton_rht_quantize_rs_at_most_one_fp4_step_from_rtne` already asserted that
+  every SR code sits within one FP4 magnitude step of the RTNE code with matching signs.
+  It ran on triton only; it now runs on **both backends** over one tile, several tiles and
+  a short trailing column group. It pins SR against an RTNE code that is still bitwise
+  checked against triton and TE, so nibble order, scale and block indexing are all still
+  caught without any SR oracle. Net: one test and one fixture deleted, zero new tests.
+- Result: linear SR standard `41.5547 -> 25.8337 us` (37.8%; `46.4310 -> 25.8337`, 44.4%
+  across the whole series), SR fast `31.4567 -> 18.0922` (42.5%; 45.2% across the series).
+  RTNE unchanged. Static excess over RTNE `+3872 -> +1112`, `IMAD` `+2007 -> +650`,
+  `LOP3` `+1530 -> +423` -- a 71% cut, matching grouped's 69%.
+- Correctness: 36 triton-parity + 54 TE-reference + 7 linear SR + 26 grouped SR.
+- Process note: the first instinct was to re-run the whole `nvfp4_training` directory
+  (~10 min, JIT-bound). The user pushed back twice. The genuine gap after the change was
+  grouped SR alone, 18 s -- everything else was already covered by runs earlier in the
+  session. Derive the blast radius from the diff before running.
+- Failure classification: none; retained.

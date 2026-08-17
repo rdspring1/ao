@@ -1,15 +1,19 @@
-# CuTeDSL NVFP4 — grouped SR round complete; next gap is grouped RTNE
+# CuTeDSL NVFP4 — SR rounds complete on both paths; next gap is RTNE quantize
 
 Self-contained handoff. The toolchain blocker the previous handoff was stuck on is gone.
 
 ## Current State
 
 - Branch `nvfp4_moe_cutedsl_split`, HEAD `0b41f58f` plus a docs commit. Working tree clean.
-- The approved grouped stochastic-rounding round is **complete, validated and committed**.
-- **Grouped SR is ~2x faster**: standard `150.73 -> 77.33 us`, fast math `116.45 -> 57.77 us`.
-- RTNE fast math also improved 6.7% (`45.60 -> 42.55`); RTNE standard is unchanged and
-  still bitwise identical to both oracles.
-- Full `test/prototype/moe_training/nvfp4_training/` suite: **594 passed, 36 skipped**.
+- The stochastic-rounding round is **complete on both the grouped and linear paths**,
+  validated and committed.
+- **Grouped SR is ~2x faster**: standard `150.73 -> 77.33 us`, fast math `116.45 -> 57.77`.
+- **Linear SR is ~1.8x faster**: standard `46.43 -> 25.83 us`, fast math `33.02 -> 18.09`.
+- RTNE fast math improved 6.7% grouped and 12.9% linear; RTNE standard is unchanged on
+  both and still bitwise identical to both oracles.
+- Verification: 36 triton-parity + 54 TE-reference + 7 linear SR + 26 grouped SR, all
+  green. (The full nvfp4_training suite was 594 passed / 36 skipped at the grouped round;
+  the linear round was validated on the 123-case affected surface -- see Testing below.)
 
 ### The blocker from the previous handoff is resolved
 
@@ -30,8 +34,15 @@ Four commits, one per retained round:
 64d381cd Fuse the CuTeDSL stochastic-rounding multiply and clamp into the convert
 87cb89c1 Fuse the CuTeDSL RTNE fast-math path and drop the scalar quantize
 0b41f58f Draw one Philox counter per block in the grouped stochastic-rounding path
-<docs>   Record the grouped SR optimization round
+e0bfe38f Record the grouped stochastic-rounding optimization round
+9a0f0675 Draw one Philox counter per block in the linear path too
 ```
+
+The linear path shared `_quant16_from_amax`, so it inherited commits 1 and 2 for free
+(SR 10.5%, RTNE fast math 12.6%). Its SASS then showed `FMUL`/`FMNMX` excess already at
+zero and Philox at **91%** of the SR-specific excess -- a larger burden than grouped
+carried pre-fix -- so the same one-draw-per-block change was applied there, at the cost of
+its triton SR bitwise parity.
 
 **Method that worked again: dump the SASS before spending a benchmark.** Diffing the SR
 and RTNE compilations of the grouped kernel sized all three candidate causes for free and
@@ -97,18 +108,22 @@ is now the more efficient of the two relative to its own baseline.
 
 ## What Should Happen Next
 
-**The remaining gap is no longer SR-specific. It is the grouped RTNE quantize kernel.**
+**The remaining gap is no longer SR-specific on either path. It is the RTNE quantize
+kernel, and the grouped one is where the money is.**
 
 The amax stage is at parity with TE everywhere (~23.3 us vs ~25.9), so the whole 1D gap
 sits in `cutedsl_group_rht_quantize_row_col`: 57.06 us vs TE's ~38 at standard math for
-gate/up. Two facts to start from, both already established:
+gate/up. Three facts to start from, all already established:
 
-- After this round, SR runs only 736 static instructions above RTNE, so the RTNE kernel
-  itself is now the floor for both. Optimizing it improves all four rows at once.
-- The last three rounds all came from the same method — dump the SASS, find the dominant
-  instruction family, fix that — and it has not been applied to the grouped RTNE variant
-  on its own. The Round 0 dump exists at `/tmp/rtne.sass` (regenerate with the recipe
-  below); nobody has yet asked what its 3456 instructions are actually doing.
+- SR now runs only 736 static instructions above RTNE grouped, 1112 linear, so the RTNE
+  kernel is the floor for both rounding modes. Optimizing it improves every row at once.
+- The last four rounds all came from the same method — dump the SASS, find the dominant
+  instruction family, fix that — and it has not been applied to the RTNE variant on its
+  own. Nobody has yet asked what its 3456 instructions are actually doing.
+- Precedent from the 2D round: the answer there was address arithmetic feeding scalar
+  `LDS.U16`, 53% of the kernel. The grouped 1D row epilogue already reads SMEM with
+  `cute.autovec_copy`, so if it repeats, expect it in the column epilogue or the
+  scale-factor scatter instead.
 
 Concrete next action: dump `_compile_group_fused_kernel(0, True, False, False)`, classify
 its instruction mix by family the way Experiment 14 did, and compare against TE's
@@ -122,11 +137,25 @@ for a third or more of the kernel.
   (`_compile_group_fused_kernel:955`), so SR-only changes go behind `const_expr(self.sr)`.
 - **Determinism is not negotiable** even though grouped bitwise-vs-triton no longer is.
   The SR stream must stay a pure function of tile coordinates and thread identity.
-- **The linear 1D SR path keeps full triton bitwise parity** and its 5
-  `test_cutedsl_vs_triton_stochastic_rounding_bitwise` cases. It still uses `philox4`.
+- **No bitwise SR oracle exists any more, on either path.** Both linear and grouped draw
+  through `philox4_all`; the linear parity test and `philox4` itself are deleted. SR is
+  guarded structurally by `test_rht_quantize_rs_at_most_one_fp4_step_from_rtne`, which
+  pins every SR code to within one FP4 step of the RTNE code -- and RTNE *is* still
+  bitwise-checked against both triton and TE. Keep it that way: any future SR asm change
+  is validated through that test, not by comparing against triton.
 - Accept a round at >= ~2% on the sentinel; retain only if aggregate improves >= 3% with
   no applicable case regressing > 2%.
 - Local commits only; no push. One commit per retained round.
+
+## Testing
+
+**Scope test runs to the blast radius; do not run the directory by reflex.** Every kernel
+variant JIT-compiles at ~10-15 s, so the full `nvfp4_training` suite is ~10 min while the
+targeted subset for a one-path change is 20-60 s. For the linear round the affected
+surface was: both oracles (they cover RTNE on every path plus the grouped constant
+refactor), the linear SR guards, and grouped SR. The only external importer of these
+modules is `test/prototype/moe_training/test_nvfp4_grouped_mm.py`; the apparent
+`test/quantization/test_qat.py` hit is a test *method name*, not an import.
 
 ## Verification
 
@@ -157,9 +186,11 @@ for sr in (False, True):
 PY
 ```
 
-Current readings: RTNE **56.95** / **42.55**, SR **77.33** / **57.77**.
+Current grouped readings (standard / fast): RTNE **56.95** / **42.55**, SR **77.33** /
+**57.77**. Linear `(2048, 7168)` gate/up, via `cutedsl_rht_quantize_row_col`: RTNE
+**19.45** / **12.93**, SR **25.83** / **18.09**.
 
-Two-oracle suite — 41 triton-parity (36 RTNE + 5 linear SR) and 54 TE-reference:
+Two-oracle suite — 36 triton-parity (all RTNE) and 54 TE-reference:
 
 ```bash
 pytest -q test/prototype/moe_training/nvfp4_training/{test_quantize_2d,test_hadamard_quantize_row_col,test_group_rht_quantize_row_col,test_group_quantize_2d}.py \
@@ -185,8 +216,9 @@ Do **not** count with `grep -c '^FMUL'` — it also matches `FMUL2`, and `^FMNMX
 
 - `_mul_cvt_rs_e2m1x8_f32`, `_mul_cvt_rs_e2m1x8_acc_f32`, `_pack16_rs_from_enc`: three new
   functions that let the next commit delete six older ones; net 186 lines removed.
-- `philox4_all`: a second generator is required because the linear path must keep the
-  discarding one for triton parity; both have callers.
+- `philox4_all`: now the only Philox generator; `philox4`, `triton_tile_id`,
+  `_GROUP_SIZE_N` and `TRITON_TILE_PACKED` are deleted, and `TILE_BLOCKS` is shared by
+  both kernel modules instead of duplicated.
 - `TILE_BLOCKS`: named constant beside `TILE_PACKED`, used at both epilogue call sites.
 - `sqnr_floor` parameter: one default argument, added because SR genuinely cannot meet the
   RTNE bar and hardcoding a second threshold would have duplicated the reference helper.
