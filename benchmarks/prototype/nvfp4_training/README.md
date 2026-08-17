@@ -232,8 +232,11 @@ Run environment for every table in this section: NVIDIA GB200, PyTorch
 ### CuteDSL kernels — comparison vs Triton
 
 Each grouped `bench_*` script runs **both backends** on the same shapes and reports the
-speedup. The two produce **bitwise identical output** — codes and scale factors, RTNE
-and stochastic rounding alike — so the choice is purely a performance one.
+speedup. Under RTNE the two produce **bitwise identical output** — codes and scale
+factors — so the choice is purely a performance one. Under stochastic rounding the
+grouped CuteDSL kernel draws its Philox stream differently (one counter per 16-element
+block, all four words consumed) and so produces different, statistically equivalent
+codes; it is checked on reconstruction SQNR, unbiasedness, and reproducibility instead.
 
 ```bash
 python -m benchmarks.prototype.nvfp4_training.bench_group_hadamard_amax --experts 4
@@ -556,9 +559,12 @@ Against TransformerEngine the 2D gap narrows substantially:
 | 2D grouped gate/up | 4 | 60.5176 | 54.56 (single x4) | 1.70x | 1.11x |
 | 2D grouped down | 4 | 60.7924 | 54.62 (single x4) | 1.69x | 1.11x |
 
-Every result above is bitwise identical to both oracles: the Triton backend (45 cases,
-including stochastic rounding) and the TE-derived PyTorch reference in
+Every result above is bitwise identical to both oracles: the Triton backend (41 cases —
+36 RTNE plus 5 linear stochastic-rounding) and the TE-derived PyTorch reference in
 `test/prototype/moe_training/nvfp4_training/nvfp4_reference.py` (54 CuteDSL cases).
+Grouped stochastic rounding is exempt by design — see the note above — and is covered by
+`test_group_rht_sr_reconstructs`, `test_group_rht_sr_unbiased` and
+`test_group_rht_rng_state_controls_stochastic_rounding`.
 
 #### Rejected in this pass
 

@@ -376,10 +376,11 @@ def _mulhi_u32(a: cutlass.Uint32, b: cutlass.Uint32, *, loc=None, ip=None):
     )
 
 
-# Philox-4x32-10, byte-identical to triton.language.random (PHILOX_KEY_A/B,
-# PHILOX_ROUND_A/B, 10 rounds). The triton kernels draw their stochastic-rounding bits
-# from tl.randint, so reproducing this exactly is what makes cvt.rs agree across the
-# two backends.
+# Philox-4x32-10 (PHILOX_KEY_A/B, PHILOX_ROUND_A/B, 10 rounds). The linear kernels draw
+# through philox4, which is byte-identical to triton.language.random: the triton kernels
+# take their stochastic-rounding bits from tl.randint, so reproducing it exactly is what
+# makes cvt.rs agree across the two backends there. The grouped kernels draw through
+# philox4_all, which keeps the same generator but not triton's counter stride.
 PHILOX_ROUNDS = 10
 _PHILOX_KEY_A, _PHILOX_KEY_B = 0x9E3779B9, 0xBB67AE85
 _PHILOX_ROUND_A, _PHILOX_ROUND_B = 0xD2511F53, 0xCD9E8D57
@@ -422,6 +423,9 @@ def philox_prep(seed_lo, seed_hi, offset_base):
 def philox4(state, packed_base):
     """The four random words a 16-element chunk needs, in triton's counter order.
 
+    Used by the linear kernels, which retain triton SR bitwise parity. The grouped
+    kernels use ``philox4_all`` instead.
+
     Triton draws one word per packed byte but its ``cvt.rs`` asm consumes only two of
     every four (``$9``/``$10`` of a ``pack=4`` group), so a chunk starting at packed
     index ``p0`` uses ``p0, p0+1, p0+4, p0+5`` -- not four consecutive counters.
@@ -432,6 +436,34 @@ def philox4(state, packed_base):
         philox_c0(cutlass.Uint32(packed_base + cutlass.Int32(d)), state)
         for d in (0, 1, 4, 5)
     )
+
+
+def philox4_all(state, chunk_counter):
+    """The four random words a 16-element chunk needs, from a single Philox draw.
+
+    ``philox4`` reproduces triton's counter stride, which costs four full round schedules
+    per chunk and throws away three of every four output words. Where bitwise agreement
+    with triton is not required, one counter per chunk and all four words consumed is the
+    same 128 bits for a quarter of the work: 34 multiplies against 124.
+
+    The counter must be derived from tile coordinates rather than a running per-thread
+    value -- see the grouped epilogues, whose CLC scheduler makes visit order unstable.
+    """
+    sched, c0_r2, c1_r2, c3_r1 = state
+    A, B = cutlass.Uint32(_PHILOX_ROUND_A), cutlass.Uint32(_PHILOX_ROUND_B)
+    c0_r1 = chunk_counter ^ sched[0][0]
+    c0, c1 = c0_r2, c1_r2
+    c2 = _mulhi_u32(A, c0_r1) ^ c3_r1 ^ sched[1][1]
+    c3 = A * c0_r1
+    # Unlike philox_c0, the last round computes all four words instead of dropping the
+    # two that only feed rounds which no longer exist.
+    for r in range(2, PHILOX_ROUNDS):
+        _c0, _c2 = c0, c2
+        c0 = _mulhi_u32(B, _c2) ^ c1 ^ sched[r][0]
+        c2 = _mulhi_u32(A, _c0) ^ c3 ^ sched[r][1]
+        c1 = B * _c2
+        c3 = A * _c0
+    return c0, c1, c2, c3
 
 
 def triton_tile_id(pid_hidden, pid_token, num_pid_n, num_pid_m):
