@@ -43,120 +43,6 @@ HADAMARD_DIM = 16
 
 
 @dsl_user_op
-def _cvt_rn_satfinite_e2m1x2_f32_pack4(
-    lo0: cutlass.Float32,
-    lo1: cutlass.Float32,
-    lo2: cutlass.Float32,
-    lo3: cutlass.Float32,
-    hi0: cutlass.Float32,
-    hi1: cutlass.Float32,
-    hi2: cutlass.Float32,
-    hi3: cutlass.Float32,
-    *,
-    loc=None,
-    ip=None,
-) -> cutlass.Uint32:
-    """Pack 4 (lo, hi) FP32 pairs into 4 FP4 bytes via inline PTX."""
-    return cutlass.Uint32(
-        llvm.inline_asm(
-            T.i32(),
-            [
-                lo0.ir_value(loc=loc, ip=ip),
-                lo1.ir_value(loc=loc, ip=ip),
-                lo2.ir_value(loc=loc, ip=ip),
-                lo3.ir_value(loc=loc, ip=ip),
-                hi0.ir_value(loc=loc, ip=ip),
-                hi1.ir_value(loc=loc, ip=ip),
-                hi2.ir_value(loc=loc, ip=ip),
-                hi3.ir_value(loc=loc, ip=ip),
-            ],
-            (
-                "{\n"
-                ".reg .b8 b0, b1, b2, b3;\n"
-                "cvt.rn.satfinite.e2m1x2.f32 b0, $5, $1;\n"
-                "cvt.rn.satfinite.e2m1x2.f32 b1, $6, $2;\n"
-                "cvt.rn.satfinite.e2m1x2.f32 b2, $7, $3;\n"
-                "cvt.rn.satfinite.e2m1x2.f32 b3, $8, $4;\n"
-                "mov.b32 $0, {b0, b1, b2, b3};\n"
-                "}"
-            ),
-            "=r,f,f,f,f,f,f,f,f",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
-    )
-
-
-@dsl_user_op
-def _cvt_rs_satfinite_e2m1x4_f32_pack4(
-    lo0: cutlass.Float32,
-    lo1: cutlass.Float32,
-    lo2: cutlass.Float32,
-    lo3: cutlass.Float32,
-    hi0: cutlass.Float32,
-    hi1: cutlass.Float32,
-    hi2: cutlass.Float32,
-    hi3: cutlass.Float32,
-    rb0: cutlass.Uint32,
-    rb1: cutlass.Uint32,
-    *,
-    loc=None,
-    ip=None,
-) -> cutlass.Uint32:
-    """Stochastic-rounding analog of _cvt_rn_satfinite_e2m1x2_f32_pack4: same (lo,hi) arg order and
-    same packed-FP4 output, but rounds with the hardware cvt.rs using random bits rb0/rb1 (one 32-bit
-    word per 4-FP4 half). The {$6,$2,$5,$1}/{$8,$4,$7,$3} lane order reproduces the rn path's nibbles."""
-    return cutlass.Uint32(
-        llvm.inline_asm(
-            T.i32(),
-            [
-                lo0.ir_value(loc=loc, ip=ip),
-                lo1.ir_value(loc=loc, ip=ip),
-                lo2.ir_value(loc=loc, ip=ip),
-                lo3.ir_value(loc=loc, ip=ip),
-                hi0.ir_value(loc=loc, ip=ip),
-                hi1.ir_value(loc=loc, ip=ip),
-                hi2.ir_value(loc=loc, ip=ip),
-                hi3.ir_value(loc=loc, ip=ip),
-                rb0.ir_value(loc=loc, ip=ip),
-                rb1.ir_value(loc=loc, ip=ip),
-            ],
-            (
-                "{\n"
-                ".reg .b16 h0, h1;\n"
-                "cvt.rs.satfinite.e2m1x4.f32 h0, {$6, $2, $5, $1}, $9;\n"
-                "cvt.rs.satfinite.e2m1x4.f32 h1, {$8, $4, $7, $3}, $10;\n"
-                "mov.b32 $0, {h0, h1};\n"
-                "}"
-            ),
-            "=r,f,f,f,f,f,f,f,f,r,r",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
-    )
-
-
-@dsl_user_op
-def _cvt_rn_bf16x2_f32(
-    hi: cutlass.Float32, lo: cutlass.Float32, *, loc=None, ip=None
-) -> cutlass.Uint32:
-    """Round two f32 to bfloat16 in one instruction, packed as ``{hi, lo}``."""
-    return cutlass.Uint32(
-        llvm.inline_asm(
-            T.i32(),
-            [hi.ir_value(loc=loc, ip=ip), lo.ir_value(loc=loc, ip=ip)],
-            "cvt.rn.bf16x2.f32 $0, $1, $2;",
-            "=r,f,f",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
-    )
-
-
-@dsl_user_op
 def _mul_cvt_rn_e2m1x8_f32(
     v0: cutlass.Float32,
     v1: cutlass.Float32,
@@ -323,8 +209,7 @@ def _mul_cvt_rs_e2m1x8_f32(
     Same packed FP32 multiplies, but the four ``cvt.rn.satfinite.e2m1x2.f32`` collapse into two
     ``cvt.rs.satfinite.e2m1x4.f32``, each consuming one 32-bit random word: ``rb0`` covers
     ``v0..v3``, ``rb1`` covers ``v4..v7``. ``cvt.rs`` takes its four sources most-significant
-    nibble first, so ``{a3, a2, a1, a0}`` lays ``v0..v3`` down in ascending nibble order --
-    the same nibbles ``_pack16``'s ``{$6, $2, $5, $1}`` produced from the scalar path.
+    nibble first, so ``{a3, a2, a1, a0}`` lays ``v0..v3`` down in ascending nibble order.
 
     The explicit clamp to +-FP4_E2M1_MAX the scalar path applied is dropped, as in
     ``_mul_cvt_rn_e2m1x8_acc_f32``: ``.satfinite`` already saturates there.
@@ -468,22 +353,6 @@ def _div_rn_f32(
             [a.ir_value(loc=loc, ip=ip), b.ir_value(loc=loc, ip=ip)],
             "div.rn.f32 $0, $1, $2;",
             "=f,f,f",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
-    )
-
-
-@dsl_user_op
-def _u32_as_f32(x: cutlass.Uint32, *, loc=None, ip=None) -> cutlass.Float32:
-    """Reinterpret 32 bits as f32 (PTX registers are untyped, so this is free)."""
-    return cutlass.Float32(
-        llvm.inline_asm(
-            T.f32(),
-            [x.ir_value(loc=loc, ip=ip)],
-            "mov.b32 $0, $1;",
-            "=f,r",
             has_side_effects=False,
             is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,
@@ -653,24 +522,6 @@ def _max_f32(
 
 
 @dsl_user_op
-def _min_xorsign_abs_f32(
-    a: cutlass.Float32, limit: cutlass.Float32, *, loc=None, ip=None
-) -> cutlass.Float32:
-    """Emit PTX min.xorsign.abs.f32 for symmetric clamp to +/-limit."""
-    return cutlass.Float32(
-        llvm.inline_asm(
-            T.f32(),
-            [a.ir_value(loc=loc, ip=ip), limit.ir_value(loc=loc, ip=ip)],
-            "min.xorsign.abs.f32 $0, $1, $2;",
-            "=f,f,f",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
-    )
-
-
-@dsl_user_op
 def _atom_max_f32_nonneg(
     addr: cutlass.Pointer, val: cutlass.Float32, *, loc=None, ip=None
 ) -> cutlass.Float32:
@@ -797,31 +648,6 @@ def _set_supertile_geometry(kernel_obj, col_groups_per_supertile: int):
     kernel_obj.tma_warp_w = kernel_obj.row_warp_end_w
     kernel_obj.fused_tpb_w = 32 * (kernel_obj.tma_warp_w + 1)  # 544 / 416 threads
     kernel_obj.row_threads_w = 32 * n_row_warps
-
-
-def _pack16(q, sr: cutlass.Constexpr, rb):
-    """Pack 16 scaled f32 -> (w0, w1) packed-FP4 u32. RTNE, or stochastic rounding (hardware
-    cvt.rs) when sr, consuming the four random words in ``rb``.
-
-    ``rb`` covers the elements in groups of four -- rb[0] for q[0:4], rb[1] for q[4:8],
-    and so on -- which is the grouping triton's cvt.rs asm uses, so the caller only has
-    to hand over the same Philox draws triton would have made."""
-    if cutlass.const_expr(sr):
-        rb0, rb1, rb2, rb3 = rb
-        w0 = _cvt_rs_satfinite_e2m1x4_f32_pack4(
-            q[0], q[2], q[4], q[6], q[1], q[3], q[5], q[7], rb0, rb1
-        )
-        w1 = _cvt_rs_satfinite_e2m1x4_f32_pack4(
-            q[8], q[10], q[12], q[14], q[9], q[11], q[13], q[15], rb2, rb3
-        )
-    else:
-        w0 = _cvt_rn_satfinite_e2m1x2_f32_pack4(
-            q[0], q[2], q[4], q[6], q[1], q[3], q[5], q[7]
-        )
-        w1 = _cvt_rn_satfinite_e2m1x2_f32_pack4(
-            q[8], q[10], q[12], q[14], q[9], q[11], q[13], q[15]
-        )
-    return w0, w1
 
 
 def _round_rht_amax(amax):
@@ -970,25 +796,13 @@ def _quant16_from_amax(
     uses TE's approximate FTZ reciprocal. The caller is responsible for rounding
     ``amax`` in exact mode (see ``_round_rht_amax``)."""
     enc, pvscale_fp8 = _enc_from_amax(amax, enc_over_fp4max, dec, fast_math)
+    # Fast math consumes the FP32 accumulator directly, so it takes the plain primitive
+    # even when vals is a raw RHT accumulator: the bfloat16 round-through is exact-mode only.
+    use_acc = cutlass.const_expr(rht_acc and not fast_math)
     if cutlass.const_expr(sr):
-        w0, w1 = _pack16_rs_from_enc(vals, enc, rb, rht_acc and not fast_math)
-        return w0, w1, pvscale_fp8
-    if cutlass.const_expr(not fast_math):
-        w0, w1 = _pack16_rn_from_enc(vals, enc, rht_acc)
-        return w0, w1, pvscale_fp8
-    q = cute.make_rmem_tensor((16,), cutlass.Float32)
-    fp4_max = cutlass.Float32(FP4_E2M1_MAX)
-    if cutlass.const_expr(rht_acc and not fast_math):
-        for i in range(0, 16, 2):
-            packed = _cvt_rn_bf16x2_f32(vals[i + 1], vals[i])
-            lo = _u32_as_f32(packed << cutlass.Uint32(16))
-            hi = _u32_as_f32(packed & cutlass.Uint32(0xFFFF0000))
-            q[i] = _min_xorsign_abs_f32(lo * enc, fp4_max)
-            q[i + 1] = _min_xorsign_abs_f32(hi * enc, fp4_max)
+        w0, w1 = _pack16_rs_from_enc(vals, enc, rb, use_acc)
     else:
-        for i in range(16):
-            q[i] = _min_xorsign_abs_f32(vals[i] * enc, fp4_max)
-    w0, w1 = _pack16(q, sr, rb)
+        w0, w1 = _pack16_rn_from_enc(vals, enc, use_acc)
     return w0, w1, pvscale_fp8
 
 
