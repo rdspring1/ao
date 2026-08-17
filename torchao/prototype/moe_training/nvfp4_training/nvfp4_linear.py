@@ -300,6 +300,39 @@ class nvfp4_mm_triton(torch.autograd.Function):
         return grad_input, grad_weight, grad_bias, None, None, None, None
 
 
+def _resolve_use_cutedsl(kernel_preference: KernelPreference) -> bool:
+    """Whether this call runs on CuteDSL.
+
+    The linear analog of the grouped path's ``_resolve_backends``, and split out for
+    the same reason: AUTO is the default, so its fallback needs a test target that
+    does not require an SM100 box without the CuteDSL runtime to reach.
+
+    Unlike the grouped path there is one decision, not one per op -- the amax, the
+    quantize and the 2D weight quantize all run on the same backend, and CuteDSL
+    accepts exactly the shapes Triton does (the path's own %128, gated for both by
+    ``nvfp4_mm_triton.forward``), so there is no shape constraint to fall back on.
+    """
+    if kernel_preference not in (
+        KernelPreference.AUTO,
+        KernelPreference.TRITON,
+        KernelPreference.CUTEDSL,
+    ):
+        raise ValueError(
+            "NVFP4 training linear only supports kernel_preference AUTO, TRITON, or "
+            f"CUTEDSL, got {kernel_preference!r}"
+        )
+    if kernel_preference == KernelPreference.TRITON:
+        return False
+    if not cutedsl_nvfp4_kernels_available():
+        if kernel_preference == KernelPreference.CUTEDSL:
+            raise RuntimeError(
+                f"kernel_preference=CUTEDSL requires {CUTEDSL_NVFP4_REQUIREMENTS} "
+                f"({cutedsl_nvfp4_unavailable_reason()})."
+            )
+        return False
+    return True
+
+
 def nvfp4_linear(
     input_hp: torch.Tensor,
     weight_hp: torch.Tensor,
@@ -335,25 +368,7 @@ def nvfp4_linear(
             each other and to TE, so the choice does not depend on kernel_preference; only
             the 2D weight quantize is unaffected, having no RHT accumulator to skip.
     """
-    if kernel_preference not in (
-        KernelPreference.AUTO,
-        KernelPreference.TRITON,
-        KernelPreference.CUTEDSL,
-    ):
-        raise ValueError(
-            "NVFP4 training linear only supports kernel_preference AUTO, TRITON, or "
-            f"CUTEDSL, got {kernel_preference!r}"
-        )
-    use_cutedsl = kernel_preference != KernelPreference.TRITON
-    if use_cutedsl and not cutedsl_nvfp4_kernels_available():
-        if kernel_preference == KernelPreference.CUTEDSL:
-            raise RuntimeError(
-                f"kernel_preference=CUTEDSL requires {CUTEDSL_NVFP4_REQUIREMENTS} "
-                f"({cutedsl_nvfp4_unavailable_reason()})."
-            )
-        use_cutedsl = False
-    # No shape fallback: CuteDSL now accepts exactly the shapes Triton does, and
-    # nvfp4_mm_triton.forward's shared % 128 gate rejects the rest for both.
+    use_cutedsl = _resolve_use_cutedsl(kernel_preference)
 
     if sr_seed is None:
         sr_seed = torch.randint(

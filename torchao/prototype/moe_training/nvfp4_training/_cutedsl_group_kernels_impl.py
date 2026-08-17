@@ -115,10 +115,26 @@ ROW_TOK_PER_PASS = ROW_THREADS // ROW_HB  # 32 tokens per pass
 ROW_PASSES = TOKEN_TILE // ROW_TOK_PER_PASS  # 4
 
 
-# Group lookup is a fixed-depth binary search, so the group count is capped at
-# 2**GROUP_SEARCH_STEPS. TE caps at the same 64 (kMaxTensorsPerKernel).
+# Group lookup is a binary search unrolled to a constexpr depth -- chosen to keep the
+# epilogues branch-free -- so it resolves exactly 2**GROUP_SEARCH_STEPS groups and the
+# group count is capped there. Raising the cap means raising the depth with it: at
+# E > 2**GROUP_SEARCH_STEPS the search exits with hi - lo > 1 and returns a group index
+# off by one, which is a silently wrong amax rather than a failure. Keep the two in
+# sync; ``test_cutedsl_group_rht_amax_rejects_too_many_groups`` pins the boundary.
+#
+# The 64 is ours, not inherited: TE's grouped NVFP4 kernels also cap at 64, but for
+# unrelated reasons -- the pointer-list kernels (kMaxTensorsPerKernel) are bounded by
+# the 4 KB kernel-argument limit, and the graph-safe ones by a shared-memory scratch
+# array. TE's graph-safe kernels, which are the ones this design mirrors (packed input
+# plus device-side offsets, no pointer arrays), use an unbounded `while` search and have
+# no depth limit at all. Nothing here forces 64; it is comfortably above the local
+# expert counts these models train at (671B at EP=64 gives 4).
 MAX_GROUPS = 64
 GROUP_SEARCH_STEPS = 6
+assert MAX_GROUPS <= 2**GROUP_SEARCH_STEPS, (
+    f"MAX_GROUPS={MAX_GROUPS} exceeds what a depth-{GROUP_SEARCH_STEPS} search resolves "
+    f"({2**GROUP_SEARCH_STEPS})"
+)
 
 
 def _group_idx(token, offsets_t, num_groups):

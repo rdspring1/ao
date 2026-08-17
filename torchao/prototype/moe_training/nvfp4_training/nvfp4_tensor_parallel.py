@@ -416,6 +416,12 @@ def nvfp4_col_parallel_linear(
             match across TP ranks.
         use_cutedsl: Use the CuteDSL amax + quantize for both forward (RTNE) and the
             backward SR (cvt.rs) paths. Requires the per-rank M shard % 128 == 0.
+        use_fast_math: Match TransformerEngine under ``NVTE_USE_FAST_MATH=1``: the RHT
+            quantize consumes the FP32 accumulator directly and takes an approximate
+            reciprocal instead of a correctly rounded divide. On by default. Both
+            backends implement it and stay bitwise identical to TE and to each other,
+            so it is independent of ``use_cutedsl``; the 2D weight quantize is
+            unaffected, having no RHT accumulator to skip.
     """
     if tp_group is None:
         raise ValueError("tp_group is required for nvfp4_col_parallel_linear")
@@ -680,6 +686,12 @@ def nvfp4_row_parallel_linear(
             match across TP ranks.
         use_cutedsl: Use the CuteDSL amax + quantize for both forward (RTNE) and the
             backward SR (cvt.rs) paths. Requires the per-rank M shard % 128 == 0.
+        use_fast_math: Match TransformerEngine under ``NVTE_USE_FAST_MATH=1``: the RHT
+            quantize consumes the FP32 accumulator directly and takes an approximate
+            reciprocal instead of a correctly rounded divide. On by default. Both
+            backends implement it and stay bitwise identical to TE and to each other,
+            so it is independent of ``use_cutedsl``; the 2D weight quantize is
+            unaffected, having no RHT accumulator to skip.
     """
     if tp_group is None:
         raise ValueError("tp_group is required for nvfp4_row_parallel_linear")

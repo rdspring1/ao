@@ -89,6 +89,19 @@ class NVFP4TrainingConfig(AOBaseConfig):
                 per-rank shard, and the per-rank M shard must be divisible by 128.
                 Unlike AUTO, an unmet requirement raises instead of falling back.
             Default: AUTO.
+
+            Reproducibility note. AUTO resolves per call site from what the runtime
+            offers, so the backend can differ between two nodes running the same code.
+            On the **grouped** path that changes results: the CuteDSL and Triton
+            grouped kernels are byte-identical under RTNE but draw *different*
+            stochastic-rounding streams (CuteDSL takes one Philox counter per
+            16-element block and consumes all four words, rather than reproducing
+            Triton's per-packed-byte counter stride). SR runs in the backward pass, so
+            the same seed on a node without the CuteDSL runtime yields different
+            gradients -- statistically equivalent, not bitwise equal. The linear
+            kernels are unaffected; they retain SR parity with Triton. Pin
+            kernel_preference explicitly for runs that must reproduce bitwise across
+            machines.
         process_group: Optional ProcessGroup for tensor-parallel TP.
             When set, forward dispatches to the selected NVFP4 tensor-parallel
             path (Triton unless CUTEDSL is requested explicitly).
@@ -106,6 +119,16 @@ class NVFP4TrainingConfig(AOBaseConfig):
             reciprocal. On by default; both backends implement it and remain bitwise
             identical to TE and to each other. Set False to recover the exact-math
             arithmetic.  Default: True.
+
+    Both defaults moved together, and both change what this config computes:
+    ``kernel_preference`` was TRITON and is now AUTO, and ``use_fast_math`` is new and
+    defaults on (fast-vs-exact measures 30-32 dB SQNR columnwise -- above NVFP4's own
+    ~20 dB quantization noise, but not identical). A run that must reproduce earlier
+    numerics needs both pinned::
+
+        NVFP4TrainingConfig(
+            kernel_preference=KernelPreference.TRITON, use_fast_math=False
+        )
     """
 
     kernel_preference: KernelPreference = KernelPreference.AUTO
