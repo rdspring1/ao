@@ -32,11 +32,19 @@ parametrization (see ``_KERNELS``):
       [1.0, 1.5] midpoint (1.25) round to each neighbor ~50% of the time for both
       columnwise and rowwise paths. Columnwise input is constructed via inverse RHT so
       post-RHT values are exactly 1.25; rowwise input has 1.25 placed directly in A.
-    - test_triton_rht_quantize_rs_at_most_one_fp4_step_from_rtne (triton): RS code is at
+    - test_rht_quantize_rs_at_most_one_fp4_step_from_rtne (both backends): RS code is at
       most 1 FP4 magnitude index step from the RTNE code for every element, for both
-      columnwise and rowwise paths.
+      columnwise and rowwise paths, over one tile, several tiles and a short trailing
+      column group. This is the structural guard on SR: it pins every SR code against an
+      RTNE code that IS bitwise-checked against triton and TE.
     - test_cutedsl_rht_quantize_sr_unbiased (cutedsl): the HW ``cvt.rs`` path is unbiased
       at the same 1.25 midpoint.
+
+  The two backends are byte-for-byte interchangeable under RTNE only
+  (test_cutedsl_vs_triton_interchangeable). Neither reproduces the other's Philox
+  stream: both CuteDSL kernels draw one counter per 16-element block and consume all
+  four output words, rather than triton's per-packed-byte stride. SR is therefore judged
+  on the structural and statistical properties above.
 
 Coverage:
   RS=F, RW=F  — TE bitwise scales + mx_formats scale compatibility + rtne_sqnr
@@ -524,67 +532,6 @@ def test_cutedsl_vs_triton_interchangeable(M, N):
         assert torch.equal(c, t), f"{name} differs between backends"
 
 
-@pytest.fixture
-def pinned_triton_tile():
-    """Pin the Triton autotune to the 128x128 config the CuteDSL SR counter assumes.
-
-    Reproducing Triton's stochastic-rounding stream means reproducing its Philox
-    counter, which is keyed on the flat tile index and therefore on BLOCK_M/BLOCK_N.
-    Every config above 128x128 exhausts SM100 tensor or shared memory and is pruned at
-    runtime, so 128x128 is what actually runs -- but that is an emergent property of the
-    hardware, not a contract, so the SR test states it rather than relying on it.
-    """
-    import triton
-
-    from torchao.prototype.moe_training.nvfp4_training import (
-        hadamard_quantize_row_col_triton as hq,
-    )
-
-    saved = list(hq.HADAMARD_QUANTIZE_CONFIGS)
-    pinned = triton.Config(
-        {"BLOCK_M": 128, "BLOCK_N": 128, "NUM_STAGES": 3}, num_warps=4, num_stages=3
-    )
-    hq.HADAMARD_QUANTIZE_CONFIGS[:] = [pinned]
-    hq._hadamard_quantize_row_col_kernel.configs = hq.HADAMARD_QUANTIZE_CONFIGS
-    try:
-        yield
-    finally:
-        hq.HADAMARD_QUANTIZE_CONFIGS[:] = saved
-        hq._hadamard_quantize_row_col_kernel.configs = hq.HADAMARD_QUANTIZE_CONFIGS
-
-
-@_skip_no_triton
-@_skip_no_cutedsl
-@pytest.mark.parametrize(
-    "M,N",
-    [(256, 512), (384, 1024), (128, 128), (256, 1408), (1024, 2432)],
-    ids=["base", "supertile128", "single-tile", "short-group", "short-group-b"],
-)
-@torch.no_grad()
-def test_cutedsl_vs_triton_stochastic_rounding_bitwise(pinned_triton_tile, M, N):
-    """SR draws the identical Philox words on both backends, so the codes are identical.
-
-    The last two shapes have ``(N // 128) % 8 != 0``, i.e. a short trailing column group
-    in Triton's L2 swizzle -- the case where inverting ``_compute_pid`` needs the
-    ``(r - base) mod group_size_n`` term rather than plain ``r``.
-    """
-    torch.manual_seed(5)
-    A = torch.randn(M, N, dtype=torch.bfloat16, device="cuda")
-    col_amax, row_amax = _rht_amax("triton", A, sign_vector=_HARDCODED_SIGN_VECTOR)
-    kwargs = dict(
-        col_amax=col_amax,
-        row_amax=row_amax,
-        sign_vector=_HARDCODED_SIGN_VECTOR,
-        stochastic_rounding=True,
-        seed=torch.tensor([0x5EED1234], dtype=torch.int64, device="cuda"),
-        offset=torch.tensor([0x0FF5E7], dtype=torch.int64, device="cuda"),
-    )
-    cutedsl = _quantize_row_col("cutedsl", A, **kwargs)
-    triton_out = _quantize_row_col("triton", A, **kwargs)
-    for name, c, t in zip(("qd", "sfd", "qa", "sfa"), cutedsl, triton_out):
-        assert torch.equal(c, t), f"{name} differs between backends"
-
-
 # ---------------------------------------------------------------------------
 # Tests — triton only (RS statistics, CUDA graph capture)
 # ---------------------------------------------------------------------------
@@ -681,27 +628,38 @@ def test_triton_rht_quantize_rs_midpoint_distribution():
     )
 
 
-@_skip_no_triton
+@pytest.mark.parametrize("kernel", _KERNELS)
+@pytest.mark.parametrize(
+    "M,N",
+    [(128, 128), (256, 512), (1024, 2432)],
+    ids=["single-tile", "multi-tile", "short-group"],
+)
 @torch.no_grad()
-def test_triton_rht_quantize_rs_at_most_one_fp4_step_from_rtne():
+def test_rht_quantize_rs_at_most_one_fp4_step_from_rtne(kernel, M, N):
     """RS code must be at most 1 FP4 magnitude index step from the RTNE code.
 
     RS picks the floor or ceil of the scaled value on the FP4 magnitude grid.
     RTNE also picks floor or ceil (nearest). Therefore |rs_mag_idx - rtne_mag_idx| <= 1
     must hold for every element, and signs must agree.
 
-    Both columnwise and rowwise paths are tested.
+    Both columnwise and rowwise paths are tested, on both backends. This is the
+    structural guard on the SR path now that neither backend reproduces the other's
+    Philox stream: it pins every SR code against the RTNE code that IS bitwise-checked
+    against triton and TE, so a wrong nibble order, scale or block index fails here even
+    though no bitwise SR oracle exists. The shapes span one tile, several tiles, and a
+    short trailing column group, which is where a tile-derived counter is most likely to
+    collide or run off the end.
     """
-    M, N = 128, 128
+    _skip_if_unsupported_shape(kernel, M, N)
     N_SAMPLES = 16
     torch.manual_seed(42)
     A = torch.randn(M, N, dtype=torch.bfloat16, device="cuda")
 
     col_amax_rtne, row_amax_rtne = _rht_amax(
-        "triton", A, sign_vector=_HARDCODED_SIGN_VECTOR
+        kernel, A, sign_vector=_HARDCODED_SIGN_VECTOR
     )
     col_rn, _, row_rn, _ = _quantize_row_col(
-        "triton",
+        kernel,
         A,
         col_amax=col_amax_rtne,
         row_amax=row_amax_rtne,
@@ -717,10 +675,10 @@ def test_triton_rht_quantize_rs_at_most_one_fp4_step_from_rtne():
 
     for _ in range(N_SAMPLES):
         col_amax_rs, row_amax_rs = _rht_amax(
-            "triton", A, sign_vector=_HARDCODED_SIGN_VECTOR
+            kernel, A, sign_vector=_HARDCODED_SIGN_VECTOR
         )
         col_rs, _, row_rs, _ = _quantize_row_col(
-            "triton",
+            kernel,
             A,
             col_amax=col_amax_rs,
             row_amax=row_amax_rs,

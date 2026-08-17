@@ -50,6 +50,7 @@ from ._cutedsl_kernels_impl import (
     FP8_E4M3_MAX,
     FP32_MAX,
     HADAMARD_DIM,
+    TILE_BLOCKS,
     _abs_f32,
     _atom_max_f32_nonneg,
     _div_rn_f32,
@@ -59,7 +60,7 @@ from ._cutedsl_kernels_impl import (
     _min_f32,
     _quant16,
     _round_rht_amax,
-    philox4,
+    philox4_all,
     philox_prep,
 )
 
@@ -571,10 +572,11 @@ class _Tcgen05GroupRowColFused(_GroupRhtMainloop):
         # capacity rows read back as zero, matching the triton op's contract.
         tiles_in_n_valid = logical_len_t[0] // cutlass.Int32(TOKEN_TILE)
         zero_sf = _zero_sf()
-        # Triton's grid is (cdiv(tokens,128) * cdiv(hidden,128),) with
-        # pid_m = tile_idx // num_tiles_hidden over tokens, so its tile index is
-        # tile_n * tiles_in_h + tile_m. Reconstructing it arithmetically makes the
-        # SR stream independent of this kernel's CLC traversal order.
+        # tile_n * tiles_in_h + tile_m gives each tile a stable identity from its
+        # coordinates alone. This kernel's CLC scheduler is persistent, so which tile a
+        # CTA visits next is not fixed; deriving the SR Philox counter from coordinates
+        # rather than from a running per-thread counter is what keeps the stream a pure
+        # function of position and makes the same rng_state reproduce the same codes.
         tiles_in_h = hidden // cutlass.Int32(M_TILE)
 
         # ==================== TMA warp (mainloop producer) ====================
@@ -773,13 +775,13 @@ class _Tcgen05GroupRowColFused(_GroupRhtMainloop):
                         vals = bulk_vals[(None, u)]
                         col_rb = None
                         if cutlass.const_expr(self.sr):
-                            # Triton's columnwise scaled tile is (hidden, tokens), so its
-                            # flat packed index is h_local * (128/2) + token_local/2.
-                            col_rb = philox4(
+                            # One draw per 16-element block, indexed by its position in
+                            # the columnwise (hidden, tokens) tile.
+                            col_rb = philox4_all(
                                 col_state,
-                                tile_id * cutlass.Int32(TILE_PACKED)
-                                + h_local * cutlass.Int32(TOKEN_TILE // 2)
-                                + cutlass.Int32(u * 8),
+                                tile_id * cutlass.Int32(TILE_BLOCKS)
+                                + h_local * cutlass.Int32(TOKEN_TILE // 16)
+                                + cutlass.Int32(u),
                             )
                         w0, w1, sf = _quant16(
                             vals,
@@ -887,6 +889,8 @@ class _Tcgen05GroupRowColFused(_GroupRhtMainloop):
                     gRow = cute.local_tile(
                         mRowFP4, (TOKEN_TILE, M_TILE // 8), (tile_n, tile_m)
                     )
+                    if cutlass.const_expr(self.sr):
+                        tile_id = tile_n * tiles_in_h + tile_m
                     for p in cutlass.range_constexpr(ROW_PASSES):
                         tok = p * cutlass.Int32(ROW_TOK_PER_PASS) + t0
                         cute.autovec_copy(
@@ -897,14 +901,13 @@ class _Tcgen05GroupRowColFused(_GroupRhtMainloop):
                             blk[j] = rBlk[j].to(cutlass.Float32)
                         row_rb = None
                         if cutlass.const_expr(self.sr):
-                            # Triton's rowwise scaled tile is (tokens, hidden), so its
-                            # flat packed index is tok * (128/2) + hidden_local/2.
-                            row_rb = philox4(
+                            # One draw per 16-element block, indexed by its position in
+                            # the rowwise (tokens, hidden) tile.
+                            row_rb = philox4_all(
                                 row_state,
-                                (tile_n * tiles_in_h + tile_m)
-                                * cutlass.Int32(TILE_PACKED)
-                                + tok * cutlass.Int32(M_TILE // 2)
-                                + hb * cutlass.Int32(8),
+                                tile_id * cutlass.Int32(TILE_BLOCKS)
+                                + tok * cutlass.Int32(M_TILE // 16)
+                                + hb,
                             )
                         w0, w1, sf = _quant16(
                             blk,
@@ -1650,11 +1653,6 @@ def _valid_tile_count(tile_n_base, n_all, tiles_in_n_valid):
     rem = tiles_in_n_valid - tile_n_base
     rem = cutlass.select_(rem > cutlass.Int32(0), rem, cutlass.Int32(0))
     return cutlass.select_(rem < n_all, rem, n_all)
-
-
-# Packed bytes in one 128x128 triton tile: the stride between consecutive tile_id
-# values in triton's stochastic-rounding Philox counter (hadamard_utils._pack_fp4).
-TILE_PACKED = TOKEN_TILE * (M_TILE // 2)
 
 
 def _zero_sf():

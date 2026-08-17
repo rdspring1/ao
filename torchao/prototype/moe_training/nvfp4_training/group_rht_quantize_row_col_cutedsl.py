@@ -7,7 +7,13 @@
 """CuteDSL grouped fused RHT + NVFP4 quantize (SM100+).
 
 Drop-in backend for ``triton_group_rht_quantize_row_col``: same signature, same
-output contract. The kernel is a structural port of TransformerEngine's
+output contract, and byte-for-byte identical output under RTNE. Under stochastic
+rounding the outputs are statistically equivalent but not bitwise equal -- this kernel
+draws one Philox counter per 16-element block and consumes all four output words
+instead of reproducing triton's per-packed-byte counter stride. The stream stays a pure
+function of tile coordinates and ``rng_state``, so results remain reproducible.
+
+The kernel is a structural port of TransformerEngine's
 ``nvte_group_hadamard_transform_cast_fusion_graph_safe``; see
 ``_cutedsl_group_kernels_impl``.
 """
