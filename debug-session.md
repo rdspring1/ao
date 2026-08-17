@@ -314,7 +314,7 @@
 
 ## Experiment 18 — Post-round CuteDSL vs TransformerEngine, E=4
 
-- Action: re-measured both sides of the DSV3 671B FFN comparison at `0b41f58f`, TE
+- Action: re-measured both sides of the DSV3 671B FFN comparison at `c659013c`, TE
   2.19.0.dev0+172bd93, adding SR rows the table never carried.
 - Result (complete pipeline, standard math): gate/up SR `TE 2.06x -> 1.21x` ahead, down
   SR `TE 2.12x -> 1.26x`. Fast math SR: `TE 1.11x` and `1.14x`.

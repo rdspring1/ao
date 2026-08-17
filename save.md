@@ -4,7 +4,7 @@ Self-contained handoff. The toolchain blocker the previous handoff was stuck on 
 
 ## Current State
 
-- Branch `nvfp4_moe_cutedsl_split`, HEAD `0b41f58f` plus a docs commit. Working tree clean.
+- Branch `nvfp4_moe_cutedsl_split`, last code commit `9a0f0675`. Working tree clean.
 - The stochastic-rounding round is **complete on both the grouped and linear paths**,
   validated and committed.
 - **Grouped SR is ~2x faster**: standard `150.73 -> 77.33 us`, fast math `116.45 -> 57.77`.
@@ -31,11 +31,12 @@ in the image; install with `pip install ruff==0.11.6` per `CONTRIBUTING.md:18`.
 Four commits, one per retained round:
 
 ```
-64d381cd Fuse the CuTeDSL stochastic-rounding multiply and clamp into the convert
-87cb89c1 Fuse the CuTeDSL RTNE fast-math path and drop the scalar quantize
-0b41f58f Draw one Philox counter per block in the grouped stochastic-rounding path
-e0bfe38f Record the grouped stochastic-rounding optimization round
+7e2f5a22 Fuse the CuTeDSL stochastic-rounding multiply and clamp into the convert
+767a41fd Fuse the CuTeDSL RTNE fast-math path and drop the scalar quantize
+c659013c Draw one Philox counter per block in the grouped stochastic-rounding path
+b9b71bdc Record the grouped stochastic-rounding optimization round
 9a0f0675 Draw one Philox counter per block in the linear path too
+9808c101 Record the linear stochastic-rounding round
 ```
 
 The linear path shared `_quant16_from_amax`, so it inherited commits 1 and 2 for free
@@ -90,7 +91,7 @@ interval rather than bounded by half of it), not a defect. The bar was parameter
 ## Where CuteDSL now stands vs TransformerEngine (DSV3 671B, E=4)
 
 Complete pipeline, GB200, median of 3 samples (15 warmup / 50 timed), TE 2.19.0.dev0.
-Both sides re-measured at `0b41f58f`.
+Both sides re-measured at `c659013c`.
 
 | projection | math | rounding | CuteDSL | TE | TE speedup | was |
 |---|---|---|---:|---:|---:|---:|

@@ -339,7 +339,7 @@ the shorter height to amortize.
 Baseline from 2026-08-16 for the DeepSeek-V3 671B FFN shapes, excluding attention
 GEMMs and using `E = 4`. Run environment: NVIDIA GB200, CUDA 13.4, PyTorch
 2.15.0a0+git0f3e7e2, TransformerEngine 2.19.0.dev0+172bd93, and torchao commit
-`0b41f58f` (both sides re-measured after the grouped stochastic-rounding
+`c659013c` (both sides re-measured after the grouped stochastic-rounding
 optimization below).
 
 Times are CUDA kernel self-time in microseconds, with 15 warmups and 50 measured
