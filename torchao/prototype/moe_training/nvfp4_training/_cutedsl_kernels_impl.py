@@ -1552,6 +1552,10 @@ class _Tcgen05RowColFused:
             thr_copy_t2r = tiled_copy_t2r.get_slice(tidx)
             tTR_tAcc_base = thr_copy_t2r.partition_S(tAcc_epi)
             tTR_rAcc = cute.make_rmem_tensor(((16, 1), 1, 1), cutlass.Float32)
+            # Swizzled col SF: the write-view's last mode is contiguous and u indexes it,
+            # so four consecutive groups land in four adjacent bytes. Stage them in a
+            # register tile and commit one 4B store instead of four scattered STS.U8.
+            rSF4 = cute.make_rmem_tensor((4,), cutlass.Float8E4M3FN)
 
             epi_store_barrier = pipeline.NamedBarrier(
                 barrier_id=EPI_STORE_BAR, num_threads=COL_THREADS
@@ -1611,12 +1615,18 @@ class _Tcgen05RowColFused:
                     sFP4[tidx, u * 2 + 1] = w1
                     if cutlass.const_expr(self.swizzle_sf):
                         # swizzled SF[r=pid_m*128+tidx, c=pid_ns*16+u] -> [r//128, c//4, r%32, (r%128//32)*4 + c%4]
-                        sSF_w[
-                            0,
-                            u // 4,
-                            tidx % cutlass.Int32(32),
-                            (tidx // cutlass.Int32(32)) * cutlass.Int32(4) + (u % 4),
-                        ] = pvscale_fp8
+                        # c%4 is the contiguous mode, so u..u+3 are adjacent bytes: stage
+                        # four and store them as one word.
+                        rSF4[u % 4] = pvscale_fp8
+                        if cutlass.const_expr(u % 4 == 3):
+                            cute.autovec_copy(
+                                rSF4,
+                                cute.local_tile(
+                                    sSF_w[(0, u // 4, tidx % cutlass.Int32(32), None)],
+                                    (4,),
+                                    (tidx // cutlass.Int32(32),),
+                                ),
+                            )
                     else:
                         sSF_w[tidx, u] = pvscale_fp8
 
@@ -2156,7 +2166,6 @@ class _Tcgen05RhtAmax:
             thr_copy_t2r = tiled_copy_t2r.get_slice(tidx)
             tTR_tAcc_base = thr_copy_t2r.partition_S(tAcc_epi)
             tTR_rAcc = cute.make_rmem_tensor(((16, 1), 1, 1), cutlass.Float32)
-
             acc_consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, NUM_ACC_STAGE
             )
