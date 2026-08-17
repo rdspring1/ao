@@ -2107,18 +2107,21 @@ class _Tcgen05RhtAmax:
                 pipeline.PipelineUserType.Consumer, NUM_AB_STAGE
             )
             thread_row_max = cutlass.Float32(0.0)
-            kc = k_row % cutlass.Int32(8)
-            kd = k_row // cutlass.Int32(8)
+            rBlk = cute.make_rmem_tensor((16,), cutlass.BFloat16)
             for local_iter in cutlass.range(num_iters):
                 ab_pipeline.consumer_wait(row_ab_state)
                 stage = row_ab_state.index
+                # read this thread's M-row (128 N values across the m_mma grain). The A
+                # atom is MN_SW128, so the N grain is the contiguous mode: each block of
+                # 16 is one vector copy, not 16 scalar swizzled loads (the same shape the
+                # fused kernel's row epilogue and the grouped amax already use).
+                sA_row = sA_clean[(None, k_row, stage)]
                 for b in cutlass.range_constexpr(M_TILE // 16):  # 8 blocks of 16 N
+                    cute.autovec_copy(cute.local_tile(sA_row, (16,), (b,)), rBlk)
                     for j in cutlass.range_constexpr(16):
-                        m_mma = b * 16 + j  # N position (0..127)
-                        v = sA_clean[
-                            ((m_mma % 64, m_mma // 64), (kc, kd), (0, stage))
-                        ].to(cutlass.Float32)
-                        thread_row_max = _max_f32(thread_row_max, _abs_f32(v))
+                        thread_row_max = _max_f32(
+                            thread_row_max, _abs_f32(rBlk[j].to(cutlass.Float32))
+                        )
                 cute.arch.mbarrier_arrive(
                     ab_pipeline.sync_object_empty.get_barrier(stage)
                 )
