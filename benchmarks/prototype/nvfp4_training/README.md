@@ -692,6 +692,64 @@ Linear `(2048, 7168)` gate/up sentinel, median of three 15/50 samples:
 | standard | RTNE | 19.5444 | 19.5155 | 19.4503 | unchanged |
 | fast | RTNE | 14.8403 | 12.9741 | 12.9274 | 12.9% faster |
 
+### Linear RHT amax vectorization
+
+The linear `cutedsl_rht_amax` was the worst-performing kernel in the project: 2.2-3.0x
+behind TransformerEngine's `HadamardAmaxTmaKernel` and running at 2145 GB/s where its own
+grouped sibling reached 5074 on the same bytes.
+
+Two register/occupancy theories were tested first and **both were refuted**, which is
+worth recording so they are not re-derived:
+
+1. **Warp-specialized register redistribution.** The linear file contains zero
+   `warpgroup_reg_alloc/dealloc` calls against the grouped file's 13, and the linear amax
+   needs 98 registers where the grouped one needs 52. Adding the discipline (block padded
+   to whole warpgroups, dealloc 32 / alloc 96 / alloc 64) changed performance by +-0.5% and
+   left `REG:98` untouched. `setmaxnreg` redistributes registers *within* a CTA's existing
+   allocation; it does not lower the compiled base, and the base is what sets blocks per SM.
+2. **Supertile height plus a larger grid.** Compiling the 128-row supertile does drop the
+   kernel to `REG:42`, which genuinely fits four blocks per SM against the 256-row config's
+   one. Raising `GRID` past `NUM_SMS` to exploit that was **monotonically worse** at every
+   shape, co-resident or not. The kernel is not warp-starved in a way more warps repair.
+
+What worked was looking at the instruction mix instead. The row epilogue read SMEM one
+element at a time, re-deriving a swizzled address per element:
+
+| kernel | SMEM loads |
+|---|---|
+| linear amax, before | **128 x `LDS.U16`** |
+| grouped amax | 13 x `LDS.128` |
+| linear amax, after | **16 x `LDS.128`** |
+
+This is the same pattern the epilogue round fixed for the 2D weight kernel and the fused 1D
+row epilogue; the amax kernel does the same read for the same reason and was simply missed.
+The corrected shape already existed one function away in the same file. Static instructions
+fell 2088 -> 1704 (18.4%), with registers unchanged at 98 — so the address arithmetic was
+not holding them either.
+
+| shape | before (us) | after (us) | change | GB/s after |
+|---|---:|---:|---:|---:|
+| (512, 7168) | 8.60 | 7.31 | 15.0% faster | 1004 |
+| (2048, 2048) | 8.71 | 7.42 | 14.9% faster | 1131 |
+| (2048, 4096) | 11.18 | 8.42 | 24.7% faster | 1993 |
+| (2048, 7168) | 13.69 | **9.67** | **29.4% faster** | 3036 |
+| (4096, 7168) | 20.81 | 12.97 | 37.7% faster | 4526 |
+| (8192, 2048) | 16.05 | 10.77 | 32.9% faster | 3114 |
+| (8192, 7168) | 37.01 | **24.69** | **33.3% faster** | 4757 |
+
+At (8192, 7168) the kernel now edges TE's `HadamardAmaxTmaKernel` (24.92 us). The complete
+linear pipeline against TE:
+
+| math | rounding | TE speedup before | TE speedup now |
+|---|---|---:|---:|
+| standard | RTNE | 1.82x | **1.60x** |
+| standard | SR | 1.31x | **1.17x** |
+| fast | RTNE | 1.71x | **1.46x** |
+| fast | SR | 1.31x | **1.15x** |
+
+Output is bitwise identical: the read order within a 16-element block changes, and max is
+commutative.
+
 ### Grouped Weight Amax
 
 Benchmarks `triton_group_weight_amax` — the input-side twin of the grouped 2D weight

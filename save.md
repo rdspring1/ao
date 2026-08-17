@@ -189,7 +189,7 @@ PY
 
 Current grouped readings (standard / fast): RTNE **56.95** / **42.55**, SR **77.33** /
 **57.77**. Linear `(2048, 7168)` gate/up, via `cutedsl_rht_quantize_row_col`: RTNE
-**19.45** / **12.93**, SR **25.83** / **18.09**.
+**19.45** / **12.93**, SR **25.83** / **18.09**. Linear `cutedsl_rht_amax`: **9.67**.
 
 Two-oracle suite — 36 triton-parity (all RTNE) and 54 TE-reference:
 

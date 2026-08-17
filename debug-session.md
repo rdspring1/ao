@@ -362,3 +362,72 @@
   grouped SR alone, 18 s -- everything else was already covered by runs earlier in the
   session. Derive the blast radius from the diff before running.
 - Failure classification: none; retained.
+
+## Experiment 20 — Warp-specialized register redistribution, linear amax (negative)
+
+- Hypothesis: the linear amax needs 98 registers where the grouped amax needs 52, and the
+  linear file contains zero `warpgroup_reg_alloc/dealloc` calls against the grouped file's
+  13. Giving the linear amax the same discipline should cut its footprint and lift
+  occupancy, which ncu said was the binding constraint (3.32 active warps per scheduler,
+  60.6% of cycles with no eligible warp, 38% of stall cycles on L1TEX dependencies).
+- Action: padded the amax block from 448 to 512 threads so the mma/tma warps form a
+  complete warpgroup (warpgroup_reg_alloc is warpgroup-granular), added two idle warps,
+  and issued dealloc 32 / alloc 96 (col) / alloc 64 (row) — a budget of
+  128*96 + 256*64 + 128*32 = 32768, i.e. two blocks per SM on paper.
+- Result: bitwise identical output, and **+-0.5% at every shape** — no effect at all.
+  `cuobjdump` still reported REG:98.
+- Interpretation: `setmaxnreg` redistributes registers *within* a CTA's existing
+  allocation; it does not lower the compiled base, and the base is what determines blocks
+  per SM. Asking col for 96 and row for 64 — both below the base of 98 — freed nothing.
+  The grouped amax's REG:52 is therefore not discipline, its code simply needs less.
+- Failure classification: refuted hypothesis; reverted.
+
+## Experiment 21 — Supertile height and grid multiplier, linear amax (negative)
+
+- Hypothesis: register pressure is driven by the 256-row supertile (each row thread owns
+  one M-row across 256 M-positions), so the 128-row supertile plus a larger persistent
+  grid should convert the freed registers into occupancy.
+- Evidence: compiling `col_groups_per_supertile=8` gives **REG:42** against the 256-row
+  config's 98. At 42 x 320 threads = 13440, four blocks genuinely fit per SM, where the
+  256-row config fits one. `GRID = min(NUM_SMS, ...)` caps the launch at one block per SM
+  regardless, so both had to change together.
+- Action: swept `col_groups_per_supertile` in (16, 8) x grid multiplier in (1, 2, 4).
+- Result: raising the grid multiplier is **monotonically worse** at every shape, including
+  the `cgps=8` case where the blocks genuinely co-reside — (2048,7168) went 13.50 -> 13.83
+  -> 15.27 for x1/x2/x4. `cgps=8` at x1 was a small win (13.69 -> 13.50, 1.4%; 8.67 -> 8.34
+  at (2048,2048), 3.8%) but below the 2% sentinel bar.
+- Interpretation: the occupancy thesis is refuted by direct experiment. The ncu counters
+  describe the kernel accurately but do not identify its constraint; it is not warp-starved
+  in a way more warps repair. Two independent occupancy levers produced nothing.
+- Failure classification: refuted hypothesis; reverted. Note `cgps=8` also relaxes the
+  shape requirement from M % 256 to M % 128, if that is ever wanted for its own sake.
+
+## Experiment 22 — Vectorized linear amax row epilogue
+
+- Hypothesis: after two failed occupancy experiments, look at what the kernel actually
+  issues rather than how many warps it runs.
+- Evidence: the amax row epilogue read SMEM one element at a time, re-deriving a swizzled
+  address per element, in a doubly-nested constexpr loop. SASS confirmed **128 LDS.U16**
+  against the grouped amax's **13 LDS.128**. This is exactly the pattern Experiment 10
+  fixed, applied then to the 2D weight kernel and the fused 1D row epilogue and missed
+  here — the linear fused kernel already carries the corrected shape one function away, with a
+  comment explaining the MN_SW128 contiguity.
+- Action: slice `sA_clean` to the thread's M-row, `local_tile` by 16, `autovec_copy` into a
+  16-element bf16 register tile. No new primitive, no new layout reasoning.
+- Result: 128 LDS.U16 -> 16 LDS.128; 2088 -> 1704 static instructions (18.4%).
+
+    (  512, 7168)   8.60 ->  7.31 us (15.0%)   ( 4096, 7168)  20.81 -> 12.97 us (37.7%)
+    ( 2048, 2048)   8.71 ->  7.42 us (14.9%)   ( 8192, 2048)  16.05 -> 10.77 us (32.9%)
+    ( 2048, 4096)  11.18 ->  8.42 us (24.7%)   ( 8192, 7168)  37.01 -> 24.69 us (33.3%)
+    ( 2048, 7168)  13.69 ->  9.67 us (29.4%)
+
+  Effective bandwidth 2145 -> 3036 GB/s at the sentinel and 3173 -> 4757 at (8192, 7168),
+  where it now edges TE's HadamardAmaxTmaKernel (24.92 us). Complete linear pipeline vs TE:
+  standard RTNE 1.82x -> 1.60x, fast RTNE 1.71x -> 1.46x, standard SR 1.31x -> 1.17x,
+  fast SR 1.31x -> 1.15x.
+- Correctness: bitwise identical (the read order within a block changes, max is
+  commutative). 79 amax cases pass with 15 skipped, plus 164 across the quantize and
+  nvfp4_linear consumers.
+- Registers stayed at 98, so the address arithmetic was not holding them either — worth
+  recording alongside Experiments 20 and 21, all three of which were register theories.
+- Failure classification: none; retained.
