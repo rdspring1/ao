@@ -334,32 +334,51 @@ the shorter height to amortize.
 
 ### CuteDSL comparison vs TransformerEngine
 
-Fresh baseline from 2026-08-16 for the DeepSeek-V3 671B FFN shapes, excluding
-attention GEMMs and using `E = 4`. Run environment: NVIDIA GB200, CUDA 13.4,
-PyTorch 2.15.0a0+git0f3e7e2, TransformerEngine 2.19.0.dev0+172bd93, and torchao
-commit `e720c1b7`.
+Baseline from 2026-08-16 for the DeepSeek-V3 671B FFN shapes, excluding attention
+GEMMs and using `E = 4`. Run environment: NVIDIA GB200, CUDA 13.4, PyTorch
+2.15.0a0+git0f3e7e2, TransformerEngine 2.19.0.dev0+172bd93, and torchao commit
+`0b41f58f` (both sides re-measured after the grouped stochastic-rounding
+optimization below).
 
 Times are CUDA kernel self-time in microseconds, with 15 warmups and 50 measured
 iterations. Memcpy and memset events are excluded. The grouped activation comparison
 times the complete post-RHT amax and row/column quantization pipeline: one
 `cutedsl_group_rht_amax` followed by one `cutedsl_group_rht_quantize_row_col`, versus
-TransformerEngine's `split_quantize` counterpart.
+TransformerEngine's `split_quantize` counterpart, which computes its post-RHT amax
+internally.
 
-| projection | E | M | N | math | CuteDSL pipeline (us) | TE pipeline (us) | TE speedup |
-|---|---:|---:|---:|---|---:|---:|---:|
-| gate/up (w1/w3) | 4 | 2048 | 7168 | standard | 91.11 | 64.44 | 1.41x |
-| gate/up (w1/w3) | 4 | 2048 | 7168 | fast | 72.64 | 55.86 | 1.30x |
-| down (w2) | 4 | 7168 | 2048 | standard | 92.76 | 62.80 | 1.48x |
-| down (w2) | 4 | 7168 | 2048 | fast | 73.65 | 54.77 | 1.35x |
+| projection | E | M | N | math | rounding | CuteDSL pipeline (us) | TE pipeline (us) | TE speedup |
+|---|---:|---:|---:|---|---|---:|---:|---:|
+| gate/up (w1/w3) | 4 | 2048 | 7168 | standard | RTNE | 86.35 | 64.01 | 1.35x |
+| gate/up (w1/w3) | 4 | 2048 | 7168 | standard | SR | 106.23 | 87.92 | 1.21x |
+| gate/up (w1/w3) | 4 | 2048 | 7168 | fast | RTNE | 70.57 | 55.62 | 1.27x |
+| gate/up (w1/w3) | 4 | 2048 | 7168 | fast | SR | 86.24 | 77.68 | 1.11x |
+| down (w2) | 4 | 7168 | 2048 | standard | RTNE | 88.51 | 62.65 | 1.41x |
+| down (w2) | 4 | 7168 | 2048 | standard | SR | 109.10 | 86.76 | 1.26x |
+| down (w2) | 4 | 7168 | 2048 | fast | RTNE | 71.63 | 54.69 | 1.31x |
+| down (w2) | 4 | 7168 | 2048 | fast | SR | 87.34 | 76.43 | 1.14x |
 
-The corresponding standalone CuteDSL stage times were:
+The SR rows are the ones that moved. Before the optimization below, TE led the SR
+pipeline by 2.06x (gate/up) and 2.12x (down) at standard math; it now leads by 1.21x
+and 1.26x. The remaining gap is no longer SR-specific: SR costs CuteDSL 1.23x its own
+RTNE pipeline against TE's 1.37x, so the SR path is now the more efficient of the two
+relative to its own baseline, and what is left is the RTNE gap.
 
-| projection | math | amax (us) | quantize (us) |
-|---|---|---:|---:|
-| gate/up (w1/w3) | standard | 22.77 | 61.18 |
-| gate/up (w1/w3) | fast | 22.67 | 45.40 |
-| down (w2) | standard | 22.63 | 63.00 |
-| down (w2) | fast | 22.60 | 46.57 |
+The corresponding standalone CuteDSL stage times:
+
+| projection | math | rounding | amax (us) | quantize (us) |
+|---|---|---|---:|---:|
+| gate/up (w1/w3) | standard | RTNE | 23.26 | 57.06 |
+| gate/up (w1/w3) | standard | SR | 23.25 | 75.90 |
+| gate/up (w1/w3) | fast | RTNE | 23.29 | 42.74 |
+| gate/up (w1/w3) | fast | SR | 23.39 | 57.24 |
+| down (w2) | standard | RTNE | 23.37 | 58.96 |
+| down (w2) | standard | SR | 23.37 | 77.68 |
+| down (w2) | fast | RTNE | 23.28 | 43.88 |
+| down (w2) | fast | SR | 23.41 | 58.90 |
+
+The amax stage is at parity with TE everywhere, so the whole remaining 1D gap sits in
+the quantize kernel.
 
 TransformerEngine has no grouped 2D weight quantization kernel. The correct weight
 comparison is therefore one `cutedsl_group_weight_quantize_2d` launch over all four
@@ -579,6 +598,58 @@ simply did not clear the 2% bar, and it would have forced the 128-row geometry o
 every weight shape. This is distinct from the earlier 128-row supertile experiment,
 which kept `GRID = min(NUM_SMS, num_super)` and therefore never changed occupancy at
 all.
+
+### Grouped stochastic-rounding optimization
+
+A third pass again started from the SASS rather than a benchmark, diffing the grouped
+kernel's SR and RTNE compilations directly (`_compile_group_fused_kernel(0, True, sr,
+False)` under `CUTE_DSL_KEEP=cubin`, then `cuobjdump -res-usage -sass`). SR ran **2360
+more static instructions than RTNE**, 5816 against 3456, and the mix said where they
+were: `IMAD` + `LOP3` accounted for 1802 (76%) and `FMUL` + `FMNMX` for 384 (16%).
+Both variants reported `REG:128` with no spill traffic, which killed a third
+hypothesis — that SR was spilling against the shared `REG_COL`/`REG_ROW` budget — for
+free, before any code was written.
+
+1. **Fused SR multiply and clamp.** The SR path still materialized a 16-entry FP32
+   register tensor plus 16 `mul.f32` and 16 `min.xorsign.abs.f32` before packing, the
+   shape RTNE had already abandoned. `_mul_cvt_rs_e2m1x8_f32` and its `_acc` twin
+   mirror the RTNE pair, replacing four `cvt.rn.satfinite.e2m1x2.f32` with two
+   `cvt.rs.satfinite.e2m1x4.f32` that each consume one random word. The explicit clamp
+   is dropped, relying on `.satfinite` as TE does; because `cvt.rs` perturbs the
+   mantissa before saturating this was verified against the linear path's five
+   triton SR bitwise-parity cases rather than assumed.
+2. **Fused RTNE fast math.** The same `not sr and not fast_math` gate meant fast math
+   was the last caller still materializing that tensor. Unifying the gate left six
+   helpers unreachable (`_pack16`, both `cvt` pack4 primitives, `_cvt_rn_bf16x2_f32`,
+   `_u32_as_f32`, `_min_xorsign_abs_f32`), removing 186 lines.
+3. **One Philox draw per block.** `philox4` reproduces triton's per-packed-byte
+   counter stride, running four full round schedules per 16-element block and keeping
+   one word of each — 124 multiplies for 128 bits that a single draw produces.
+   `philox4_all` keeps the existing launch-uniform `philox_prep` hoist (an advantage
+   over TE, which recomputes its key schedule in-loop) and computes all four words in
+   the last round: **34 multiplies instead of 124**. The counter is derived from tile
+   coordinates rather than a running per-thread value, because this kernel's CLC
+   scheduler is persistent and visit order is not fixed.
+
+Change 3 is the first in this project that is not bitwise-preserving. Grouped SR codes
+are now a different, equally valid stream; RTNE is untouched and remains bitwise
+identical to both oracles.
+
+Static instruction excess over the RTNE variant:
+
+| | total | IMAD | LOP3 | FMUL | FMNMX |
+|---|---:|---:|---:|---:|---:|
+| before | +2360 | +1044 | +758 | +192 | +192 |
+| after | +736 | +346 | +206 | 0 | 0 |
+
+Sentinel, grouped `E=4` per-expert `(2048, 7168)`, median of three 15/50 samples:
+
+| math | rounding | before (us) | after (us) | change |
+|---|---|---:|---:|---:|
+| standard | SR | 150.73 | 77.33 | **48.7% faster** |
+| fast | SR | 116.45 | 57.77 | **50.4% faster** |
+| standard | RTNE | 56.82 | 56.95 | unchanged |
+| fast | RTNE | 45.60 | 42.55 | 6.7% faster |
 
 ### Grouped Weight Amax
 

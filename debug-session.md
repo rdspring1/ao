@@ -227,3 +227,99 @@
   the 128-row geometry. Occupancy is a genuine second-order effect here, not the
   first-order one the pre-round table suggested.
 - Failure classification: sub-threshold improvement; reverted.
+
+## Experiment 14 — SR vs RTNE SASS diff (no benchmark)
+
+- Hypothesis: the grouped SR gap has three candidate causes -- discarded Philox words,
+  an unfused multiply/clamp, and register spilling against the shared `REG_COL` /
+  `REG_ROW` budget -- and a static instruction diff can size all three for free.
+- Evidence: `philox4:397` runs four full `philox_c0` schedules per 16-element block and
+  keeps only `c0` of each; `_quant16_from_amax:776` gates the fused packing on
+  `not sr and not fast_math`; `REG_DEALLOC/REG_COL/REG_ROW` are module-level ints shared
+  by every compiled variant.
+- Action: compiled `_compile_group_fused_kernel(0, True, sr, False)` for both `sr`
+  values under `CUTE_DSL_KEEP=cubin CUTE_DSL_DUMP_DIR=`, then `cuobjdump -res-usage
+  -sass` and diffed the opcode mix by base family.
+- Result: SR 5816 static instructions vs RTNE 3456, +2360. `IMAD` +1044 and `LOP3` +758
+  (1802, 76%); `FMUL` +192 and `FMNMX` +192 (384, 16%). `IMAD.HI.U32` goes 0 -> 536.
+  Both report `REG:128`, `LDL` 14 -> 16, `STL` 8 -> 9, no `MOV.SPILL`.
+- Interpretation: the RNG is the dominant cost and the unfused arithmetic is second.
+  The spill hypothesis is refuted -- SR does not spill where RTNE does not -- so the
+  planned SR-specific register-budget round was dropped before it was written.
+- Failure classification: none; diagnostic only, no source change.
+
+## Experiment 15 — Fused SR multiply and clamp
+
+- Hypothesis: giving SR the same fused multiply/convert RTNE already has removes the
+  384 `FMUL`/`FMNMX` Experiment 14 measured.
+- Evidence: TE fuses the multiply into the same asm block and applies no clamp,
+  relying on `.satfinite` (`ptx.cuh:940-990`); Experiment 12 already validated exactly
+  that removal for RTNE.
+- Action: added `_mul_cvt_rs_e2m1x8_f32` and `_mul_cvt_rs_e2m1x8_acc_f32` (two
+  `cvt.rs.satfinite.e2m1x4.f32` in place of four `cvt.rn...e2m1x2`, one random word
+  each) plus `_pack16_rs_from_enc`, and routed the `sr` branch through it.
+- Discriminator for the dropped clamp: `cvt.rs` perturbs the mantissa before saturating,
+  so `|x| > 6` could have diverged. The linear path retains full triton SR bitwise
+  parity and is a real oracle for it -- all five
+  `test_cutedsl_vs_triton_stochastic_rounding_bitwise` cases passed unchanged, so no
+  explicit `min.xorsign.abs` was needed.
+- Result: SR standard `150.73 -> 139.43 us` (7.5%), SR fast `116.45 -> 108.98` (6.4%);
+  RTNE unchanged. `FMUL`/`FMNMX` excess over RTNE went +192/+192 -> 0/0.
+- Correctness: bitwise neutral; 45 triton-parity + 54 TE-reference cases passed.
+- Failure classification: none; retained.
+
+## Experiment 16 — Fused RTNE fast-math path
+
+- Hypothesis: the same gate left fast-math RTNE materializing the scalar tensor, and
+  fixing it is bitwise-neutral.
+- Action: collapsed `_quant16_from_amax` to one rounding-mode branch over a shared
+  shape, with `use_acc = rht_acc and not fast_math` -- fast math takes the plain
+  primitive even for an RHT accumulator, because it deliberately skips the bfloat16
+  round-through. Deleted the six helpers this made unreachable (186 lines).
+- Result: RTNE fast `45.60 -> 42.55 us` (6.7%); all other cases unchanged.
+- Correctness: 45 + 54 cases, including
+  `test_cutedsl_group_fast_math_matches_transformer_engine`, the byte-identity check
+  against real TE fast math and the only direct guard on the dropped clamp here.
+- Failure classification: none; retained.
+
+## Experiment 17 — One Philox draw per block (grouped)
+
+- Hypothesis: consuming all four Philox words per draw instead of one cuts the RNG cost
+  Experiment 14 measured by roughly 3.6x.
+- Evidence: TE issues one `generate4` per block for ~40 multiplies
+  (`curanddx.hpp:36-101`, `ptx.cuh:914-990`); `philox4`'s 4-counter stride exists only
+  to reproduce triton's `tl.randint`-per-packed-byte stream, which the user approved
+  dropping for the grouped kernel.
+- Action: added `philox4_all`, which reuses the existing `philox_prep` hoist and differs
+  from `philox_c0` only in computing all four words in the last round: 34 multiplies for
+  four words against 124. Counter derived from tile coordinates -- the previous
+  packed-byte expression divided by 8, every term dividing exactly -- because the CLC
+  scheduler makes visit order unstable and a running counter would make output depend on
+  scheduling. Added `TILE_BLOCKS`; column and row keep distinct keys.
+- Result: SR standard `138.34 -> 77.33 us` (44.1%), SR fast `108.75 -> 57.77` (46.9%).
+  Over the three commits: `150.73 -> 77.33` (1.95x) and `116.45 -> 57.77` (2.02x).
+  Static excess over RTNE `+2360 -> +736`; `IMAD` `+1044 -> +346`, `LOP3` `+758 -> +206`.
+- Correctness: first non-bitwise-preserving change in this project. The four grouped SR
+  bitwise cases asserted exactly the dropped property and were replaced by
+  `test_group_rht_sr_reconstructs` and `test_group_rht_sr_unbiased`;
+  `test_group_rht_rng_state_controls_stochastic_rounding` is unchanged and is the real
+  guard on the new counter derivation. Full nvfp4_training suite: 594 passed, 36 skipped.
+- Gap found while writing the tests: SR measures 17.2 dB reconstruction SQNR against
+  RTNE's 20+, on both backends and all four fixtures within 0.2 dB. The unmodified
+  triton backend measures the same, so the planned "SQNR at the RTNE threshold" was the
+  wrong contract for a stochastic kernel rather than a defect -- SR's error is uniform
+  over the quantization interval instead of bounded by half of it, about 3 dB. The bar
+  was parameterized and set to 15 dB for SR.
+- Failure classification: none; retained.
+
+## Experiment 18 — Post-round CuteDSL vs TransformerEngine, E=4
+
+- Action: re-measured both sides of the DSV3 671B FFN comparison at `0b41f58f`, TE
+  2.19.0.dev0+172bd93, adding SR rows the table never carried.
+- Result (complete pipeline, standard math): gate/up SR `TE 2.06x -> 1.21x` ahead, down
+  SR `TE 2.12x -> 1.26x`. Fast math SR: `TE 1.11x` and `1.14x`.
+- Interpretation: SR now costs CuteDSL 1.23x its own RTNE pipeline against TE's 1.37x,
+  so the SR path is the more efficient of the two relative to its own baseline. The
+  remaining gap is no longer SR-specific -- it is the RTNE gap, and it sits entirely in
+  the quantize kernel, since the amax stage is at parity everywhere.
+- Failure classification: none; measurement only.
