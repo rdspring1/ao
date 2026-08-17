@@ -174,26 +174,28 @@ python -m benchmarks.prototype.nvfp4_training.bench_quantize_2d --shape-set repr
   amaxes. Device kernel time is used rather than wall-clock because NVFP4 training runs the linear
   under CUDA graphs / `torch.compile`, which amortizes host launch overhead.
 
-Run environment: NVIDIA GB200, PyTorch 2.15.0a0+git04a7716, Triton 3.8.0,
-nvidia-cutlass-dsl 4.5.2.
+Run environment: NVIDIA GB200, CUDA 13.4, PyTorch 2.15.0a0+git0f3e7e2, Triton 3.8.0,
+nvidia-cutlass-dsl 4.5.2. Every table in this section was re-measured together on that
+environment; earlier revisions of this file used a different torch build, so their
+absolute numbers are not comparable to these on either backend.
 
 ### Hadamard Amax (`cutedsl_rht_amax` vs `triton_rht_amax`)
 
 | Model | Shape | M | N | cutedsl_kernel_us | triton_kernel_us | speedup | cutedsl_gbps |
 |---|---|---:|---:|---:|---:|---:|---:|
-| Llama 3 8B | hidden-state input | 2048 | 4096 | 11.25 | 16.35 | 1.45x | 1491.7 |
-| Llama 3 8B | mlp.down input | 2048 | 14336 | 20.98 | 25.31 | 1.21x | 2799.0 |
-| Llama 3 70B | hidden-state input | 2048 | 8192 | 16.14 | 20.02 | 1.24x | 2079.2 |
-| Llama 3 70B | mlp.down input | 2048 | 28672 | 37.24 | 39.59 | 1.06x | 3153.8 |
+| Llama 3 8B | hidden-state input | 2048 | 4096 | 8.52 | 16.37 | 1.92x | 1968.5 |
+| Llama 3 8B | mlp.down input | 2048 | 14336 | 13.12 | 25.40 | 1.94x | 4474.1 |
+| Llama 3 70B | hidden-state input | 2048 | 8192 | 10.86 | 20.03 | 1.84x | 3089.0 |
+| Llama 3 70B | mlp.down input | 2048 | 28672 | 25.19 | 39.95 | 1.59x | 4663.0 |
 
 ### Hadamard Quantize Row+Col (`cutedsl_rht_quantize_row_col` vs `triton_rht_quantize_row_col`, RTNE)
 
 | Model | Shape | M | N | cutedsl_kernel_us | triton_kernel_us | speedup | cutedsl_gbps |
 |---|---|---:|---:|---:|---:|---:|---:|
-| Llama 3 8B | hidden-state input | 2048 | 4096 | 14.76 | 23.77 | 1.61x | 1775.7 |
-| Llama 3 8B | mlp.down input | 2048 | 14336 | 37.62 | 60.95 | 1.62x | 2438.9 |
-| Llama 3 70B | hidden-state input | 2048 | 8192 | 25.29 | 37.50 | 1.48x | 2072.8 |
-| Llama 3 70B | mlp.down input | 2048 | 28672 | 72.22 | 113.88 | 1.58x | 2540.7 |
+| Llama 3 8B | hidden-state input | 2048 | 4096 | 14.07 | 25.28 | 1.80x | 1863.3 |
+| Llama 3 8B | mlp.down input | 2048 | 14336 | 35.87 | 61.29 | 1.71x | 2557.6 |
+| Llama 3 70B | hidden-state input | 2048 | 8192 | 23.12 | 38.37 | 1.66x | 2268.0 |
+| Llama 3 70B | mlp.down input | 2048 | 28672 | 70.98 | 113.11 | 1.59x | 2585.1 |
 
 ### 2D Weight Quantize (`cutedsl_weight_quantize_2d` vs `triton_weight_quantize_2d`, no RHT)
 
@@ -202,10 +204,10 @@ Requires `out_features % 128 == 0`.
 
 | Model | Weight | M (out) | N (in) | cutedsl_kernel_us | triton_kernel_us | speedup | cutedsl_gbps |
 |---|---|---:|---:|---:|---:|---:|---:|
-| Llama 3 8B | mlp.gate/up | 14336 | 4096 | 78.89 | 144.58 | 1.83x | 2325.9 |
-| Llama 3 8B | mlp.down | 4096 | 14336 | 78.80 | 144.49 | 1.83x | 2328.6 |
-| Llama 3 70B | mlp.gate/up | 28672 | 8192 | 286.06 | 535.91 | 1.87x | 2565.9 |
-| Llama 3 70B | mlp.down | 8192 | 28672 | 284.79 | 535.20 | 1.88x | 2577.3 |
+| Llama 3 8B | mlp.gate/up | 14336 | 4096 | 57.31 | 154.53 | 2.70x | 3201.9 |
+| Llama 3 8B | mlp.down | 4096 | 14336 | 57.53 | 154.31 | 2.68x | 3189.6 |
+| Llama 3 70B | mlp.gate/up | 28672 | 8192 | 203.93 | 577.52 | 2.83x | 3599.2 |
+| Llama 3 70B | mlp.down | 8192 | 28672 | 203.84 | 577.50 | 2.83x | 3600.9 |
 
 ## Grouped (MoE) kernels
 
@@ -228,8 +230,9 @@ target deployment is high expert parallelism, so a rank holds a handful of exper
 the per-model M/N at small `E` is the representative shape. `--experts` overrides it
 where the script takes one.
 
-Run environment for every table in this section: NVIDIA GB200, PyTorch
-2.15.0a0+git04a7716, Triton 3.8.0, nvidia-cutlass-dsl 4.5.2.
+Run environment for every table in this section: NVIDIA GB200, CUDA 13.4, PyTorch
+2.15.0a0+git0f3e7e2, Triton 3.8.0, nvidia-cutlass-dsl 4.5.2. All of them were
+re-measured together on that environment.
 
 ### CuteDSL kernels — comparison vs Triton
 
@@ -271,12 +274,12 @@ rowwise amax, without materializing the transform.
 
 | model | projection | E | M | N | cutedsl_us | triton_us | speedup | cutedsl_gbps |
 |---|---|---:|---:|---:|---:|---:|---:|---:|
-| debugmodel | gate/up (w1/w3) | 4 | 256 | 256 | 11.22 | 8.84 | 0.79x | 46.7 |
-| debugmodel | down (w2) | 4 | 256 | 256 | 11.20 | 8.83 | 0.79x | 46.8 |
-| 16B | gate/up (w1/w3) | 4 | 1408 | 2048 | 10.16 | 18.18 | 1.79x | 2270.7 |
-| 16B | down (w2) | 4 | 2048 | 1408 | 9.77 | 18.18 | 1.86x | 2362.2 |
-| 671B | gate/up (w1/w3) | 4 | 2048 | 7168 | 22.99 | 39.71 | 1.73x | 5109.2 |
-| 671B | down (w2) | 4 | 7168 | 2048 | 22.26 | 40.56 | 1.82x | 5276.9 |
+| debugmodel | gate/up (w1/w3) | 4 | 256 | 256 | 11.08 | 8.76 | 0.79x | 47.3 |
+| debugmodel | down (w2) | 4 | 256 | 256 | 11.06 | 8.77 | 0.79x | 47.4 |
+| 16B | gate/up (w1/w3) | 4 | 1408 | 2048 | 10.17 | 18.10 | 1.78x | 2267.5 |
+| 16B | down (w2) | 4 | 2048 | 1408 | 9.77 | 18.12 | 1.85x | 2361.3 |
+| 671B | gate/up (w1/w3) | 4 | 2048 | 7168 | 22.92 | 40.10 | 1.75x | 5124.0 |
+| 671B | down (w2) | 4 | 7168 | 2048 | 22.49 | 41.26 | 1.83x | 5221.1 |
 
 #### Grouped Hadamard Quantize Row+Col
 
@@ -290,28 +293,30 @@ Round-to-nearest-even (`rtne`):
 
 | model | projection | E | M | N | cutedsl_us | triton_us | speedup | cutedsl_gbps | pct_peak |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| debugmodel | gate/up (w1/w3) | 4 | 256 | 256 | 19.19 | 7.05 | 0.37x | 42.7 | 0.54 |
-| debugmodel | down (w2) | 4 | 256 | 256 | 19.18 | 7.06 | 0.37x | 42.7 | 0.54 |
-| 16B | gate/up (w1/w3) | 4 | 1408 | 2048 | 19.11 | 18.69 | 0.98x | 1885.8 | 23.79 |
-| 16B | down (w2) | 4 | 2048 | 1408 | 17.95 | 18.68 | 1.04x | 2008.3 | 25.33 |
-| 671B | gate/up (w1/w3) | 4 | 2048 | 7168 | 51.68 | 85.75 | 1.66x | 3551.0 | 44.79 |
-| 671B | down (w2) | 4 | 7168 | 2048 | 52.77 | 85.03 | 1.61x | 3477.2 | 43.86 |
+| debugmodel | gate/up (w1/w3) | 4 | 256 | 256 | 20.90 | 7.05 | 0.34x | 39.2 | 0.49 |
+| debugmodel | down (w2) | 4 | 256 | 256 | 20.87 | 7.03 | 0.34x | 39.3 | 0.50 |
+| 16B | gate/up (w1/w3) | 4 | 1408 | 2048 | 20.68 | 21.40 | 1.04x | 1743.4 | 21.99 |
+| 16B | down (w2) | 4 | 2048 | 1408 | 19.18 | 21.44 | 1.12x | 1879.1 | 23.70 |
+| 671B | gate/up (w1/w3) | 4 | 2048 | 7168 | 57.10 | 92.48 | 1.62x | 3213.8 | 40.54 |
+| 671B | down (w2) | 4 | 7168 | 2048 | 59.05 | 92.58 | 1.57x | 3107.8 | 39.20 |
 
 Stochastic rounding (`rs`):
 
 | model | projection | E | M | N | cutedsl_us | triton_us | speedup | cutedsl_gbps | pct_peak |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| debugmodel | gate/up (w1/w3) | 4 | 256 | 256 | 42.45 | 11.73 | 0.28x | 19.3 | 0.24 |
-| debugmodel | down (w2) | 4 | 256 | 256 | 42.48 | 11.77 | 0.28x | 19.3 | 0.24 |
-| 16B | gate/up (w1/w3) | 4 | 1408 | 2048 | 41.50 | 36.36 | 0.88x | 868.5 | 10.95 |
-| 16B | down (w2) | 4 | 2048 | 1408 | 40.97 | 36.38 | 0.89x | 879.8 | 11.10 |
-| 671B | gate/up (w1/w3) | 4 | 2048 | 7168 | 127.50 | 164.17 | 1.29x | 1439.2 | 18.15 |
-| 671B | down (w2) | 4 | 7168 | 2048 | 128.85 | 163.62 | 1.27x | 1424.1 | 17.96 |
+| debugmodel | gate/up (w1/w3) | 4 | 256 | 256 | 26.33 | 11.70 | 0.44x | 31.1 | 0.39 |
+| debugmodel | down (w2) | 4 | 256 | 256 | 26.34 | 11.70 | 0.44x | 31.1 | 0.39 |
+| 16B | gate/up (w1/w3) | 4 | 1408 | 2048 | 26.48 | 37.81 | 1.43x | 1361.1 | 17.17 |
+| 16B | down (w2) | 4 | 2048 | 1408 | 25.03 | 37.90 | 1.51x | 1440.0 | 18.16 |
+| 671B | gate/up (w1/w3) | 4 | 2048 | 7168 | 75.93 | 167.51 | 2.21x | 2416.6 | 30.48 |
+| 671B | down (w2) | 4 | 7168 | 2048 | 77.53 | 167.03 | 2.15x | 2367.0 | 29.86 |
 
-Stochastic rounding costs roughly 2.5x RTNE on CuteDSL and 2x on Triton. Both run a
-10-round Philox per random word and draw the identical stream; CuteDSL issues half as
-many calls (Triton discards two of every four it computes), which is what keeps it
-ahead at 671B despite the extra ALU work.
+Stochastic rounding now costs CuteDSL about 1.3x its own RTNE time against Triton's
+1.8x, which is what turns a 1.6x RTNE lead into a 2.2x SR lead at 671B. Both run the
+same 10-round Philox generator, but no longer the same counter stream: Triton draws one
+word per packed byte and discards two of every four it computes, while CuteDSL draws one
+counter per 16-element block and consumes all four words -- 34 multiplies where the
+triton-compatible stride cost 124.
 
 #### Grouped 2D Weight Quantize (`cutedsl_group_weight_quantize_2d` vs Triton)
 
@@ -322,12 +327,12 @@ writes.
 
 | model | projection | E | M (out) | N (in) | cutedsl_us | triton_us | speedup | cutedsl_gbps |
 |---|---|---:|---:|---:|---:|---:|---:|---:|
-| debugmodel | gate/up (w1/w3) | 4 | 256 | 256 | 9.02 | 5.97 | 0.66x | 90.8 |
-| debugmodel | down (w2) | 4 | 256 | 256 | 9.02 | 5.98 | 0.66x | 90.8 |
-| 16B | gate/up (w1/w3) | 4 | 1408 | 2048 | 21.39 | 23.18 | 1.08x | 1685.0 |
-| 16B | down (w2) | 4 | 2048 | 1408 | 22.50 | 23.38 | 1.04x | 1601.8 |
-| 671B | gate/up (w1/w3) | 4 | 2048 | 7168 | 81.00 | 99.41 | 1.23x | 2265.3 |
-| 671B | down (w2) | 4 | 7168 | 2048 | 80.87 | 98.01 | 1.21x | 2269.1 |
+| debugmodel | gate/up (w1/w3) | 4 | 256 | 256 | 6.81 | 6.33 | 0.93x | 120.3 |
+| debugmodel | down (w2) | 4 | 256 | 256 | 6.79 | 6.32 | 0.93x | 120.6 |
+| 16B | gate/up (w1/w3) | 4 | 1408 | 2048 | 19.22 | 25.24 | 1.31x | 1875.2 |
+| 16B | down (w2) | 4 | 2048 | 1408 | 16.41 | 25.21 | 1.54x | 2196.6 |
+| 671B | gate/up (w1/w3) | 4 | 2048 | 7168 | 60.54 | 109.08 | 1.80x | 3031.3 |
+| 671B | down (w2) | 4 | 7168 | 2048 | 60.61 | 107.99 | 1.78x | 3027.8 |
 
 The 16B `gate/up` row has `M = 1408`, which is `% 128` but not `% 256`, so it compiles
 the 128-row CuteDSL supertile. That path runs near Triton parity rather than the
@@ -336,11 +341,10 @@ the shorter height to amortize.
 
 ### CuteDSL comparison vs TransformerEngine
 
-Baseline from 2026-08-16 for the DeepSeek-V3 671B FFN shapes, excluding attention
-GEMMs and using `E = 4`. Run environment: NVIDIA GB200, CUDA 13.4, PyTorch
-2.15.0a0+git0f3e7e2, TransformerEngine 2.19.0.dev0+172bd93, and torchao commit
-`c659013c` (both sides re-measured after the grouped stochastic-rounding
-optimization below).
+DeepSeek-V3 671B FFN shapes, excluding attention GEMMs, at `E = 4`. Run environment:
+NVIDIA GB200, CUDA 13.4, PyTorch 2.15.0a0+git0f3e7e2, TransformerEngine
+2.19.0.dev0+172bd93, nvidia-cutlass-dsl 4.5.2. Both sides were re-measured together
+after the last optimization round below.
 
 Times are CUDA kernel self-time in microseconds, with 15 warmups and 50 measured
 iterations. Memcpy and memset events are excluded. The grouped activation comparison
@@ -351,14 +355,25 @@ internally.
 
 | projection | E | M | N | math | rounding | CuteDSL pipeline (us) | TE pipeline (us) | TE speedup |
 |---|---:|---:|---:|---|---|---:|---:|---:|
-| gate/up (w1/w3) | 4 | 2048 | 7168 | standard | RTNE | 86.35 | 64.01 | 1.35x |
-| gate/up (w1/w3) | 4 | 2048 | 7168 | standard | SR | 106.23 | 87.92 | 1.21x |
-| gate/up (w1/w3) | 4 | 2048 | 7168 | fast | RTNE | 70.57 | 55.62 | 1.27x |
-| gate/up (w1/w3) | 4 | 2048 | 7168 | fast | SR | 86.24 | 77.68 | 1.11x |
-| down (w2) | 4 | 7168 | 2048 | standard | RTNE | 88.51 | 62.65 | 1.41x |
-| down (w2) | 4 | 7168 | 2048 | standard | SR | 109.10 | 86.76 | 1.26x |
-| down (w2) | 4 | 7168 | 2048 | fast | RTNE | 71.63 | 54.69 | 1.31x |
-| down (w2) | 4 | 7168 | 2048 | fast | SR | 87.34 | 76.43 | 1.14x |
+| gate/up (w1/w3) | 4 | 2048 | 7168 | standard | RTNE | 86.22 | 64.03 | 1.35x |
+| gate/up (w1/w3) | 4 | 2048 | 7168 | standard | SR | 106.44 | 87.90 | 1.21x |
+| gate/up (w1/w3) | 4 | 2048 | 7168 | fast | RTNE | 70.44 | 55.66 | 1.27x |
+| gate/up (w1/w3) | 4 | 2048 | 7168 | fast | SR | 86.24 | 77.74 | 1.11x |
+| down (w2) | 4 | 7168 | 2048 | standard | RTNE | 88.35 | 62.59 | 1.41x |
+| down (w2) | 4 | 7168 | 2048 | standard | SR | 108.59 | 86.67 | 1.25x |
+| down (w2) | 4 | 7168 | 2048 | fast | RTNE | 71.54 | 54.73 | 1.31x |
+| down (w2) | 4 | 7168 | 2048 | fast | SR | 87.43 | 76.47 | 1.14x |
+
+The linear (non-grouped) activation path, `(2048, 7168)`, measured the same way — one
+`cutedsl_rht_amax` plus one `cutedsl_rht_quantize_row_col` against a single-tensor
+`NVFP4Quantizer` call:
+
+| math | rounding | CuteDSL pipeline (us) | TE pipeline (us) | TE speedup |
+|---|---|---:|---:|---:|
+| standard | RTNE | 29.82 | 18.61 | 1.60x |
+| standard | SR | 36.69 | 31.33 | 1.17x |
+| fast | RTNE | 21.75 | 15.95 | 1.36x |
+| fast | SR | 28.24 | 24.63 | 1.15x |
 
 The SR rows are the ones that moved. Before the optimization below, TE led the SR
 pipeline by 2.06x (gate/up) and 2.12x (down) at standard math; it now leads by 1.21x
@@ -368,34 +383,64 @@ relative to its own baseline, and what is left is the RTNE gap.
 
 The corresponding standalone CuteDSL stage times:
 
-| projection | math | rounding | amax (us) | quantize (us) |
-|---|---|---|---:|---:|
-| gate/up (w1/w3) | standard | RTNE | 23.26 | 57.06 |
-| gate/up (w1/w3) | standard | SR | 23.25 | 75.90 |
-| gate/up (w1/w3) | fast | RTNE | 23.29 | 42.74 |
-| gate/up (w1/w3) | fast | SR | 23.39 | 57.24 |
-| down (w2) | standard | RTNE | 23.37 | 58.96 |
-| down (w2) | standard | SR | 23.37 | 77.68 |
-| down (w2) | fast | RTNE | 23.28 | 43.88 |
-| down (w2) | fast | SR | 23.41 | 58.90 |
+| family | projection | math | rounding | amax (us) | quantize (us) |
+|---|---|---|---|---:|---:|
+| grouped | gate/up (w1/w3) | standard | RTNE | 23.34 | 57.04 |
+| grouped | gate/up (w1/w3) | standard | SR | 23.30 | 75.91 |
+| grouped | gate/up (w1/w3) | fast | RTNE | 23.32 | 42.67 |
+| grouped | gate/up (w1/w3) | fast | SR | 23.31 | 57.24 |
+| grouped | down (w2) | standard | RTNE | 23.40 | 58.69 |
+| grouped | down (w2) | standard | SR | 23.29 | 77.68 |
+| grouped | down (w2) | fast | RTNE | 23.26 | 43.77 |
+| grouped | down (w2) | fast | SR | 23.33 | 58.75 |
+| linear | (2048, 7168) | standard | RTNE | 9.63 | 19.50 |
+| linear | (2048, 7168) | standard | SR | 9.69 | 25.93 |
+| linear | (2048, 7168) | fast | RTNE | 9.64 | 11.49 |
+| linear | (2048, 7168) | fast | SR | 9.70 | 17.96 |
 
-The amax stage is at parity with TE everywhere, so the whole remaining 1D gap sits in
-the quantize kernel.
+Breaking TE's side out by kernel puts the remaining gap in one place. The grouped amax
+**wins** (23.34 against TE's 25.81) and the linear amax trails at 9.63 against 4.47; the
+quantize kernel is behind on both paths, 57.04 against 38.32 grouped and 19.50 against
+12.98 linear. That quantize ratio -- 1.49x and 1.51x -- is nearly identical across the
+two families, which is what one would expect from them sharing `_quant16_from_amax`.
 
-TransformerEngine has no grouped 2D weight quantization kernel. The correct weight
-comparison is therefore one `cutedsl_group_weight_quantize_2d` launch over all four
-experts versus four times TransformerEngine's measured single-expert kernel time.
-Both sides consume precomputed per-expert amaxes.
+TransformerEngine has no grouped 2D weight quantization kernel, so the weight
+comparison is one `cutedsl_group_weight_quantize_2d` launch over all four experts
+against four times TE's single-expert time, using
+`NVFP4Quantizer(with_2d_quantization=True)` so both sides emit 16x16 block scaling.
 
-| projection | E | M | N | CuteDSL grouped (us) | TE single (us) | TE single x E (us) | TE speedup |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| gate/up (w1/w3) | 4 | 2048 | 7168 | 92.74 | 13.64 | 54.56 | 1.70x |
-| down (w2) | 4 | 7168 | 2048 | 92.57 | 13.65 | 54.62 | 1.69x |
+**Read the TE column carefully.** A TE 2D call launches three kernels, not one:
 
-The public CuteDSL 2D weight path has no fast-math specialization. Repeating under
-`NVTE_USE_FAST_MATH=1` produced 92.92/54.56 us for gate/up and 92.63/54.50 us for
-down (CuteDSL grouped/TE single x E), which is measurement noise. Fast math improved
-the complete CuteDSL activation pipeline by 20-21% and the TE pipeline by 13%.
+| TE kernel | (2048, 7168) | (7168, 2048) |
+|---|---:|---:|
+| `quantize_transpose_kernel` | 13.80 | 13.76 |
+| `amax_kernel` | 5.40 | 5.39 |
+| `zero_amax_kernel` | 1.34 | 1.34 |
+| total | 20.53 | 20.49 |
+
+`cutedsl_weight_quantize_2d` and its grouped twin consume a **precomputed** amax, so the
+apples-to-apples figure is TE's quantize kernel alone. Comparing against TE's full call
+instead would credit CuteDSL with skipping a pass it never runs.
+
+| kernel | projection | CuteDSL (us) | TE quantize only (us) | TE speedup |
+|---|---|---:|---:|---:|
+| 2D linear | gate/up | 16.33 | 13.80 | 1.18x |
+| 2D linear | down | 16.36 | 13.76 | 1.19x |
+| 2D grouped, E=4 | gate/up | 60.26 | 55.20 (x4) | 1.09x |
+| 2D grouped, E=4 | down | 60.57 | 55.04 (x4) | 1.10x |
+
+At the op level, where each side computes its own amax, CuteDSL wins instead: TE pays
+6.74 us for `amax_kernel` plus `zero_amax_kernel` where torchao's weight amax is
+cheaper (see **Grouped Weight Amax** below).
+
+**Neither side has a 2D fast path**, and this is structural rather than an omission.
+Fast math buys two things on the 1D path: skipping the bfloat16 round-through of the
+tcgen05 RHT accumulator, and `rcp_approx` in place of `div.rn` for the encode
+reciprocal. Without an RHT there is no accumulator, so the first cannot apply, and the
+second is one instruction per 16-element block in a kernel that is otherwise load/store
+bound. Measured, `NVTE_USE_FAST_MATH=1` moves TE's three kernels by at most 0.02 us
+(13.78/5.39/1.34), and the public CuteDSL 2D wrapper exposes no `use_fast_math` at all
+(`_cutedsl_kernels_impl.py` asserts `not (fast_math and not apply_rht)`).
 
 #### 1D linear optimization sweep
 
@@ -452,67 +497,50 @@ output orientations: gate/up improved from 92.74 to 87.3549 us (5.81%), and down
 92.57 to 87.4361 us (5.55%). Relative to TE's single-expert time multiplied by four,
 the grouped gap narrows from about 1.70x to 1.60x. The linear gap is about 1.71x.
 
-#### Final CuTeDSL validation matrix
+#### Current standalone kernel medians
 
-Each entry is the median of three samples. Every sample uses 15 warmups and 50 timed
+Each entry is the median of three samples; every sample uses 15 warmups and 50 timed
 CUDA-profiler iterations and reports device kernel self-time in microseconds. The 1D
 rows measure the fused quantize stage with precomputed amaxes; the 2D rows consume
-precomputed weight amaxes.
+precomputed weight amaxes. These supersede every before/after table in the optimization
+sections below, which record what each round changed rather than where the kernels stand.
 
-| family | projection | math/environment | rounding | median (us) |
+| family | projection | math | rounding | median (us) |
 |---|---|---|---|---:|
-| 1D linear | gate/up | standard | RTNE | 23.2411 |
-| 1D linear | gate/up | standard | SR | 51.0504 |
-| 1D linear | gate/up | fast | RTNE | 18.8167 |
-| 1D linear | gate/up | fast | SR | 34.6773 |
-| 1D linear | down | standard | RTNE | 23.3231 |
-| 1D linear | down | standard | SR | 50.6500 |
-| 1D linear | down | fast | RTNE | 18.7982 |
-| 1D linear | down | fast | SR | 34.5102 |
-| 1D grouped, E=4 | gate/up | standard | RTNE | 61.6432 |
-| 1D grouped, E=4 | gate/up | standard | SR | 149.5823 |
-| 1D grouped, E=4 | gate/up | fast | RTNE | 45.3090 |
-| 1D grouped, E=4 | gate/up | fast | SR | 115.1210 |
-| 1D grouped, E=4 | down | standard | RTNE | 63.2194 |
-| 1D grouped, E=4 | down | standard | SR | 150.8909 |
-| 1D grouped, E=4 | down | fast | RTNE | 46.2625 |
-| 1D grouped, E=4 | down | fast | SR | 115.8542 |
-| 2D linear | gate/up | standard environment | RTNE | 23.2973 |
-| 2D linear | down | standard environment | RTNE | 23.2692 |
-| 2D linear | gate/up | `NVTE_USE_FAST_MATH=1` | RTNE | 23.2896 |
-| 2D linear | down | `NVTE_USE_FAST_MATH=1` | RTNE | 23.2834 |
-| 2D grouped, E=4 | gate/up | standard environment | RTNE | 87.3549 |
-| 2D grouped, E=4 | down | standard environment | RTNE | 87.4361 |
-| 2D grouped, E=4 | gate/up | `NVTE_USE_FAST_MATH=1` | RTNE | 87.3904 |
-| 2D grouped, E=4 | down | `NVTE_USE_FAST_MATH=1` | RTNE | 87.3985 |
+| 1D linear | gate/up | standard | RTNE | 19.42 |
+| 1D linear | gate/up | standard | SR | 25.82 |
+| 1D linear | gate/up | fast | RTNE | 11.39 |
+| 1D linear | gate/up | fast | SR | 17.77 |
+| 1D grouped, E=4 | gate/up | standard | RTNE | 57.04 |
+| 1D grouped, E=4 | gate/up | standard | SR | 75.91 |
+| 1D grouped, E=4 | gate/up | fast | RTNE | 42.67 |
+| 1D grouped, E=4 | gate/up | fast | SR | 57.24 |
+| 1D grouped, E=4 | down | standard | RTNE | 58.69 |
+| 1D grouped, E=4 | down | standard | SR | 77.68 |
+| 1D grouped, E=4 | down | fast | RTNE | 43.77 |
+| 1D grouped, E=4 | down | fast | SR | 58.75 |
+| amax linear | (2048, 7168) | — | — | 9.63 |
+| amax grouped, E=4 | gate/up | — | — | 23.34 |
+| 2D linear | gate/up | — | RTNE | 16.33 |
+| 2D linear | down | — | RTNE | 16.36 |
+| 2D grouped, E=4 | gate/up | — | RTNE | 60.26 |
+| 2D grouped, E=4 | down | — | RTNE | 60.57 |
 
-Across the six cases with saved directly comparable baselines, aggregate time improved
-3.28%. The largest regression was 0.76% (grouped 1D gate/up RTNE), below the 2%
-limit. The 2D fast-environment differences were at most 0.04%, confirming that this
-environment variable does not specialize the public 2D path.
-
-The exact sentinel commands use the public callables shown by the benchmark modules:
+The exact sentinel commands use the public callables the benchmark modules show:
 
 ```bash
-# Run each command three times for the reported medians (15 warmups/50 iterations
-# are the defaults in bench_utils.kernel_time_us).
+# Run each three times for the reported medians (15 warmups / 50 iterations are the
+# defaults in bench_utils.kernel_time_us).
 python -m benchmarks.prototype.nvfp4_training.bench_hadamard_quantize_row_col
-python -m benchmarks.prototype.nvfp4_training.bench_group_rht_quantize_row_col --experts 4 --rounding all
+python -m benchmarks.prototype.nvfp4_training.bench_group_rht_quantize_row_col --experts 4
 python -m benchmarks.prototype.nvfp4_training.bench_quantize_2d
 python -m benchmarks.prototype.nvfp4_training.bench_group_quantize_2d
 ```
 
 `bench_group_quantize_2d` takes no arguments (`LOCAL_EXPERTS = 4` is hardcoded), and
 `bench_hadamard_quantize_row_col` benchmarks RTNE only — `--rounding` exists on the
-grouped script alone. `NVTE_USE_FAST_MATH` is a TransformerEngine variable and has no
-effect on a pure torchao run; the 1D fast rows come from `use_fast_math=True`, and the
-2D weight path has no fast-math specialization at all
-(`_cutedsl_kernels_impl.py` asserts `not (fast_math and not apply_rht)`).
-
-Remaining parity work is structural: the 2D kernel still uses a 544-thread dual
-epilogue block rather than TE's 128-thread 128x128 design, and the grouped 1D row
-scale factors remain scalar scattered stores. The geometry and store-staging variants
-tested here did not improve the representative shapes.
+grouped script alone. `NVTE_USE_FAST_MATH` is a TransformerEngine variable with no effect
+on a pure torchao run; the 1D fast rows come from `use_fast_math=True`.
 
 ### Epilogue SMEM-read and packing optimization
 
@@ -749,6 +777,35 @@ linear pipeline against TE:
 
 Output is bitwise identical: the read order within a 16-element block changes, and max is
 commutative.
+
+### Columnwise scale-factor store packing
+
+The swizzled columnwise SF write-view is `(1, sf_gcol, 32, 16)` with stride
+`(.., SF_BLK, 16, 1)`, and the epilogue's group index `u` drives the **last, contiguous**
+mode: `u` and `u+1` land in adjacent bytes. The store nevertheless wrote one byte at a
+time, so every group paid its own `STS.U8` with its own four-index swizzle address, and
+across a warp the lanes hit addresses 16 bytes apart. Staging four scale factors in a
+register tile and committing them with one `autovec_copy` takes 25 `STS.U8` down to 9.
+
+| math | rounding | before (us) | after (us) | change |
+|---|---|---:|---:|---:|
+| fast | RTNE | 12.9274 | **11.3856** | **11.9% faster** |
+| fast | SR | 18.0922 | 17.7677 | 1.8% faster |
+| standard | RTNE | 19.4503 | 19.4164 | unchanged |
+| standard | SR | 25.8337 | 25.8176 | unchanged |
+
+The win lands almost entirely on fast math, which is consistent: fast math drops the
+`div.rn` reciprocal and the bfloat16 round-through, so the epilogue's store traffic is a
+much larger share of what remains. Total static instruction count did not move (3608
+either way) — the packing costs what the stores saved, so the gain is in issue efficiency
+rather than instruction count, which caps how much more is available from store shaping.
+
+This clears the aggregate acceptance clause (3.5% across the four cases, nothing
+regressing) but not the >= 2% standard-math sentinel gate, which it misses at 0.17%. It
+was retained on the strength of a reproducible 11.9% on a configuration the project ships
+and tests byte-identically against TE. The same packing applied to the **rowwise** SF
+store was measured and discarded: it takes 9 `STS.U8` to 1, but every case moved within
++-0.5%, so those lines did not earn their place.
 
 ### Grouped Weight Amax
 
