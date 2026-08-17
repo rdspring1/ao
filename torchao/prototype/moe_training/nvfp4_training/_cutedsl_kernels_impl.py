@@ -377,20 +377,18 @@ def _mulhi_u32(a: cutlass.Uint32, b: cutlass.Uint32, *, loc=None, ip=None):
 
 
 # Philox-4x32-10 (PHILOX_KEY_A/B, PHILOX_ROUND_A/B, 10 rounds). The linear kernels draw
-# through philox4, which is byte-identical to triton.language.random: the triton kernels
-# take their stochastic-rounding bits from tl.randint, so reproducing it exactly is what
-# makes cvt.rs agree across the two backends there. The grouped kernels draw through
-# philox4_all, which keeps the same generator but not triton's counter stride.
+# The generator is the same one triton.language.random uses, but the counter is not:
+# every kernel here draws through philox4_all, one counter per 16-element block with all
+# four output words consumed, rather than triton's per-packed-byte stride. So the FP4
+# codes agree with triton under RTNE and are a different, equally valid stream under
+# stochastic rounding.
 PHILOX_ROUNDS = 10
 _PHILOX_KEY_A, _PHILOX_KEY_B = 0x9E3779B9, 0xBB67AE85
 _PHILOX_ROUND_A, _PHILOX_ROUND_B = 0xD2511F53, 0xCD9E8D57
 
-# hadamard_quantize_row_col_triton passes GROUP_SIZE_N=8 to _compute_pid, and runs a
-# 128x128 tile (its larger autotune configs exhaust SM100 tensor/shared memory and are
-# pruned). One tile holds BLOCK_M * BLOCK_N / 2 packed bytes, the stride between tile_id
-# values in its stochastic-rounding Philox counter.
-_GROUP_SIZE_N = 8
-TRITON_TILE_PACKED = 128 * (128 // 2)
+# 16-element quantization blocks in one 128x128 tile, i.e. one Philox draw each, and the
+# stride between tile ids in the stochastic-rounding counter.
+TILE_BLOCKS = (128 * 128) // 16
 
 
 def philox_prep(seed_lo, seed_hi, offset_base):
@@ -420,34 +418,19 @@ def philox_prep(seed_lo, seed_hi, offset_base):
     return sched, c0_r2, c1_r2, c3_r1
 
 
-def philox4(state, packed_base):
-    """The four random words a 16-element chunk needs, in triton's counter order.
-
-    Used by the linear kernels, which retain triton SR bitwise parity. The grouped
-    kernels use ``philox4_all`` instead.
-
-    Triton draws one word per packed byte but its ``cvt.rs`` asm consumes only two of
-    every four (``$9``/``$10`` of a ``pack=4`` group), so a chunk starting at packed
-    index ``p0`` uses ``p0, p0+1, p0+4, p0+5`` -- not four consecutive counters.
-    Matching that stride is what makes the FP4 codes agree; it also means these kernels
-    issue half the Philox calls triton does.
-    """
-    return tuple(
-        philox_c0(cutlass.Uint32(packed_base + cutlass.Int32(d)), state)
-        for d in (0, 1, 4, 5)
-    )
-
-
 def philox4_all(state, chunk_counter):
     """The four random words a 16-element chunk needs, from a single Philox draw.
 
-    ``philox4`` reproduces triton's counter stride, which costs four full round schedules
-    per chunk and throws away three of every four output words. Where bitwise agreement
-    with triton is not required, one counter per chunk and all four words consumed is the
-    same 128 bits for a quarter of the work: 34 multiplies against 124.
+    These kernels once reproduced triton's counter stride, drawing one word per packed
+    byte at counters ``p0, p0+1, p0+4, p0+5`` because that is what triton's ``cvt.rs`` asm
+    consumes. That cost four full round schedules per chunk and discarded three of every
+    four output words -- 124 multiplies for 128 bits that one draw produces. Consuming a
+    single draw whole costs 34, and yields the same 128 bits.
 
-    The counter must be derived from tile coordinates rather than a running per-thread
-    value -- see the grouped epilogues, whose CLC scheduler makes visit order unstable.
+    The counter must be derived from tile coordinates rather than from a running
+    per-thread value: these kernels are persistent, and the grouped one schedules through
+    CLC, so visit order is not fixed and a running counter would make the output depend on
+    scheduling rather than on position.
     """
     sched, c0_r2, c1_r2, c3_r1 = state
     A, B = cutlass.Uint32(_PHILOX_ROUND_A), cutlass.Uint32(_PHILOX_ROUND_B)
@@ -464,33 +447,6 @@ def philox4_all(state, chunk_counter):
         c1 = B * _c2
         c3 = A * _c0
     return c0, c1, c2, c3
-
-
-def triton_tile_id(pid_hidden, pid_token, num_pid_n, num_pid_m):
-    """Invert ``hadamard_utils._compute_pid``: the flat tile index triton would use.
-
-    The linear triton kernel is persistent and feeds its Philox counter the *flat*
-    ``tile_id``, not the (pid_m, pid_n) pair, so reproducing its stochastic-rounding
-    stream means undoing the GROUP_SIZE_N=8 L2 swizzle.
-
-    Forward, with ``base = group_id * num_pid_in_group`` and ``q = tile_id - base``:
-    ``pid_m = q // group_size_n`` but ``pid_n - first = (base + q) % group_size_n``, i.e.
-    the column index is taken modulo the *global* tile id. So ``q = pid_m * group_size_n
-    + (r - base) mod group_size_n``, and the ``base`` term only vanishes when
-    ``group_size_n`` divides it -- always true for a full 8-wide group, not for a short
-    trailing one (num_pid_n = 11, num_pid_m = 2 is the smallest counterexample).
-    """
-    group_id = pid_hidden // cutlass.Int32(_GROUP_SIZE_N)
-    first_pid_n = group_id * cutlass.Int32(_GROUP_SIZE_N)
-    rem = num_pid_n - first_pid_n
-    group_size_n = cutlass.select_(
-        rem < cutlass.Int32(_GROUP_SIZE_N), rem, cutlass.Int32(_GROUP_SIZE_N)
-    )
-    base = group_id * (cutlass.Int32(_GROUP_SIZE_N) * num_pid_m)
-    # (r - base) mod group_size_n, kept non-negative so the sign of % never matters.
-    r = pid_hidden - first_pid_n
-    s = (r + group_size_n - base % group_size_n) % group_size_n
-    return base + pid_token * group_size_n + s
 
 
 def philox_c0(counter, state):
@@ -1376,16 +1332,12 @@ class _Tcgen05RowColFused:
                 cutlass.Uint32(sr_rng_t[5]),
                 cutlass.Uint32(sr_rng_t[6]),
             )
-        # Triton tile geometry for the stochastic-rounding counter. The linear triton
-        # kernel autotunes BLOCK_M/BLOCK_N over {128,256}^2, but every config above
-        # 128x128 exhausts SM100 tensor or shared memory and is pruned at runtime, so
-        # 128x128 is what actually runs; the SR tests pin it to make that explicit.
-        # Counters are derived from global (token, hidden) coordinates rather than this
-        # kernel's supertile, so the 256-row supertile spanning two triton token tiles
-        # costs nothing. col_tiles_per_expert is num_tiles_m (N // M_TILE), the
-        # hidden-tile count -- its grouped name is moot here, since sr and grouped are
-        # never compiled together.
-        tri_tiles_tok = num_tiles_ns * cutlass.Int32(self.kw // M_TILE)
+        # Tile geometry for the stochastic-rounding counter, on a 128x128 grid. Counters
+        # are derived from global (token, hidden) coordinates rather than from this
+        # kernel's supertile or its traversal order, so the 256-row supertile spanning two
+        # token tiles costs nothing and the stream stays a pure function of position.
+        # col_tiles_per_expert is num_tiles_m (N // M_TILE), the hidden-tile count -- its
+        # grouped name is moot here, since sr and grouped are never compiled together.
         tri_tiles_hid = col_tiles_per_expert
 
         pipeline_init_wait(cluster_shape_mn=cluster_layout_vmnk)
@@ -1487,23 +1439,20 @@ class _Tcgen05RowColFused:
                         blk[j] = rBlk[j].to(cutlass.Float32)
                     row_rb = None
                     if cutlass.const_expr(self.sr):
-                        # This thread owns supertile row k_row, i.e. triton token tile
-                        # pid_ns*(kw/128) + k_row//128 at local token k_row%128. Its
-                        # rowwise tile is (tokens, hidden), so the flat packed index is
-                        # token_local * (128/2) + hidden_local/2.
-                        row_rb = philox4(
+                        # This thread owns supertile row k_row, i.e. token tile
+                        # pid_ns*(kw/128) + k_row//128 at local token k_row%128. One draw
+                        # per 16-element block, indexed by its position in the rowwise
+                        # (tokens, hidden) tile.
+                        tile_id = (
+                            pid_ns * cutlass.Int32(self.kw // M_TILE)
+                            + k_row // cutlass.Int32(M_TILE)
+                        ) * tri_tiles_hid + pid_m
+                        row_rb = philox4_all(
                             row_state,
-                            triton_tile_id(
-                                pid_m,
-                                pid_ns * cutlass.Int32(self.kw // M_TILE)
-                                + k_row // cutlass.Int32(M_TILE),
-                                tri_tiles_hid,
-                                tri_tiles_tok,
-                            )
-                            * cutlass.Int32(TRITON_TILE_PACKED)
+                            tile_id * cutlass.Int32(TILE_BLOCKS)
                             + (k_row % cutlass.Int32(M_TILE))
-                            * cutlass.Int32(M_TILE // 2)
-                            + cutlass.Int32(b * 8),
+                            * cutlass.Int32(M_TILE // 16)
+                            + cutlass.Int32(b),
                         )
                     amax = _abs_amax16(blk)
                     if cutlass.const_expr(not self.apply_rht):
@@ -1635,21 +1584,18 @@ class _Tcgen05RowColFused:
                     col_rb = None
                     if cutlass.const_expr(self.sr):
                         # This thread's 16 tokens start at supertile offset u*16, so they
-                        # sit in triton token tile pid_ns*(kw/128) + u//8 at local token
-                        # (u%8)*16. Its columnwise tile is (hidden, tokens), so the flat
-                        # packed index is hidden_local * (128/2) + token_local/2.
-                        col_rb = philox4(
+                        # sit in token tile pid_ns*(kw/128) + u//8 at local token
+                        # (u%8)*16. One draw per 16-element block, indexed by its position
+                        # in the columnwise (hidden, tokens) tile.
+                        tile_id = (
+                            pid_ns * cutlass.Int32(self.kw // M_TILE)
+                            + cutlass.Int32(u // (M_TILE // 16))
+                        ) * tri_tiles_hid + pid_m
+                        col_rb = philox4_all(
                             col_state,
-                            triton_tile_id(
-                                pid_m,
-                                pid_ns * cutlass.Int32(self.kw // M_TILE)
-                                + cutlass.Int32(u // (M_TILE // 16)),
-                                tri_tiles_hid,
-                                tri_tiles_tok,
-                            )
-                            * cutlass.Int32(TRITON_TILE_PACKED)
-                            + tidx * cutlass.Int32(M_TILE // 2)
-                            + cutlass.Int32((u % (M_TILE // 16)) * 8),
+                            tile_id * cutlass.Int32(TILE_BLOCKS)
+                            + tidx * cutlass.Int32(M_TILE // 16)
+                            + cutlass.Int32(u % (M_TILE // 16)),
                         )
                     w0, w1, pvscale_fp8 = _quant16(
                         vals,

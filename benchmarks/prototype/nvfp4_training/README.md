@@ -155,9 +155,11 @@ Each `bench_*` script above runs **both backends** (Triton and CuteDSL) on the s
 reports the speedup. The CuteDSL (`nvidia-cutlass-dsl`) kernels do the Randomized Hadamard Transform
 on Blackwell tensor cores; they require SM100 and accept exactly the shapes the Triton kernels do.
 
-The two backends produce **bitwise identical output** — FP4 codes and FP8 scale factors, RTNE and
-stochastic rounding alike — so they are drop-in interchangeable and the choice is purely a
-performance one.
+Under RTNE the two backends produce **bitwise identical output** — FP4 codes and FP8 scale
+factors — so they are drop-in interchangeable and the choice is purely a performance one.
+Under stochastic rounding the CuteDSL kernel draws one Philox counter per 16-element block
+and consumes all four output words, rather than reproducing triton's per-packed-byte
+stride, so its SR codes are a different, equally valid stream.
 
 ```bash
 python -m benchmarks.prototype.nvfp4_training.bench_hadamard_amax --shape-set representative-models
@@ -234,9 +236,9 @@ Run environment for every table in this section: NVIDIA GB200, PyTorch
 Each grouped `bench_*` script runs **both backends** on the same shapes and reports the
 speedup. Under RTNE the two produce **bitwise identical output** — codes and scale
 factors — so the choice is purely a performance one. Under stochastic rounding the
-grouped CuteDSL kernel draws its Philox stream differently (one counter per 16-element
-block, all four words consumed) and so produces different, statistically equivalent
-codes; it is checked on reconstruction SQNR, unbiasedness, and reproducibility instead.
+CuteDSL kernel draws its Philox stream differently (one counter per 16-element block, all
+four words consumed) and so produces different, statistically equivalent codes; it is
+checked on reconstruction SQNR, unbiasedness, and reproducibility instead.
 
 ```bash
 python -m benchmarks.prototype.nvfp4_training.bench_group_hadamard_amax --experts 4
@@ -578,11 +580,14 @@ Against TransformerEngine the 2D gap narrows substantially:
 | 2D grouped gate/up | 4 | 60.5176 | 54.56 (single x4) | 1.70x | 1.11x |
 | 2D grouped down | 4 | 60.7924 | 54.62 (single x4) | 1.69x | 1.11x |
 
-Every result above is bitwise identical to both oracles: the Triton backend (41 cases —
-36 RTNE plus 5 linear stochastic-rounding) and the TE-derived PyTorch reference in
+Every result above is bitwise identical to both oracles: the Triton backend (36 RTNE
+cases) and the TE-derived PyTorch reference in
 `test/prototype/moe_training/nvfp4_training/nvfp4_reference.py` (54 CuteDSL cases).
-Grouped stochastic rounding is exempt by design — see the note above — and is covered by
-`test_group_rht_sr_reconstructs`, `test_group_rht_sr_unbiased` and
+Stochastic rounding is exempt by design on both the linear and grouped paths — see the
+notes above — and is covered instead by
+`test_rht_quantize_rs_at_most_one_fp4_step_from_rtne` (every SR code within one FP4 step
+of the bitwise-checked RTNE code), `test_group_rht_sr_reconstructs`,
+`test_cutedsl_rht_quantize_sr_unbiased` / `test_group_rht_sr_unbiased`, and
 `test_group_rht_rng_state_controls_stochastic_rounding`.
 
 #### Rejected in this pass
@@ -650,6 +655,42 @@ Sentinel, grouped `E=4` per-expert `(2048, 7168)`, median of three 15/50 samples
 | fast | SR | 116.45 | 57.77 | **50.4% faster** |
 | standard | RTNE | 56.82 | 56.95 | unchanged |
 | fast | RTNE | 45.60 | 42.55 | 6.7% faster |
+
+### Linear stochastic-rounding optimization
+
+The linear kernels shared `_quant16_from_amax` with the grouped ones, so they inherited
+the fused SR multiply/clamp and the fused RTNE fast-math path automatically: linear SR
+improved 10.5% and RTNE fast math 12.6% with no linear-specific change. A SASS diff then
+showed the linear SR path was almost purely RNG-bound in its SR-specific work — `FMUL`
+and `FMNMX` excess over RTNE was already zero, while `IMAD` + `LOP3` accounted for **91%**
+of the 3872-instruction excess, a larger Philox burden than grouped carried before its
+own fix.
+
+Applying the same one-draw-per-block Philox to the linear path required dropping its
+Triton SR bitwise parity, which was the project's only bitwise oracle for stochastic
+rounding (there is no TE SR reference; TE's stream differs by construction). It was
+dropped deliberately, and `test_cutedsl_vs_triton_stochastic_rounding_bitwise` was
+replaced by extending `test_rht_quantize_rs_at_most_one_fp4_step_from_rtne` to both
+backends and three tile geometries. That test is the stronger structural guard: it pins
+every SR code to within one FP4 magnitude step of the RTNE code, and the RTNE code *is*
+still bitwise-checked against both Triton and TE. `triton_tile_id`, which existed only to
+invert Triton's `GROUP_SIZE_N=8` L2 swizzle for the SR counter, was deleted with it.
+
+Static instruction excess over the RTNE variant, linear:
+
+| | total | IMAD | LOP3 | FMUL | FMNMX |
+|---|---:|---:|---:|---:|---:|
+| before | +3872 | +2007 | +1530 | 0 | 0 |
+| after | +1112 | +650 | +423 | 0 | 0 |
+
+Linear `(2048, 7168)` gate/up sentinel, median of three 15/50 samples:
+
+| math | rounding | before round | after fused mul/clamp | after one-draw Philox | total |
+|---|---|---:|---:|---:|---:|
+| standard | SR | 46.4310 | 41.5547 | **25.8337** | **44.4% faster** |
+| fast | SR | 33.0158 | 31.4567 | **18.0922** | **45.2% faster** |
+| standard | RTNE | 19.5444 | 19.5155 | 19.4503 | unchanged |
+| fast | RTNE | 14.8403 | 12.9741 | 12.9274 | 12.9% faster |
 
 ### Grouped Weight Amax
 

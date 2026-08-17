@@ -50,6 +50,7 @@ from ._cutedsl_kernels_impl import (
     FP8_E4M3_MAX,
     FP32_MAX,
     HADAMARD_DIM,
+    TILE_BLOCKS,
     _abs_f32,
     _atom_max_f32_nonneg,
     _div_rn_f32,
@@ -1652,16 +1653,6 @@ def _valid_tile_count(tile_n_base, n_all, tiles_in_n_valid):
     rem = tiles_in_n_valid - tile_n_base
     rem = cutlass.select_(rem > cutlass.Int32(0), rem, cutlass.Int32(0))
     return cutlass.select_(rem < n_all, rem, n_all)
-
-
-# Packed bytes in one 128x128 triton tile: the stride between consecutive tile_id
-# values in triton's stochastic-rounding Philox counter (hadamard_utils._pack_fp4).
-TILE_PACKED = TOKEN_TILE * (M_TILE // 2)
-
-# 16-element quantization blocks in that tile, i.e. one stochastic-rounding Philox draw
-# each: eight packed bytes per block, so this is TILE_PACKED scaled down by the same
-# factor as every term of the epilogue counters below.
-TILE_BLOCKS = TILE_PACKED // 8
 
 
 def _zero_sf():
