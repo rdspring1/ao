@@ -971,9 +971,13 @@ class _Tcgen05GroupRowColFused(_GroupRhtMainloop):
                 clc_consumer_state.advance()
 
 
-@functools.lru_cache(maxsize=16)
+# maxsize=None and no defaults, for the reasons spelled out over ``_compile_fused_kernel``:
+# an entry is a compiled kernel a CUDA-graph capture may depend on, so the cache must never
+# evict, and the key is the literal (args, kwargs) shape, so every caller passes all four
+# positionally or the pre-capture warm-up warms keys nothing will look up.
+@functools.lru_cache(maxsize=None)
 def _compile_group_fused_kernel(
-    device_idx: int, swizzle: bool, sr: bool, fast_math: bool = False
+    device_idx: int, swizzle: bool, sr: bool, fast_math: bool
 ):
     """Compile the grouped fused kernel with symbolic shapes (cached per device+flags).
 
@@ -1568,7 +1572,7 @@ class _Tcgen05GroupRhtAmax(_GroupRhtMainloop):
                 clc_consumer_state.advance()
 
 
-@functools.lru_cache(maxsize=4)
+@functools.lru_cache(maxsize=None)
 def _compile_group_amax_kernel(device_idx: int):
     """Compile the grouped RHT amax kernel with symbolic shapes."""
     free = cute.sym_int

@@ -8,6 +8,9 @@ import pytest
 import torch
 from torch.utils._triton import has_triton
 
+from torchao.prototype.moe_training.nvfp4_training import (
+    nvfp4_linear as nvfp4_linear_mod,
+)
 from torchao.prototype.moe_training.nvfp4_training.hadamard_cutedsl_utils import (
     cutedsl_nvfp4_kernels_available,
     cutedsl_prepare_for_cuda_graph,
@@ -15,7 +18,6 @@ from torchao.prototype.moe_training.nvfp4_training.hadamard_cutedsl_utils import
 from torchao.prototype.moe_training.nvfp4_training.hadamard_utils import (
     prepare_for_cuda_graph,
 )
-from torchao.prototype.moe_training.nvfp4_training import nvfp4_linear as nvfp4_linear_mod
 from torchao.prototype.moe_training.nvfp4_training.nvfp4_linear import (
     _resolve_use_cutedsl,
     nvfp4_linear,
@@ -407,3 +409,48 @@ def test_nvfp4_linear_auto_runs_on_triton_fallback(monkeypatch):
     )
     got = nvfp4_linear(x, w, None, kernel_preference=KernelPreference.AUTO, **kw)
     torch.testing.assert_close(got, expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(
+    not cutedsl_nvfp4_kernels_available(), reason="requires SM100 + the CuteDSL runtime"
+)
+def test_cutedsl_prepare_for_cuda_graph_warms_every_kernel_the_path_uses():
+    """After the pre-capture warm-up, no CuteDSL kernel compiles lazily.
+
+    The whole point of cutedsl_prepare_for_cuda_graph is that a lazy cute.compile must
+    not fire inside a captured region, and nothing else observes whether it worked: the
+    warm-up once compiled a set of lru_cache keys no runtime call could reach (keyword
+    vs positional args make distinct keys, and the fast-math axis was missing entirely),
+    so it warmed twelve kernels and hit zero of them while every test still passed. This
+    asserts the property directly -- new compiles after prepare, which must be zero --
+    rather than trusting a smoke test that survives the warm-up being a no-op.
+    """
+    from torchao.prototype.moe_training.nvfp4_training import _cutedsl_kernels_impl
+
+    cutedsl_prepare_for_cuda_graph("cuda", sign_vectors=(_HARDCODED_SIGN_VECTOR,))
+    caches = (
+        _cutedsl_kernels_impl._compile_fused_kernel,
+        _cutedsl_kernels_impl._compile_amax_tc_kernel,
+    )
+    before = [c.cache_info().misses for c in caches]
+
+    x = torch.randn(_M, _K, dtype=torch.bfloat16, device="cuda", requires_grad=True)
+    w = torch.randn(_N, _K, dtype=torch.bfloat16, device="cuda", requires_grad=True)
+    # Both arithmetic modes, and a backward so the stochastic-rounding variant is
+    # reached as well -- each is a separate compiled kernel and a separate cache key.
+    for use_fast_math in (True, False):
+        out = nvfp4_linear(
+            x,
+            w,
+            None,
+            sign_vector=_HARDCODED_SIGN_VECTOR,
+            kernel_preference=KernelPreference.CUTEDSL,
+            use_fast_math=use_fast_math,
+        )
+        out.sum().backward()
+
+    new = [c.cache_info().misses - b for c, b in zip(caches, before)]
+    assert new == [0, 0], (
+        f"{sum(new)} CuteDSL kernel(s) compiled after cutedsl_prepare_for_cuda_graph "
+        f"(fused={new[0]}, amax={new[1]}); they would compile inside a CUDA-graph capture"
+    )

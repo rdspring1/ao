@@ -720,7 +720,15 @@ def _pack16_rn_from_enc(vals, enc, rht_acc: cutlass.Constexpr = False):
         vals[0], vals[1], vals[2], vals[3], vals[4], vals[5], vals[6], vals[7], enc
     )
     w1 = pack8(
-        vals[8], vals[9], vals[10], vals[11], vals[12], vals[13], vals[14], vals[15], enc
+        vals[8],
+        vals[9],
+        vals[10],
+        vals[11],
+        vals[12],
+        vals[13],
+        vals[14],
+        vals[15],
+        enc,
     )
     return w0, w1
 
@@ -2348,15 +2356,21 @@ def _cutedsl_rht_amax_impl(A: torch.Tensor, sign_vector=DEFAULT_SIGN_VECTOR):
 # (device, swizzle, sr, apply_rht, grouped, col_groups_per_supertile, fast_math)
 # and every entry is a compiled kernel that a CUDA-graph capture may depend on. An eviction
 # would force a lazy recompile mid-capture, so the cache must never evict.
+#
+# Every parameter is required and every caller passes it positionally, deliberately: an
+# lru_cache key is the literal (args, kwargs) shape, so ``f(i, True, False, apply_rht=False)``
+# and ``f(i, True, False, False)`` are two entries compiling the same kernel. Defaults here
+# once let cutedsl_prepare_for_cuda_graph warm a set of keys no runtime call could hit, which
+# silently turned the whole pre-capture warm-up into a no-op.
 @functools.lru_cache(maxsize=None)
 def _compile_fused_kernel(
     device_idx,
     swizzle,
     sr,
-    apply_rht=True,
-    grouped=False,
-    col_groups_per_supertile=16,
-    fast_math=False,
+    apply_rht,
+    grouped,
+    col_groups_per_supertile,
+    fast_math,
 ):
     """Compile the fused kernel with symbolic shapes (cached per device+flags+supertile).
 
@@ -2600,8 +2614,9 @@ def _cutedsl_rht_quantize_row_col_impl(
         swizzle,
         sr,
         bool(apply_rht),
-        col_groups_per_supertile=col_groups_per_supertile,
-        fast_math=bool(use_fast_math),
+        False,  # grouped
+        col_groups_per_supertile,
+        bool(use_fast_math),
     )
     fused(
         A.t().unsqueeze(-1),
@@ -2671,11 +2686,12 @@ def _cutedsl_group_weight_quantize_2d_impl(
 
     fused = _compile_fused_kernel(
         dev.index,
-        True,
-        False,
-        apply_rht=False,
-        grouped=True,
-        col_groups_per_supertile=col_groups_per_supertile,
+        True,  # swizzle
+        False,  # sr
+        False,  # apply_rht
+        True,  # grouped
+        col_groups_per_supertile,
+        False,  # fast_math
     )
     fused(
         A.view(E * M, N).t().unsqueeze(-1),

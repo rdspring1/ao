@@ -460,6 +460,7 @@ else:
         col_offset_base: torch.Tensor | None = None,
         row_offset_base: torch.Tensor | None = None,
         row_seed_base: torch.Tensor | None = None,
+        use_fast_math: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         raise NotImplementedError(
             "triton_rht_quantize_row_col requires torch 2.10.0+ and triton installed"
