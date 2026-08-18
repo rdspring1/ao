@@ -361,6 +361,50 @@ def _div_rn_f32(
 
 
 @dsl_user_op
+def _bf16lo_to_f32(w: cutlass.Uint32, *, loc=None, ip=None) -> cutlass.Float32:
+    """Widen the low bf16 of a packed pair to f32, in one instruction.
+
+    bfloat16 is the truncation of float32 -- same 8-bit exponent field and bias, mantissa
+    zero-filled -- so widening is exactly a shift: no rounding, and no special case for
+    subnormals, infinities or NaN payloads. Reading the pair as one u32 and shifting is what
+    ``cutlass::bfloat16_t::operator float()`` does, so it is what TransformerEngine's
+    epilogues get for free. Going through the DSL's ``BFloat16`` element type instead costs
+    two instructions per value: ptxas materializes the 16-bit extract as a ``PRMT`` and then
+    widens. Callers reach the pairs with ``cute.recast_tensor(rBlk, cutlass.Uint32)``.
+    """
+    return cutlass.Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [w.ir_value(loc=loc, ip=ip)],
+            ("{\n.reg .b32 t;\nshl.b32 t, $1, 16;\nmov.b32 $0, t;\n}"),
+            "=f,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def _bf16hi_to_f32(w: cutlass.Uint32, *, loc=None, ip=None) -> cutlass.Float32:
+    """Widen the high bf16 of a packed pair to f32. See ``_bf16lo_to_f32``.
+
+    The high half's shift-right-then-shift-left collapses into a single mask.
+    """
+    return cutlass.Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [w.ir_value(loc=loc, ip=ip)],
+            ("{\n.reg .b32 t;\nand.b32 t, $1, 0xffff0000;\nmov.b32 $0, t;\n}"),
+            "=f,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
 def _mulhi_u32(a: cutlass.Uint32, b: cutlass.Uint32, *, loc=None, ip=None):
     """High 32 bits of a 32x32 unsigned multiply (triton's math.umulhi)."""
     return cutlass.Uint32(
@@ -1417,8 +1461,10 @@ class _Tcgen05RowColFused:
                 sA_row = sA_clean[(None, k_row, stage)]
                 for b in cutlass.range_constexpr(M_TILE // 16):  # 8 blocks of 16 N
                     cute.autovec_copy(cute.local_tile(sA_row, (16,), (b,)), rBlk)
-                    for j in cutlass.range_constexpr(16):
-                        blk[j] = rBlk[j].to(cutlass.Float32)
+                    rWords = cute.recast_tensor(rBlk, cutlass.Uint32)
+                    for j in cutlass.range_constexpr(8):
+                        blk[2 * j] = _bf16lo_to_f32(rWords[j])
+                        blk[2 * j + 1] = _bf16hi_to_f32(rWords[j])
                     row_rb = None
                     if cutlass.const_expr(self.sr):
                         # This thread owns supertile row k_row, i.e. token tile
@@ -2110,9 +2156,13 @@ class _Tcgen05RhtAmax:
                 sA_row = sA_clean[(None, k_row, stage)]
                 for b in cutlass.range_constexpr(M_TILE // 16):  # 8 blocks of 16 N
                     cute.autovec_copy(cute.local_tile(sA_row, (16,), (b,)), rBlk)
-                    for j in cutlass.range_constexpr(16):
+                    rWords = cute.recast_tensor(rBlk, cutlass.Uint32)
+                    for j in cutlass.range_constexpr(8):
                         thread_row_max = _max_f32(
-                            thread_row_max, _abs_f32(rBlk[j].to(cutlass.Float32))
+                            thread_row_max, _abs_f32(_bf16lo_to_f32(rWords[j]))
+                        )
+                        thread_row_max = _max_f32(
+                            thread_row_max, _abs_f32(_bf16hi_to_f32(rWords[j]))
                         )
                 cute.arch.mbarrier_arrive(
                     ab_pipeline.sync_object_empty.get_barrier(stage)

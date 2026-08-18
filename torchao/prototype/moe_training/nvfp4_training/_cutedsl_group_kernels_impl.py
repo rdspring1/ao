@@ -53,6 +53,8 @@ from ._cutedsl_kernels_impl import (
     TILE_BLOCKS,
     _abs_f32,
     _atom_max_f32_nonneg,
+    _bf16hi_to_f32,
+    _bf16lo_to_f32,
     _div_rn_f32,
     _get_rht_buffer,
     _get_sr_rng_buffer,
@@ -889,8 +891,10 @@ class _Tcgen05GroupRowColFused(_GroupRhtMainloop):
                                 ),
                                 rBlk,
                             )
-                            for j in cutlass.range_constexpr(16):
-                                blk[j] = rBlk[j].to(cutlass.Float32)
+                            rWords = cute.recast_tensor(rBlk, cutlass.Uint32)
+                            for j in cutlass.range_constexpr(8):
+                                blk[2 * j] = _bf16lo_to_f32(rWords[j])
+                                blk[2 * j + 1] = _bf16hi_to_f32(rWords[j])
                             row_rb = None
                             if cutlass.const_expr(self.sr):
                                 # One draw per 16-element block, indexed by its position in
@@ -1521,9 +1525,13 @@ class _Tcgen05GroupRhtAmax(_GroupRhtMainloop):
                                 ),
                                 rBlk,
                             )
-                            for j in cutlass.range_constexpr(16):
+                            rWords = cute.recast_tensor(rBlk, cutlass.Uint32)
+                            for j in cutlass.range_constexpr(8):
                                 tile_max = _max_f32(
-                                    tile_max, _abs_f32(rBlk[j].to(cutlass.Float32))
+                                    tile_max, _abs_f32(_bf16lo_to_f32(rWords[j]))
+                                )
+                                tile_max = _max_f32(
+                                    tile_max, _abs_f32(_bf16hi_to_f32(rWords[j]))
                                 )
                         ab_pipeline.consumer_release(
                             ab_consumer_state, pipeline.PipelineOp.AsyncThread
