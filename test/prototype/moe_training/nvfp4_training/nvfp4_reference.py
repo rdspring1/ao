@@ -309,8 +309,8 @@ def reference_group_rht_amax(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Per-group ``(col_amax, row_amax)``, each ``(num_tensors,)`` float32.
 
-    Rows at or past ``logical_packed_length`` are capacity padding and must not reach the
-    reduction -- the kernels mask them out.
+    Rows at or past ``logical_packed_length == offsets[-1]`` are allocation tail and
+    must not reach the reduction. Zero-valued padding inside each group remains input.
     """
     valid = A.shape[0] if logical_packed_length is None else int(logical_packed_length)
     cols, rows = [], []
@@ -357,8 +357,8 @@ def reference_group_rht_quantize_row_col(
     start = 0
     for g, size in enumerate(sizes):
         end = min(start + size, valid)
-        # Capacity rows keep the zeros allocated above, matching the kernels' zero-fill
-        # of the codes and of the columnwise scale tiles.
+        # This block spans group-addressable rows only. Storage after the final offset
+        # has no output contract and must not be compared to this reference.
         block = A.new_zeros((hidden, size // 16), dtype=torch.float8_e4m3fn)
         if end > start:
             group = A[start:end]

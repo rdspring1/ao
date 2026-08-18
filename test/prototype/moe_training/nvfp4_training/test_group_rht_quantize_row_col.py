@@ -74,6 +74,9 @@ if has_triton() and is_sm_at_least_100() and torch_version_at_least("2.10.0"):
         get_rht_matrix,
     )
 if cutedsl_nvfp4_kernels_available():
+    from torchao.prototype.moe_training.nvfp4_training.group_hadamard_amax_cutedsl import (
+        cutedsl_group_rht_amax,
+    )
     from torchao.prototype.moe_training.nvfp4_training.group_rht_quantize_row_col_cutedsl import (
         cutedsl_group_rht_quantize_row_col,
     )
@@ -558,7 +561,7 @@ def test_group_fast_math_matches_transformer_engine(kernel, monkeypatch):
 @pytest.mark.parametrize("kernel", _KERNELS)
 @torch.no_grad()
 def test_group_rht_padded_capacity_masks_spare_rows(kernel):
-    """Capacity rows do not affect amax and flush to zero during quantization."""
+    """Poisoned allocation tail cannot affect any group-addressable output."""
     device = torch.device("cuda", 0)
     logical_rows, capacity_rows, hidden_size = 128, 256, 128
     torch.manual_seed(227)
@@ -572,8 +575,9 @@ def test_group_rht_padded_capacity_masks_spare_rows(kernel):
     capacity[logical_rows:].fill_(1000.0)
     offsets = torch.tensor([logical_rows], dtype=torch.int32, device=device)
     logical_packed_length = offsets[-1:]
+    group_amax = triton_group_rht_amax if kernel == "triton" else cutedsl_group_rht_amax
 
-    expected_col_amax, expected_row_amax = triton_group_rht_amax(
+    expected_col_amax, expected_row_amax = group_amax(
         valid,
         list(_HARDCODED_SIGN_VECTOR),
         offsets,
@@ -582,7 +586,7 @@ def test_group_rht_padded_capacity_masks_spare_rows(kernel):
         hidden_size,
         1,
     )
-    actual_col_amax, actual_row_amax = triton_group_rht_amax(
+    actual_col_amax, actual_row_amax = group_amax(
         capacity,
         list(_HARDCODED_SIGN_VECTOR),
         offsets,
@@ -641,72 +645,7 @@ def test_group_rht_padded_capacity_masks_spare_rows(kernel):
         actual_sfd_plain,
         from_blocked(expected_sfd, hidden_size, logical_rows // 16),
     )
-    assert torch.count_nonzero(actual_qa[logical_rows:]) == 0
-    assert torch.count_nonzero(actual_sfa_plain[logical_rows:]) == 0
-    assert torch.count_nonzero(actual_qd[:, logical_rows // 2 :]) == 0
-    # No columnwise-scale equivalent: the grouped layout ends at the last
-    # group's extent, so the spare capacity has no scale bytes to flush -- the
-    # allocation past that point is never addressed by the grouped GEMM.
-
-
-@_maybe_sm100
-@pytest.mark.parametrize("kernel", _KERNELS)
-@torch.no_grad()
-def test_group_rht_capacity_folded_into_last_group_zeroes_col_scales(kernel):
-    """Capacity rows inside the last group's extent get zeroed columnwise scales.
-
-    The other convention (offsets[-1] == logical rows, covered above) leaves those
-    bytes unaddressed, so nothing writes them. Here offsets[-1] is the capacity, so
-    the spare rows *are* part of the last group's blocked scale buffer and the
-    grouped GEMM reads them -- both backends must flush zeros.
-    """
-    device = torch.device("cuda", 0)
-    logical_rows, capacity_rows, hidden_size = 128, 256, 128
-    torch.manual_seed(228)
-    A = torch.randn((capacity_rows, hidden_size), dtype=torch.bfloat16, device=device)
-    A[logical_rows:].fill_(1000.0)
-    offsets = torch.tensor([capacity_rows], dtype=torch.int32, device=device)
-    logical_packed_length = torch.tensor(
-        [logical_rows], dtype=torch.int32, device=device
-    )
-
-    amax_col, amax_row = triton_group_rht_amax(
-        A,
-        list(_HARDCODED_SIGN_VECTOR),
-        offsets,
-        1,
-        capacity_rows,
-        hidden_size,
-        1,
-        logical_packed_length=logical_packed_length,
-    )
-
-    # The op allocates its own outputs with torch.empty, so an unwritten scale
-    # region would read whatever the caching allocator last held. Dirty a block of
-    # exactly that size first, or "uninitialized" happens to be zero and the
-    # assertion below cannot fail.
-    sf_bytes = hidden_size * (capacity_rows // 16)
-    poison = torch.full((sf_bytes,), 255, dtype=torch.uint8, device=device)
-    del poison
-
-    _, _, _, sfd = _group_quantize(
-        kernel,
-        A,
-        list(_HARDCODED_SIGN_VECTOR),
-        offsets,
-        1,
-        capacity_rows,
-        hidden_size,
-        1,
-        amax_row,
-        amax_col,
-        None,
-        False,
-        logical_packed_length=logical_packed_length,
-    )
-
-    sfd_plain = _from_blocked_grouped(sfd, hidden_size, (capacity_rows,))
-    assert torch.count_nonzero(sfd_plain[:, logical_rows // 16 :]) == 0
+    # Tail storage is deliberately unspecified and inaccessible to grouped consumers.
 
 
 @_maybe_sm100
@@ -739,8 +678,9 @@ def test_group_rht_stochastic_rounding_launches(graph_case, kernel):
 
 @_maybe_sm100
 @_skip_no_cutedsl
+@pytest.mark.parametrize("use_fast_math", [False, True], ids=["exact", "fast"])
 @torch.no_grad()
-def test_cutedsl_group_quantize_matches_triton_bitwise(graph_case):
+def test_cutedsl_group_quantize_matches_triton_bitwise(graph_case, use_fast_math):
     """The two grouped backends are byte-for-byte interchangeable under RTNE.
 
     Stochastic rounding is deliberately out of scope here. The grouped CuteDSL kernel
@@ -771,8 +711,8 @@ def test_cutedsl_group_quantize_matches_triton_bitwise(graph_case):
         None,
         False,
     )
-    cutedsl = _group_quantize("cutedsl", *args)
-    triton_out = _group_quantize("triton", *args)
+    cutedsl = _group_quantize("cutedsl", *args, use_fast_math=use_fast_math)
+    triton_out = _group_quantize("triton", *args, use_fast_math=use_fast_math)
     for name, c, t in zip(("qa", "sfa", "qd", "sfd"), cutedsl, triton_out):
         assert torch.equal(c, t), f"{name} differs between backends"
 

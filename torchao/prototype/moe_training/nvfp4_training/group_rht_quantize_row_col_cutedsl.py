@@ -48,8 +48,10 @@ def cutedsl_group_rht_quantize_row_col(
 
     Signature and returns match ``triton_group_rht_quantize_row_col``. ``A`` is
     the pre-packed ``(packed_sequence_length, hidden_size)`` capacity buffer;
-    rows at or after ``logical_packed_length`` are storage only and are written
-    as zeros. ``offsets`` is int32 cumulative row-end offsets, one per group.
+    rows at or after ``logical_packed_length == offsets[-1]`` are untouched
+    allocation capacity and must not be consumed. ``offsets`` is int32
+    cumulative row-end offsets, one per group. Zero-valued per-group padding
+    before the final offset is processed normally.
 
     ``shape_rep`` is validated but does not reach the kernel: group membership
     is read from ``offsets`` alone, which is correct for both SAME_BOTH_DIMS and

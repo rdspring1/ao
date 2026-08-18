@@ -417,7 +417,7 @@ if has_triton():
 
         Requires 128-aligned group boundaries, which is what makes the
         group-local tile index exact. The pad-128 token dispatcher guarantees
-        it, as does the caller's `offs[-1] = A.shape[0]` for the padding tail.
+        it through the final logical group-end offset.
         """
         group_start = tl.load(
             offsets_ptr + group_idx - 1, mask=group_idx > 0, other=0
