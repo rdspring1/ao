@@ -79,7 +79,8 @@ CLC_RESPONSE_I32 = 4  # 16-byte cluster-launch-control response
 
 # Mainloop stage count from the SM100 shared-memory budget (TE :1257-1264). The
 # A tile dominates; the reserve covers sB, every pipeline's mbarriers, the CLC
-# response, the TMEM holding buffer, and the per-group amax staging arrays.
+# response, and the TMEM holding buffer. The epilogues reduce in registers and
+# atomic straight to global, so there is no per-group amax staging in SMEM.
 _SMEM_CAPACITY = 232448
 _A_TILE_BYTES = M_TILE * TOKEN_TILE * 2
 _SMEM_RESERVE = 2048
@@ -184,8 +185,10 @@ def _group_at_work_item(tile_n_base, offsets_t, num_groups):
     A work item is K_TILE_MAX consecutive token tiles, so one search covers all
     of them unless a tile crosses out of the returned group; the epilogues
     re-search on that crossing rather than stepping ``g``, which keeps the
-    result identical to a per-tile lookup even when a group is empty. Searching
-    ``offsets_t`` in place keeps the group count unbounded.
+    result identical to a per-tile lookup even when a group is empty. Both
+    searches go through ``_group_idx``, so both inherit its ``MAX_GROUPS`` /
+    ``GROUP_SEARCH_STEPS`` depth cap -- raising one without the other returns a
+    silently wrong group index rather than failing.
     """
     g = _group_idx(tile_n_base * cutlass.Int32(TOKEN_TILE), offsets_t, num_groups)
     return g, offsets_t[g]
@@ -330,10 +333,7 @@ class _Tcgen05GroupRowColFused(_GroupRhtMainloop):
     the row warp group (which reads the same SMEM bytes for the rowwise path).
     """
 
-    def __init__(
-        self, swizzle_sf: bool = True, sr: bool = False, fast_math: bool = False
-    ):
-        self.swizzle_sf = swizzle_sf
+    def __init__(self, sr: bool = False, fast_math: bool = False):
         self.sr = sr
         self.fast_math = fast_math
 
@@ -930,12 +930,10 @@ class _Tcgen05GroupRowColFused(_GroupRhtMainloop):
 
 # maxsize=None and no defaults, for the reasons spelled out over ``_compile_fused_kernel``:
 # an entry is a compiled kernel a CUDA-graph capture may depend on, so the cache must never
-# evict, and the key is the literal (args, kwargs) shape, so every caller passes all four
+# evict, and the key is the literal (args, kwargs) shape, so every caller passes all three
 # positionally or the pre-capture warm-up warms keys nothing will look up.
 @functools.lru_cache(maxsize=None)
-def _compile_group_fused_kernel(
-    device_idx: int, swizzle: bool, sr: bool, fast_math: bool
-):
+def _compile_group_fused_kernel(device_idx: int, sr: bool, fast_math: bool):
     """Compile the grouped fused kernel with symbolic shapes (cached per device+flags).
 
     ``sym_int`` divisibilities let one compiled kernel serve any
@@ -979,7 +977,7 @@ def _compile_group_fused_kernel(
     fake_offsets = make_fake_tensor(cutlass.Int32, (free(),), stride=(1,))
 
     return cute.compile(
-        _Tcgen05GroupRowColFused(swizzle_sf=swizzle, sr=sr, fast_math=fast_math),
+        _Tcgen05GroupRowColFused(sr=sr, fast_math=fast_math),
         fake_a,
         fake_b,
         fake_col_fp4,
@@ -1048,7 +1046,7 @@ def _cutedsl_group_rht_quantize_row_col_impl(
 
     stream = cuda.CUstream(int(torch.cuda.current_stream(dev).cuda_stream))
     compiled = _compile_group_fused_kernel(
-        dev.index, True, bool(stochastic_rounding), bool(use_fast_math)
+        dev.index, bool(stochastic_rounding), bool(use_fast_math)
     )
     compiled(
         A.t().unsqueeze(-1),

@@ -400,7 +400,7 @@ def philox_prep(seed_lo, seed_hi, offset_base):
     per-element counter, and round 2's ``c0``/``c1`` are still counter-independent. The
     key schedule depends only on the round index, so all ten steps precompute too.
 
-    Returns the opaque state ``philox_c0`` consumes. Building it once per kernel keeps
+    Returns the opaque state ``philox4_all`` consumes. Building it once per kernel keeps
     the per-element cost at eight full rounds plus a two-instruction round-2 tail.
     """
     sched = [
@@ -438,8 +438,6 @@ def philox4_all(state, chunk_counter):
     c0, c1 = c0_r2, c1_r2
     c2 = _mulhi_u32(A, c0_r1) ^ c3_r1 ^ sched[1][1]
     c3 = A * c0_r1
-    # Unlike philox_c0, the last round computes all four words instead of dropping the
-    # two that only feed rounds which no longer exist.
     for r in range(2, PHILOX_ROUNDS):
         _c0, _c2 = c0, c2
         c0 = _mulhi_u32(B, _c2) ^ c1 ^ sched[r][0]
@@ -447,30 +445,6 @@ def philox4_all(state, chunk_counter):
         c1 = B * _c2
         c3 = A * _c0
     return c0, c1, c2, c3
-
-
-def philox_c0(counter, state):
-    """``tl.randint(seed, (counter << 32) | offset_base)``, given ``philox_prep`` state.
-
-    Rounds 3-10 run in full; the last drops ``c1``/``c3``, which only feed rounds that
-    no longer exist.
-    """
-    sched, c0_r2, c1_r2, c3_r1 = state
-    A, B = cutlass.Uint32(_PHILOX_ROUND_A), cutlass.Uint32(_PHILOX_ROUND_B)
-    # Round 1 (c2 = c3 = 0): c0' = c1 ^ k0 is the only counter-dependent output.
-    c0_r1 = counter ^ sched[0][0]
-    # Round 2: c0/c1 are precomputed; c2/c3 carry the counter (c1_r1 == 0).
-    c0, c1 = c0_r2, c1_r2
-    c2 = _mulhi_u32(A, c0_r1) ^ c3_r1 ^ sched[1][1]
-    c3 = A * c0_r1
-    for r in range(2, PHILOX_ROUNDS):
-        _c0, _c2 = c0, c2
-        c0 = _mulhi_u32(B, _c2) ^ c1 ^ sched[r][0]
-        if r < PHILOX_ROUNDS - 1:
-            c2 = _mulhi_u32(A, _c0) ^ c3 ^ sched[r][1]
-            c1 = B * _c2
-            c3 = A * _c0
-    return c0
 
 
 @dsl_user_op

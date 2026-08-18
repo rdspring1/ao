@@ -142,4 +142,4 @@ def cutedsl_prepare_for_cuda_graph(device, *, sign_vectors=None) -> None:
     _compile_group_amax_kernel(idx)
     for sr in (False, True):
         for fast_math in (False, True):
-            _compile_group_fused_kernel(idx, True, sr, fast_math)
+            _compile_group_fused_kernel(idx, sr, fast_math)

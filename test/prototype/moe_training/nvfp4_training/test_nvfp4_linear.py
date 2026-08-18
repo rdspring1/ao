@@ -26,6 +26,7 @@ from torchao.prototype.moe_training.nvfp4_training.nvfp4_training import (
     NVFP4Linear,
     NVFP4TrainingConfig,
 )
+from torchao.prototype.moe_training.utils import generate_jagged_offs
 from torchao.quantization import quantize_
 from torchao.quantization.quantize_.common.kernel_preference import KernelPreference
 from torchao.quantization.utils import compute_error
@@ -424,15 +425,27 @@ def test_cutedsl_prepare_for_cuda_graph_warms_every_kernel_the_path_uses():
     so it warmed twelve kernels and hit zero of them while every test still passed. This
     asserts the property directly -- new compiles after prepare, which must be zero --
     rather than trusting a smoke test that survives the warm-up being a no-op.
+
+    Both halves of the warm-up are covered. The grouped caches live in a separate module
+    with their own key shapes, so a linear-only assertion would leave the grouped MoE
+    kernels exposed to exactly the drift this test exists to catch.
     """
-    from torchao.prototype.moe_training.nvfp4_training import _cutedsl_kernels_impl
+    from torchao.prototype.moe_training.nvfp4_training import (
+        _cutedsl_group_kernels_impl,
+        _cutedsl_kernels_impl,
+    )
+    from torchao.prototype.moe_training.nvfp4_training.nvfp4_grouped_mm import (
+        _to_nvfp4_rht_rs_then_scaled_grouped_mm,
+    )
 
     cutedsl_prepare_for_cuda_graph("cuda", sign_vectors=(_HARDCODED_SIGN_VECTOR,))
-    caches = (
-        _cutedsl_kernels_impl._compile_fused_kernel,
-        _cutedsl_kernels_impl._compile_amax_tc_kernel,
-    )
-    before = [c.cache_info().misses for c in caches]
+    caches = {
+        "fused": _cutedsl_kernels_impl._compile_fused_kernel,
+        "amax": _cutedsl_kernels_impl._compile_amax_tc_kernel,
+        "group_fused": _cutedsl_group_kernels_impl._compile_group_fused_kernel,
+        "group_amax": _cutedsl_group_kernels_impl._compile_group_amax_kernel,
+    }
+    before = {k: c.cache_info().misses for k, c in caches.items()}
 
     x = torch.randn(_M, _K, dtype=torch.bfloat16, device="cuda", requires_grad=True)
     w = torch.randn(_N, _K, dtype=torch.bfloat16, device="cuda", requires_grad=True)
@@ -449,8 +462,32 @@ def test_cutedsl_prepare_for_cuda_graph_warms_every_kernel_the_path_uses():
         )
         out.sum().backward()
 
-    new = [c.cache_info().misses - b for c, b in zip(caches, before)]
-    assert new == [0, 0], (
-        f"{sum(new)} CuteDSL kernel(s) compiled after cutedsl_prepare_for_cuda_graph "
-        f"(fused={new[0]}, amax={new[1]}); they would compile inside a CUDA-graph capture"
+    # Grouped MoE: the forward is RTNE and the backward is SR, so one fwd+bwd per
+    # arithmetic mode covers all four grouped fused keys plus the grouped amax. The
+    # grouped weight quantize compiles out of the linear `fused` cache (grouped=True).
+    num_experts = 2
+    gx = torch.randn(_M, _K, dtype=torch.bfloat16, device="cuda", requires_grad=True)
+    gw = torch.randn(
+        num_experts, _N, _K, dtype=torch.bfloat16, device="cuda", requires_grad=True
+    )
+    offs = generate_jagged_offs(num_experts, _M, multiple_of=128, dtype=torch.int32)
+    sr_seed = torch.tensor([1234], dtype=torch.int64, device="cuda")
+    for use_fast_math in (True, False):
+        gout = _to_nvfp4_rht_rs_then_scaled_grouped_mm(
+            gx,
+            gw,
+            _HARDCODED_SIGN_VECTOR,
+            sr_seed,
+            offs=offs,
+            pad_token_groups_for_grouped_mm=False,
+            kernel_preference=KernelPreference.CUTEDSL,
+            use_fast_math=use_fast_math,
+        )
+        gout.sum().backward()
+
+    new = {k: c.cache_info().misses - before[k] for k, c in caches.items()}
+    assert set(new.values()) == {0}, (
+        f"{sum(new.values())} CuteDSL kernel(s) compiled after "
+        f"cutedsl_prepare_for_cuda_graph ({new}); they would compile inside a "
+        "CUDA-graph capture"
     )

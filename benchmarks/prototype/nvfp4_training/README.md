@@ -683,7 +683,7 @@ all.
 ### Grouped stochastic-rounding optimization
 
 A third pass again started from the SASS rather than a benchmark, diffing the grouped
-kernel's SR and RTNE compilations directly (`_compile_group_fused_kernel(0, True, sr,
+kernel's SR and RTNE compilations directly (`_compile_group_fused_kernel(0, sr,
 False)` under `CUTE_DSL_KEEP=cubin`, then `cuobjdump -res-usage -sass`). SR ran **2360
 more static instructions than RTNE**, 5816 against 3456, and the mix said where they
 were: `IMAD` + `LOP3` accounted for 1802 (76%) and `FMUL` + `FMNMX` for 384 (16%).
