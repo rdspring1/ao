@@ -346,7 +346,7 @@ class _Tcgen05GroupRowColFused(_GroupRhtMainloop):
         mB: cute.Tensor,  # (16, 16, 1) bf16 = H^T
         mColFP4: cute.Tensor,  # (hidden, tokens//8) u32
         mColSF: cute.Tensor,  # flat u32 concatenation of per-group swizzled scales
-        mRowFP4: cute.Tensor,  # (tokens, hidden//8) u32
+        mRowFP4: cute.Tensor,  # (tokens, hidden//16) u64: the row code pair per store
         mRowSF: cute.Tensor,  # (tokens//128, hidden//64, 32, 16) e4m3
         row_amax_t: cute.Tensor,  # (num_tensors,) f32
         col_amax_t: cute.Tensor,  # (num_tensors,) f32
@@ -848,6 +848,7 @@ class _Tcgen05GroupRowColFused(_GroupRhtMainloop):
 
             blk = cute.make_rmem_tensor((16,), cutlass.Float32)
             rBlk = cute.make_rmem_tensor((16,), cutlass.BFloat16)
+            rPair = cute.make_rmem_tensor((2,), cutlass.Uint32)
             row_state = None
             if cutlass.const_expr(self.sr):
                 row_state = philox_prep(
@@ -879,7 +880,7 @@ class _Tcgen05GroupRowColFused(_GroupRhtMainloop):
                         stage = ab_consumer_state.index
                         tile_n = tile_n_base + k_tile
                         gRow = cute.local_tile(
-                            mRowFP4, (TOKEN_TILE, M_TILE // 8), (tile_n, tile_m)
+                            mRowFP4, (TOKEN_TILE, M_TILE // 16), (tile_n, tile_m)
                         )
                         if cutlass.const_expr(self.sr):
                             tile_id = tile_n * tiles_in_h + tile_m
@@ -913,8 +914,17 @@ class _Tcgen05GroupRowColFused(_GroupRhtMainloop):
                                 row_rb,
                                 fast_math=self.fast_math,
                             )
-                            gRow[(tok, hb * cutlass.Int32(2))] = w0
-                            gRow[(tok, hb * cutlass.Int32(2) + cutlass.Int32(1))] = w1
+                            # One 64-bit store, not two 32-bit ones. A warp covers 4
+                            # tokens x ROW_HB hidden blocks, so consecutive lanes differ in
+                            # hb: as two u32 stores each wrote 4B at an 8B lane stride,
+                            # spanning 64B to fill 32B, and every sector came back half
+                            # wasted (8.00 sectors/instruction against an ideal of 4.00).
+                            # Storing the pair makes the lanes contiguous and lands at the
+                            # ideal, which is what TE's STG.E.64 already does here.
+                            rPair[0] = w0
+                            rPair[1] = w1
+                            pair64 = cute.recast_tensor(rPair, cutlass.Uint64)
+                            gRow[(tok, hb)] = pair64[0]
                             _store_sf_byte(
                                 mRowSF,
                                 sf,
@@ -966,10 +976,14 @@ def _compile_group_fused_kernel(device_idx: int, sr: bool, fast_math: bool):
         assumed_align=16,
     )
     fake_col_sf = make_fake_tensor(cutlass.Uint32, (free(),), stride=(1,))
+    # u64: the row epilogue stores the two code words of a 16-hidden block together.
+    # The allocation is torch.empty (256B) and hidden % 128 == 0 makes the row stride
+    # hidden/2 bytes, a multiple of 64B, so every row start is 16B aligned.
     fake_row_fp4 = make_fake_tensor(
-        cutlass.Uint32,
-        (t_sym, cute.sym_int(divisibility=M_TILE // 8)),
+        cutlass.Uint64,
+        (t_sym, cute.sym_int(divisibility=M_TILE // 16)),
         stride=(free(), 1),
+        assumed_align=16,
     )
     fake_row_sf = make_fake_tensor(
         cutlass.Float8E4M3FN, (free(), free(), 32, 16), stride=(free(), 512, 16, 1)
@@ -1057,7 +1071,7 @@ def _cutedsl_group_rht_quantize_row_col_impl(
         rht_nk,
         col_fp4,
         col_sf.view(torch.uint32).flatten(),
-        row_fp4,
+        row_fp4.view(torch.uint64),
         row_sf,
         row_global_amax,
         col_global_amax,
