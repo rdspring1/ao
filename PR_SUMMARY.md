@@ -17,6 +17,31 @@ is 37.3% faster than BF16 and +12.8% faster than MXFP8 (1004.6 vs 731.6 and 890.
 while using less memory than either (217.08 GiB, −8.38 GiB vs bf16 and −5.41 GiB vs mxfp8). The
 training loss curve is inline with BF16 and MXFP8.
 
+<details>
+<summary><strong>E2E run: 64 GB300 GPUs, 1 hour</strong></summary>
+
+<!-- loss curve png here -->
+
+**Throughput** (steps >= 50):
+
+| cell | TFLOP/s/GPU | tok/s/GPU | vs bf16 | vs mxfp8 | steps in 1 h |
+|---|---:|---:|---:|---:|---:|
+| bf16 | 731.6 | 2602 | — | −17.9% | 270 |
+| nvfp4 F0L10, bf16 attn, Triton | 847.4 | 3014 | +15.8% | −4.9% | 280 |
+| mxfp8 | 890.8 | 3168 | +21.8% | — | 320 |
+| **nvfp4 F0L0 + mxfp8 attn, CuteDSL fast** | **1004.6** | **3573** | **+37.3%** | **+12.8%** | **340** |
+
+**Memory** (peak reserved per GPU, 276 GiB device):
+
+| cell | peak | of 276 GiB | vs bf16 | headroom |
+|---|---:|---:|---:|---:|
+| nvfp4 F0L10, bf16 attn, Triton | 227.03 GiB | 82.07% | +1.57 GiB | 48.97 GiB |
+| bf16 | 225.46 GiB | 81.50% | — | 50.54 GiB |
+| mxfp8 | 222.49 GiB | 80.43% | −2.97 GiB | 53.51 GiB |
+| **nvfp4 F0L0 + mxfp8 attn, CuteDSL fast** | **217.08 GiB** | **78.48%** | **−8.38 GiB** | **58.92 GiB** |
+
+</details>
+
 ### Key Changes
 
 1. Replace random bit generation in Linear CuteDSL kernels from MurmurHash3 to Philox
