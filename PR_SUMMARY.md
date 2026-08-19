@@ -11,6 +11,12 @@ grouped amax, and 1.8x on grouped 2D weights** at 671B, and fast math is worth a
 1.3-1.4x on top. Round-to-nearest-even output stays bitwise identical to both the Triton
 backend and the TransformerEngine-derived reference on every path.
 
+The latest configuration is NVFP4 for all dense linears, shared and routed experts and
+MXFP8 attention with fast math enabled. In E2E run with 64 GB300 GPUs for 1 hour, NVFP4
+is 37.3% faster than BF16 and +12.8% faster than MXFP8 (1004.6 vs 731.6 and 890.8 TFLOP/s)
+while using less memory than either (217.08 GiB, −8.38 vs bf16 and −5.41 vs mxfp8). The
+training loss curve is inline with BF16 and MXFP8.
+
 ### Key Changes
 
 1. Replace random bit generate in Linear CuteDSL kernels from MurmurHash3 to Philox
