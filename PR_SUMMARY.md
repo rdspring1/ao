@@ -1,4 +1,4 @@
-# [nvfp4_training] Optimized CuTeDSL kernels for NVFP4 training
+# [nvfp4_training] Optimized CuteDSL kernels for NVFP4 training
 
 ## Summary
 
@@ -14,14 +14,14 @@ backend and the TransformerEngine-derived reference on every path.
 The latest configuration is NVFP4 for all dense linears, shared and routed experts and
 MXFP8 attention with fast math enabled. In E2E run with 64 GB300 GPUs for 1 hour, NVFP4
 is 37.3% faster than BF16 and +12.8% faster than MXFP8 (1004.6 vs 731.6 and 890.8 TFLOP/s)
-while using less memory than either (217.08 GiB, −8.38 vs bf16 and −5.41 vs mxfp8). The
+while using less memory than either (217.08 GiB, −8.38 GiB vs bf16 and −5.41 GiB vs mxfp8). The
 training loss curve is inline with BF16 and MXFP8.
 
 ### Key Changes
 
-1. Replace random bit generate in Linear CuteDSL kernels from MurmurHash3 to Philox
-2. Add fast-math path to Triton and CuTeDSL
-3. Create CuTeDSL versions of the grouped RHT quantize, grouped amax, and grouped 2D weight kernels
+1. Replace random bit generation in Linear CuteDSL kernels from MurmurHash3 to Philox
+2. Add fast-math path to Triton and CuteDSL
+3. Create CuteDSL versions of the grouped RHT quantize, grouped amax, and grouped 2D weight kernels
 4. Enable CuteDSL + fast math as the default
 
 ## Key details
@@ -34,7 +34,7 @@ Fast math matches TransformerEngine under `NVTE_USE_FAST_MATH=1` and does two th
   Gated per call site: it applies to the columnwise path only, since the rowwise path has
   no accumulator.
 - **Replaces the correctly rounded `div.rn` encode reciprocal with `rcp.approx.ftz.f32`**
-  (one `MUFU.RCP`). 
+  (one `MUFU.RCP`).
 
 Triton previously had no fast variant at all. Adding it keeps the two backends bitwise
 identical to each other **and** to TE in either mode, so `AUTO` and `TRITON` agree.
@@ -61,7 +61,7 @@ whole FP4 step.
 
 ### Philox divergence between CuteDSL and Triton
 
-**Triton and CuTeDSL are bitwise identical for RTNE but not for SR**
+**Triton and CuteDSL are bitwise identical for RTNE but not for SR**
 
 Triton's SR path calls `tl.randint(seed, offset)` once per packed byte. Two things waste
 work there:
@@ -140,12 +140,10 @@ CuteDSL ~1.4x its own RTNE time against Triton's ~1.8x.
 
 | path | CuteDSL fast/exact | Triton fast/exact |
 |---|---|---|
-| linear quantize | 1.57-1.91x | 1.14-1.22x |
 | grouped quantize, RTNE | 1.32-1.38x | 1.28-1.36x |
 | grouped quantize, SR | 1.27-1.36x | 1.13-1.14x |
 
-Fast math is worth far more to CuteDSL because it removes a larger share of what that
-epilogue does once its other work is fused. Triton gains little under SR, where the Philox
-work it still carries dominates what fast math removes.
+Under RTNE both backends gain about the same. The split appears under SR, where Triton
+gains only 1.13-1.14x: the Philox work it still carries dominates what fast math removes.
 
 </details>
