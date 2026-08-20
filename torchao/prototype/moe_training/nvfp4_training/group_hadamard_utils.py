@@ -22,7 +22,10 @@ VARYING_FIRST_DIM = 1
 # time: at DeepSeek-V3 671B expert shapes that is more than the grouped RHT
 # kernel being guarded, so the checks are opt-in. The shape, dtype, device and
 # alignment checks derived from host-side arguments always run.
-_DEVICE_ASSERTS = os.environ.get("TORCHAO_NVFP4_GROUP_DEVICE_ASSERTS", "0") == "1"
+# DIAGNOSTIC BRANCH: default flipped to on so the probe needs no JET env
+# plumbing. Do NOT merge -- this costs ~9 us per launch and is a throughput
+# regression on any real run.
+_DEVICE_ASSERTS = os.environ.get("TORCHAO_NVFP4_GROUP_DEVICE_ASSERTS", "1") == "1"
 
 
 if torch_version_at_least("2.10.0") and has_triton():
