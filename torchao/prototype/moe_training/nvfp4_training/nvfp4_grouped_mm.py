@@ -278,21 +278,6 @@ class _NVFP4GroupedMM(torch.autograd.Function):
 
         packed_sequence_length = input_act.shape[0]
         logical_packed_length = padded_group_end_offsets[-1:]
-        if _DEVICE_ASSERTS:
-            # The swizzled scale tensors are allocated with packed_sequence_length
-            # rows (the dispatch buffer capacity), but F.scaled_grouped_mm indexes
-            # them through offs, which only covers logical_packed_length. The two
-            # agree only when the capacity factor is an exact fit; every surplus
-            # configuration makes them diverge. This is a probe for that
-            # hypothesis, not an established contract -- it is expected to fire
-            # on any surplus config, and only tells us something if the failing
-            # config trips it and the passing ones do not.
-            torch.ops.aten._assert_async.msg(
-                logical_packed_length[0] == packed_sequence_length,
-                "scale tensors are sized by packed_sequence_length but indexed "
-                "through offs, which covers only logical_packed_length",
-            )
-
         group_rht_amax = (
             cutedsl_group_rht_amax if use_cutedsl_rht else triton_group_rht_amax
         )
