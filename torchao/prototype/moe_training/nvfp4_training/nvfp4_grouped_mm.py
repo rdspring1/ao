@@ -150,6 +150,34 @@ def _to_nvfp4_rht_rs_then_scaled_grouped_mm(
     return output
 
 
+def _assert_quant_values(tag: str, amax: torch.Tensor, *scale_factors) -> None:
+    """Device-side value checks on an NVFP4 amax and its block scales.
+
+    The FP4 codes are deliberately not checked: e2m1 has no NaN or Inf
+    encoding, so every 4-bit pattern decodes to a finite value and a corrupted
+    code is indistinguishable from a valid one until the GEMM dequantizes it.
+    The fp32 amax and the e4m3fn block scales are the only tensors in the
+    NVFP4 path that can carry a non-finite value.
+    """
+    if not _DEVICE_ASSERTS:
+        return
+    torch.ops.aten._assert_async.msg(
+        torch.isfinite(amax).all(),
+        f"{tag}: amax is non-finite",
+    )
+    torch.ops.aten._assert_async.msg(
+        (amax > 0).all(),
+        f"{tag}: a group amax is zero, so its scale underflows to zero and the "
+        f"quantizer divides by it; offs already guarantees non-empty groups, so "
+        f"this means the group's rows are all zero",
+    )
+    for i, sf in enumerate(scale_factors):
+        torch.ops.aten._assert_async.msg(
+            torch.isfinite(sf.to(torch.float32)).all(),
+            f"{tag}: e4m3fn block scale {i} is NaN",
+        )
+
+
 class _NVFP4GroupedMM(torch.autograd.Function):
     """NVFP4 grouped forward, dgrad, and wgrad on the selected quantization backend."""
 
@@ -250,6 +278,21 @@ class _NVFP4GroupedMM(torch.autograd.Function):
 
         packed_sequence_length = input_act.shape[0]
         logical_packed_length = padded_group_end_offsets[-1:]
+        if _DEVICE_ASSERTS:
+            # The swizzled scale tensors are allocated with packed_sequence_length
+            # rows (the dispatch buffer capacity), but F.scaled_grouped_mm indexes
+            # them through offs, which only covers logical_packed_length. The two
+            # agree only when the capacity factor is an exact fit; every surplus
+            # configuration makes them diverge. This is a probe for that
+            # hypothesis, not an established contract -- it is expected to fire
+            # on any surplus config, and only tells us something if the failing
+            # config trips it and the passing ones do not.
+            torch.ops.aten._assert_async.msg(
+                logical_packed_length[0] == packed_sequence_length,
+                "scale tensors are sized by packed_sequence_length but indexed "
+                "through offs, which covers only logical_packed_length",
+            )
+
         group_rht_amax = (
             cutedsl_group_rht_amax if use_cutedsl_rht else triton_group_rht_amax
         )
@@ -268,6 +311,8 @@ class _NVFP4GroupedMM(torch.autograd.Function):
             VARYING_FIRST_DIM,
             logical_packed_length=logical_packed_length,
         )
+        _assert_quant_values("fwd x row amax", x_row_amax)
+        _assert_quant_values("fwd x col amax", x_col_amax)
         x_row_codes, x_row_sf, x_col_codes, x_col_sf = group_rht_quantize_row_col(
             input_act,
             sign_vector_list,
@@ -284,6 +329,8 @@ class _NVFP4GroupedMM(torch.autograd.Function):
             use_fast_math=use_fast_math,
         )
 
+        _assert_quant_values("fwd x row scale", x_row_amax, x_row_sf)
+        _assert_quant_values("fwd x col scale", x_col_amax, x_col_sf)
         weight_amax = triton_group_weight_amax(weight, num_experts)
         group_weight_quantize_2d = (
             cutedsl_group_weight_quantize_2d
@@ -293,6 +340,7 @@ class _NVFP4GroupedMM(torch.autograd.Function):
         weight_codes, weight_sf, weight_t_codes, weight_t_sf = group_weight_quantize_2d(
             weight, weight_amax, num_experts
         )
+        _assert_quant_values("fwd w", weight_amax, weight_sf, weight_t_sf)
         output = F.scaled_grouped_mm(
             x_row_codes.view(torch.float4_e2m1fn_x2),
             # Transpose rowwise W codes to the grouped-GEMM RHS layout (E, K, N).
@@ -390,6 +438,8 @@ class _NVFP4GroupedMM(torch.autograd.Function):
             0, 2**32, (1,), dtype=torch.int64, device=grad_output.device
         )
         rng_state = torch.cat((sr_seed, col_offset, sr_seed ^ 1, row_offset))
+        _assert_quant_values("bwd dy row amax", dy_row_amax)
+        _assert_quant_values("bwd dy col amax", dy_col_amax)
         dy_row_codes, dy_row_sf, dy_col_codes, dy_col_sf = group_rht_quantize_row_col(
             grad_output,
             sign_vector_list,
@@ -406,6 +456,8 @@ class _NVFP4GroupedMM(torch.autograd.Function):
             use_fast_math=ctx.use_fast_math,
         )
 
+        _assert_quant_values("bwd dy row scale", dy_row_amax, dy_row_sf)
+        _assert_quant_values("bwd dy col scale", dy_col_amax, dy_col_sf)
         grad_input = F.scaled_grouped_mm(
             dy_row_codes.view(torch.float4_e2m1fn_x2),
             # Transpose rowwise W.T codes to the dgrad RHS layout (E, N, K).
