@@ -29,7 +29,7 @@ from torchao.prototype.moe_training.nvfp4_training.nvfp4_training import (
 from torchao.quantization import quantize_
 from torchao.quantization.utils import compute_error
 
-from ._v2_marks import kernel_gate, maybe_sm100
+from ._v2_marks import kernel_gate, kernel_skip, maybe_sm100
 
 # Every grouped kernel these recipes call must be implemented before the numerics
 # tests mean anything. V1_REQUANT needs only the three no-RHT ops; V2 needs all of them.
@@ -39,6 +39,24 @@ _needs_v1_requant = kernel_gate(
     _V1_REQUANT_KERNELS_IMPLEMENTED, "the §11.1/§11.6/§11.7 kernels"
 )
 _needs_v2 = kernel_gate(_V2_KERNELS_IMPLEMENTED, "the §11.1-§11.9 kernels")
+
+# For tests that cover both recipes. Gating the whole test on V2 would keep the
+# V1_REQUANT half unreachable through all of Phase A, which is exactly the half that
+# has to hold before a V1_REQUANT convergence run.
+_BOTH_RECIPES = [
+    pytest.param(
+        NVFP4Recipe.V1_REQUANT,
+        marks=kernel_skip(
+            _V1_REQUANT_KERNELS_IMPLEMENTED, "the §11.1/§11.6/§11.7 kernels"
+        ),
+        id="v1_requant",
+    ),
+    pytest.param(
+        NVFP4Recipe.V2,
+        marks=kernel_skip(_V2_KERNELS_IMPLEMENTED, "the §11.1-§11.9 kernels"),
+        id="v2",
+    ),
+]
 
 _M = _K = _N = 256
 
@@ -225,8 +243,8 @@ def test_v2_forward_vs_bf16():
     assert compute_error(want.float(), got.float()) > 15.0
 
 
-@_needs_v2
-@pytest.mark.parametrize("recipe", [NVFP4Recipe.V1_REQUANT, NVFP4Recipe.V2])
+@maybe_sm100
+@pytest.mark.parametrize("recipe", _BOTH_RECIPES)
 def test_gradients_vs_bf16_autograd(recipe):
     layer = _layer(recipe)
     x = _inputs()
@@ -240,8 +258,8 @@ def test_gradients_vs_bf16_autograd(recipe):
     assert compute_error(w_ref.grad.float(), layer.weight.grad.float()) > 10.0
 
 
-@_needs_v2
-@pytest.mark.parametrize("recipe", [NVFP4Recipe.V1_REQUANT, NVFP4Recipe.V2])
+@maybe_sm100
+@pytest.mark.parametrize("recipe", _BOTH_RECIPES)
 def test_no_non_grouped_kernel_is_dispatched(recipe):
     """The runtime half of the "linear is grouped at num_tensors=1" claim.
 
@@ -258,8 +276,8 @@ def test_no_non_grouped_kernel_is_dispatched(recipe):
     assert not leaked, f"non-grouped kernels dispatched: {sorted(leaked)}"
 
 
-@_needs_v2
-@pytest.mark.parametrize("recipe", [NVFP4Recipe.V1_REQUANT, NVFP4Recipe.V2])
+@maybe_sm100
+@pytest.mark.parametrize("recipe", _BOTH_RECIPES)
 @torch.no_grad()
 def test_linear_matches_the_grouped_path_at_one_group(recipe):
     """The converse: driving the grouped entrypoint with ``offs = [M]`` must give the

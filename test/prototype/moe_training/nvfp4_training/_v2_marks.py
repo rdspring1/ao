@@ -47,17 +47,28 @@ def maybe_sm100(fn):
     return fn
 
 
+def kernel_skip(implemented: bool, module: str):
+    """The bare skip mark behind ``kernel_gate``, for per-*parameter* gating.
+
+    Use with ``pytest.param(..., marks=...)`` when one test covers several recipes
+    whose kernels land at different times. Decorating the whole test with the
+    strictest gate hides the recipes that are already ready -- which is how
+    V1_REQUANT's gradient coverage ended up behind the V2 flag.
+    """
+    return pytest.mark.skipif(
+        not implemented, reason=f"Triton kernel body in {module} is still a stub"
+    )
+
+
 def kernel_gate(implemented: bool, module: str):
-    """Return a decorator gating a test on ``module``'s kernel body being written.
+    """Return a decorator gating a whole test on ``module``'s kernel body being written.
 
     Args:
         implemented: the module-level ``_KERNEL_IMPLEMENTED`` flag.
         module: the file whose ``@triton.jit`` body is still a stub, for the reason
             string.
     """
-    skip = pytest.mark.skipif(
-        not implemented, reason=f"Triton kernel body in {module} is still a stub"
-    )
+    skip = kernel_skip(implemented, module)
 
     def decorate(fn):
         return maybe_sm100(skip(fn))
