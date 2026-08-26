@@ -66,6 +66,10 @@ def prepare_for_cuda_graph(
     # matches.
     for sign_vector in sign_vectors or ():
         _prewarm_rht_matrix(tuple(sign_vector), key)
+    # Warm H128 unconditionally (32 KB of bf16). Recipes with dynamic signs form
+    # diag(signs) @ H128 per launch and so have no sign vector to enumerate here,
+    # but the Hadamard itself must still be allocated outside the graph pool.
+    get_hadamard_matrix(128, key, torch.bfloat16)
     return _TMA_WORKSPACES[key]
 
 
@@ -80,37 +84,75 @@ def get_wgrad_sign_vector(
     )
 
 
+@functools.lru_cache(maxsize=None)
 def get_hadamard_matrix(
     hadamard_dimension: int, device, dtype: torch.dtype = torch.bfloat16
 ) -> torch.Tensor:
-    """Construct a 16x16 Hadamard matrix (scaled by 1/sqrt(16))."""
-    if hadamard_dimension != 16:
-        raise ValueError("Only hadamard dimension 16 is supported.")
+    """Normalized Sylvester-ordered Hadamard matrix. Supports 16 and 128.
+
+    128 is built by Kronecker-recursing the hardcoded 16x16 block:
+    ``H_128 = H_16 (x) H_8`` where ``H_8 = H_16[:8, :8]`` is its Sylvester
+    sub-block. That reproduces the popcount ordering the V2 reference uses, so a
+    128-row RHT built here cancels against one built by the oracle.
+
+    Cached because V2 forms ``diag(signs) @ H`` per launch from a resampled sign
+    tensor: only the fixed Hadamard may be memoized, never the product.
+    """
+    if hadamard_dimension not in (16, 128):
+        raise ValueError("Only hadamard dimension 16 or 128 is supported.")
     hadamard_scale = 1 / math.sqrt(hadamard_dimension)
-    return (
-        torch.tensor(
-            [
-                [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
-                [1, -1, 1, -1, 1, -1, 1, -1, 1, -1, 1, -1, 1, -1, 1, -1],
-                [1, 1, -1, -1, 1, 1, -1, -1, 1, 1, -1, -1, 1, 1, -1, -1],
-                [1, -1, -1, 1, 1, -1, -1, 1, 1, -1, -1, 1, 1, -1, -1, 1],
-                [1, 1, 1, 1, -1, -1, -1, -1, 1, 1, 1, 1, -1, -1, -1, -1],
-                [1, -1, 1, -1, -1, 1, -1, 1, 1, -1, 1, -1, -1, 1, -1, 1],
-                [1, 1, -1, -1, -1, -1, 1, 1, 1, 1, -1, -1, -1, -1, 1, 1],
-                [1, -1, -1, 1, -1, 1, 1, -1, 1, -1, -1, 1, -1, 1, 1, -1],
-                [1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1, -1, -1, -1],
-                [1, -1, 1, -1, 1, -1, 1, -1, -1, 1, -1, 1, -1, 1, -1, 1],
-                [1, 1, -1, -1, 1, 1, -1, -1, -1, -1, 1, 1, -1, -1, 1, 1],
-                [1, -1, -1, 1, 1, -1, -1, 1, -1, 1, 1, -1, -1, 1, 1, -1],
-                [1, 1, 1, 1, -1, -1, -1, -1, -1, -1, -1, -1, 1, 1, 1, 1],
-                [1, -1, 1, -1, -1, 1, -1, 1, -1, 1, -1, 1, 1, -1, 1, -1],
-                [1, 1, -1, -1, -1, -1, 1, 1, -1, -1, 1, 1, 1, 1, -1, -1],
-                [1, -1, -1, 1, -1, 1, 1, -1, -1, 1, 1, -1, 1, -1, -1, 1],
-            ],
-            dtype=dtype,
-            device=device,
+    h16 = torch.tensor(
+        [
+            [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+            [1, -1, 1, -1, 1, -1, 1, -1, 1, -1, 1, -1, 1, -1, 1, -1],
+            [1, 1, -1, -1, 1, 1, -1, -1, 1, 1, -1, -1, 1, 1, -1, -1],
+            [1, -1, -1, 1, 1, -1, -1, 1, 1, -1, -1, 1, 1, -1, -1, 1],
+            [1, 1, 1, 1, -1, -1, -1, -1, 1, 1, 1, 1, -1, -1, -1, -1],
+            [1, -1, 1, -1, -1, 1, -1, 1, 1, -1, 1, -1, -1, 1, -1, 1],
+            [1, 1, -1, -1, -1, -1, 1, 1, 1, 1, -1, -1, -1, -1, 1, 1],
+            [1, -1, -1, 1, -1, 1, 1, -1, 1, -1, -1, 1, -1, 1, 1, -1],
+            [1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1, -1, -1, -1],
+            [1, -1, 1, -1, 1, -1, 1, -1, -1, 1, -1, 1, -1, 1, -1, 1],
+            [1, 1, -1, -1, 1, 1, -1, -1, -1, -1, 1, 1, -1, -1, 1, 1],
+            [1, -1, -1, 1, 1, -1, -1, 1, -1, 1, 1, -1, -1, 1, 1, -1],
+            [1, 1, 1, 1, -1, -1, -1, -1, -1, -1, -1, -1, 1, 1, 1, 1],
+            [1, -1, 1, -1, -1, 1, -1, 1, -1, 1, -1, 1, 1, -1, 1, -1],
+            [1, 1, -1, -1, -1, -1, 1, 1, -1, -1, 1, 1, 1, 1, -1, -1],
+            [1, -1, -1, 1, -1, 1, 1, -1, -1, 1, 1, -1, 1, -1, -1, 1],
+        ],
+        dtype=dtype,
+        device=device,
+    )
+    if hadamard_dimension == 128:
+        return torch.kron(h16, h16[:8, :8]) * hadamard_scale
+    return h16 * hadamard_scale
+
+
+def get_dynamic_rht_matrix(
+    sign_vector: torch.Tensor,
+    dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """Build ``diag(sign_vector) @ H`` from a live device buffer, caching only ``H``.
+
+    The counterpart to ``get_rht_matrix`` for recipes whose signs are resampled
+    during the run. ``get_rht_matrix`` is keyed on the sign *tuple*, which is sound
+    only when the key set is a single element; keyed on a resampled vector its
+    ``maxsize=None`` cache grows one entry per resample for the run's lifetime.
+    Here only the fixed Hadamard is memoized and the product is formed per call.
+
+    ``sign_vector`` is a device tensor rather than a tuple on purpose: it is a
+    fixed-shape buffer updated in place by the cadence manager, so its address
+    stays stable under CUDA-graph capture.
+    """
+    if sign_vector.ndim != 1:
+        raise ValueError(f"sign_vector must be 1D, got {sign_vector.ndim}D")
+    hadamard_dimension = sign_vector.shape[0]
+    if hadamard_dimension not in (16, 128):
+        raise ValueError(
+            f"sign_vector length must be 16 or 128, got {hadamard_dimension}"
         )
-        * hadamard_scale
+    return sign_vector.to(dtype)[:, None] * get_hadamard_matrix(
+        hadamard_dimension, device=sign_vector.device, dtype=dtype
     )
 
 
@@ -123,7 +165,22 @@ def get_rht_matrix(
     /,
 ) -> torch.Tensor:
     """Construct an RHT matrix from an explicit sign vector. Avoid default arguments
-    and require positional arguments to ensure lru_cache keys are unambiguous."""
+    and require positional arguments to ensure lru_cache keys are unambiguous.
+
+    ``sign_vector`` must be a hashable-by-value tuple. A ``torch.Tensor`` is rejected
+    explicitly rather than left to fail on its own: tensors hash by *identity*, not by
+    value, so a dynamic sign buffer would be accepted here and then -- because the
+    cadence manager updates it in place, leaving its id unchanged -- keep returning
+    the matrix built from its very first contents. The transform would stop cancelling
+    and the gradients would be silently wrong, with no error anywhere. Recipes with
+    resampled signs must use ``get_dynamic_rht_matrix``.
+    """
+    if isinstance(sign_vector, torch.Tensor):
+        raise TypeError(
+            "get_rht_matrix caches by value and cannot take a torch.Tensor: tensors "
+            "hash by identity, so an in-place resample would silently return a stale "
+            "RHT matrix. Use get_dynamic_rht_matrix for resampled sign vectors."
+        )
     if len(sign_vector) != hadamard_dimension:
         raise ValueError(
             f"Expected sign_vector length {hadamard_dimension}, got {len(sign_vector)}"
@@ -178,6 +235,44 @@ if has_triton():
             pack=4,
         )
         return x_fp4x2
+
+    @triton.jit
+    def convert_4xfp4_packed_to_8xfp32(bytes4):
+        """Inverse of ``convert_8xfp32_to_4xfp4_packed``.
+
+        One uint8 tile in; two fp32 tiles out (low-nibble columns, high-nibble
+        columns), interleaved back into the original column order. FP4 -> FP16 is a
+        widening conversion and therefore exact, so this round-trips the packer
+        bit-for-bit.
+        """
+        lo, hi = tl.inline_asm_elementwise(
+            asm="""
+            {
+            .reg .b8  b0, b1, b2, b3;
+            .reg .b32 p0, p1, p2, p3;
+            .reg .b16 l0, h0, l1, h1, l2, h2, l3, h3;
+            mov.b32 {b0, b1, b2, b3}, $8;          // 4 packed bytes -> 4 x b8
+            cvt.rn.f16x2.e2m1x2 p0, b0;            // byte -> 2 f16 (widening = exact)
+            cvt.rn.f16x2.e2m1x2 p1, b1;
+            cvt.rn.f16x2.e2m1x2 p2, b2;
+            cvt.rn.f16x2.e2m1x2 p3, b3;
+            mov.b32 {l0, h0}, p0;                  // split f16x2 -> lo/hi halves
+            mov.b32 {l1, h1}, p1;
+            mov.b32 {l2, h2}, p2;
+            mov.b32 {l3, h3}, p3;
+            cvt.f32.f16 $0, l0;   cvt.f32.f16 $4, h0;
+            cvt.f32.f16 $1, l1;   cvt.f32.f16 $5, h1;
+            cvt.f32.f16 $2, l2;   cvt.f32.f16 $6, h2;
+            cvt.f32.f16 $3, l3;   cvt.f32.f16 $7, h3;
+            }
+            """,
+            constraints="=r,=r,=r,=r,=r,=r,=r,=r,r",
+            args=[bytes4],
+            dtype=(tl.float32, tl.float32),
+            is_pure=True,
+            pack=4,
+        )
+        return tl.interleave(lo, hi)
 
     @triton.jit
     def convert_8xfp32_to_4xfp4_packed_rs(x_pairs, rbits):
@@ -255,6 +350,56 @@ if has_triton():
             return convert_8xfp32_to_4xfp4_packed(scaled_pairs)
 
     @triton.jit
+    def _nvfp4_global_scales(global_amax, FP8_E4M3_MAX: tl.constexpr):
+        """Exact FP32 per-tensor ``(encode, decode)`` scales for a given FP8 ceiling.
+
+        Factored out of ``_nvfp4_quantize`` because the requantization kernels must
+        decode the saved forward weight with *exactly* the scale the forward encoded
+        it with. If the two ever drift, the requantization amax stops bounding the
+        tensor being quantized and both gradients come out biased low.
+
+        ``FP8_E4M3_MAX`` is 448 for plain NVFP4 casts and 256 for MS-EDEN, which is
+        what makes their per-tensor decode numerators 2688 and 1536 respectively.
+        """
+        FP4_E2M1_MAX: tl.constexpr = 6.0
+        FP32_MAX: tl.constexpr = torch.finfo(torch.float32).max
+
+        is_zero = global_amax == 0.0
+        safe_global_amax = tl.where(is_zero, 1.0, global_amax)
+        # TE's scale bytes follow correctly-rounded FP32 division; Triton's normal
+        # "/" lowers through a reciprocal path that can flip FP8 midpoint ties.
+        global_scale_num = tl.full(
+            safe_global_amax.shape,
+            FP8_E4M3_MAX * FP4_E2M1_MAX,
+            safe_global_amax.dtype,
+        )
+        candidate = tl.div_rn(global_scale_num, safe_global_amax)
+        candidate = tl.minimum(candidate, FP32_MAX)
+        candidate = tl.where(candidate == 0.0, 1.0, candidate)
+        global_encode_scale = tl.where(is_zero, 1.0, candidate)
+        one = tl.full(
+            safe_global_amax.shape, 1.0, safe_global_amax.dtype
+        )  # div_rn needs a tensor numerator
+        return global_encode_scale, tl.div_rn(one, global_encode_scale)
+
+    @triton.jit
+    def _rescale_fp4(qa_fp4, sfa, gds, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
+        """Dequantize a packed FP4 tile back to FP32 -- the ``W_qdq`` reconstruction.
+
+        Args:
+            qa_fp4: ``(BLOCK_M, BLOCK_N//2)`` packed uint8 FP4 codes.
+            sfa: ``(BLOCK_M, BLOCK_N//16)`` per-vector FP8 scale factors, already
+                un-swizzled (see ``_load_scales_swizzle``).
+            gds: per-tensor global *decode* scale from ``_nvfp4_global_scales``.
+
+        Returns ``(BLOCK_M, BLOCK_N//16, 16)`` FP32; reshape to ``(BLOCK_M, BLOCK_N)``
+        for a plain 2D view.
+        """
+        qa_f32_unpacked = convert_4xfp4_packed_to_8xfp32(qa_fp4)
+        qa_f32_blocked = qa_f32_unpacked.reshape(BLOCK_M, BLOCK_N // 16, 16)
+        return qa_f32_blocked * sfa[:, :, None] * gds
+
+    @triton.jit
     def _nvfp4_quantize(
         a_t_rht,
         global_amax,
@@ -278,23 +423,11 @@ if has_triton():
         a_vecs = tl.reshape(a_t_rht, [BLOCK_N, BLOCK_M // 16, 16])
         vec_max = tl.max(tl.abs(a_vecs), axis=-1, keep_dims=True)
 
-        is_global_amax = global_amax == 0
-        safe_global_amax = tl.where(is_global_amax, 1.0, global_amax)
-        # TE's scale bytes follow correctly-rounded FP32 division; Triton's normal
-        # "/" lowers through a reciprocal path that can flip FP8 midpoint ties.
-        global_scale_num = tl.full(
-            safe_global_amax.shape,
-            FP8_E4M3_MAX * FP4_E2M1_MAX,
-            safe_global_amax.dtype,
+        # Shared with the requantization kernels: they decode the saved forward
+        # weight with this exact scale, so it must be one implementation.
+        global_encode_scale, global_decode_scale = _nvfp4_global_scales(
+            global_amax, FP8_E4M3_MAX
         )
-        candidate = tl.div_rn(global_scale_num, safe_global_amax)
-        candidate = tl.minimum(candidate, FP32_MAX)
-        candidate = tl.where(candidate == 0, 1.0, candidate)
-        global_encode_scale = tl.where(is_global_amax, 1.0, candidate)
-        one = tl.full(
-            safe_global_amax.shape, 1.0, safe_global_amax.dtype
-        )  # div_rn needs a tensor numerator
-        global_decode_scale = tl.div_rn(one, global_encode_scale)
 
         # Cap at FP8_E4M3_MAX only, no lower clamp: pvscale is non-negative and TE
         # emits a zero per-vector scale for zero/near-zero vectors, so pinning small
@@ -389,6 +522,54 @@ if has_triton():
         tl.store(flat_ptrs, flat_val, mask=flat_msk)
 
     @triton.jit
+    def _load_scales_swizzle(
+        sf_ptr,
+        pid_outer,
+        pid_inner,
+        OUTER,
+        INNER,
+        BLOCK_OUTER: tl.constexpr,
+        BLOCK_INNER: tl.constexpr,
+    ):
+        """Load one swizzled scale tile and return its plain ``(outer, inner//16)`` view.
+
+        The read counterpart of ``_store_scales_swizzle``, needed by the
+        requantization kernels: they consume the swizzled E4M3 scales the forward
+        wrote and must undo the SWIZZLE_32_4_4 permutation on chip to reconstruct
+        ``W_qdq``.
+        """
+        BLOCK_OUTER_TILES: tl.constexpr = BLOCK_OUTER // 128
+        BLOCK_INNER_TILES: tl.constexpr = BLOCK_INNER // 64
+        FLAT_TILE: tl.constexpr = BLOCK_OUTER_TILES * BLOCK_INNER_TILES * TILE_ELEMS
+
+        INNER_TILES = tl.cdiv(INNER, 64)
+        OUTER_TILES = tl.cdiv(OUTER, 128)
+        rb_idx = pid_outer * BLOCK_OUTER_TILES + tl.arange(0, BLOCK_OUTER_TILES)
+        cb_idx = pid_inner * BLOCK_INNER_TILES + tl.arange(0, BLOCK_INNER_TILES)
+        elem_idx = tl.arange(0, TILE_ELEMS)
+        offsets = (
+            rb_idx[:, None, None].to(tl.int64) * INNER_TILES * TILE_ELEMS
+            + cb_idx[None, :, None] * TILE_ELEMS
+            + elem_idx[None, None, :]
+        )
+        mask = (
+            (rb_idx[:, None, None] < OUTER_TILES)
+            & (cb_idx[None, :, None] < INNER_TILES)
+            & (elem_idx[None, None, :] < TILE_ELEMS)
+        )
+        swizzled = tl.load(
+            sf_ptr + tl.reshape(offsets, (FLAT_TILE,)),
+            mask=tl.reshape(mask, (FLAT_TILE,)),
+            other=0.0,
+        )
+        swizzled = tl.reshape(
+            swizzled,
+            [BLOCK_OUTER_TILES, BLOCK_INNER_TILES, 32, 4, 4],
+        )
+        plain = tl.permute(swizzled, [0, 3, 2, 1, 4])
+        return tl.reshape(plain, [BLOCK_OUTER, BLOCK_INNER // 16])
+
+    @triton.jit
     def _store_grouped_scales_swizzle(
         scale_inv,
         sf_ptr,
@@ -443,11 +624,20 @@ else:
     def convert_8xfp32_to_4xfp4_packed(*args, **kwargs):
         raise RuntimeError("convert_8xfp32_to_4xfp4_packed requires Triton")
 
+    def convert_4xfp4_packed_to_8xfp32(*args, **kwargs):
+        raise RuntimeError("convert_4xfp4_packed_to_8xfp32 requires Triton")
+
     def convert_8xfp32_to_4xfp4_packed_rs(*args, **kwargs):
         raise RuntimeError("convert_8xfp32_to_4xfp4_packed_rs requires Triton")
 
     def _pack_fp4(*args, **kwargs):
         raise RuntimeError("_pack_fp4 requires Triton")
+
+    def _nvfp4_global_scales(*args, **kwargs):
+        raise RuntimeError("_nvfp4_global_scales requires Triton")
+
+    def _rescale_fp4(*args, **kwargs):
+        raise RuntimeError("_rescale_fp4 requires Triton")
 
     def _nvfp4_quantize(*args, **kwargs):
         raise RuntimeError("_nvfp4_quantize requires Triton")
@@ -457,6 +647,9 @@ else:
 
     def _store_scales_swizzle(*args, **kwargs):
         raise RuntimeError("_store_scales_swizzle requires Triton")
+
+    def _load_scales_swizzle(*args, **kwargs):
+        raise RuntimeError("_load_scales_swizzle requires Triton")
 
     def _store_grouped_scales_swizzle(*args, **kwargs):
         raise RuntimeError("_store_grouped_scales_swizzle requires Triton")

@@ -62,17 +62,38 @@ import torch
 
 from torchao.prototype.moe_training.nvfp4_training.hadamard_utils import (
     DEFAULT_SIGN_VECTOR,
+    get_dynamic_rht_matrix,
     get_rht_matrix,
 )
 from torchao.prototype.mx_formats.kernels import f32_to_f4_unpacked, pack_uint4
-from torchao.prototype.mx_formats.utils import to_blocked
+from torchao.prototype.mx_formats.utils import from_blocked, to_blocked
 
 FP4_E2M1_MAX = 6.0
 FP8_E4M3_MAX = 448.0
 _FP32_MAX = torch.finfo(torch.float32).max
 
 __all__ = [
+    "EDEN_BLOCK_SCALE_MAX",
     "NVFP4ReferenceOutput",
+    "decode_fp4_codes",
+    "reference_col_cast_requant_amax",
+    "reference_col_cast_requantize",
+    "reference_col_rht_requant_amax",
+    "reference_col_rht_requantize",
+    "reference_dequantize_rowwise",
+    "reference_dynamic_rht",
+    "reference_group_col_cast_requant_amax",
+    "reference_group_col_cast_requantize",
+    "reference_group_col_rht_requant_amax",
+    "reference_group_col_rht_requantize",
+    "reference_group_row_cast_col_rht_amax",
+    "reference_group_row_cast_col_rht_quantize",
+    "reference_group_row_cast_quantize",
+    "reference_group_row_rht_col_rht_amax",
+    "reference_row_cast_col_rht_amax",
+    "reference_row_cast_col_rht_quantize",
+    "reference_row_cast_quantize",
+    "reference_row_rht_col_rht_amax",
     "global_encode_scale",
     "nvfp4_reference_quantize",
     "reference_group_rht_amax",
@@ -118,10 +139,17 @@ def to_blocked_grouped(plain: torch.Tensor, group_sizes) -> torch.Tensor:
     return torch.cat(parts)
 
 
-def global_encode_scale(global_amax: torch.Tensor) -> torch.Tensor:
-    """``compute_global_encode_scaling_factor_FP4``: 2688 / amax, guarded at both ends."""
+def global_encode_scale(
+    global_amax: torch.Tensor, fp8_max: float = FP8_E4M3_MAX
+) -> torch.Tensor:
+    """``compute_global_encode_scaling_factor_FP4``: ``fp8_max * 6 / amax``, guarded.
+
+    ``fp8_max`` is 448 for every plain NVFP4 cast, giving the familiar 2688 numerator.
+    MS-EDEN operands pass 256, giving 1536: their block-scale ceiling is lower so the
+    stochastically-rounded scale correction has headroom.
+    """
     amax = global_amax.to(torch.float32)
-    candidate = torch.full_like(amax, FP8_E4M3_MAX * FP4_E2M1_MAX) / amax
+    candidate = torch.full_like(amax, fp8_max * FP4_E2M1_MAX) / amax
     candidate = candidate.clamp(max=_FP32_MAX)
     # amax == 0 gives inf; an enormous amax underflows the scale to zero. Both -> identity.
     return torch.where(
@@ -416,3 +444,342 @@ def reference_group_weight_quantize_2d(
     row_codes, row_scales = _stack([row for row, _ in per_expert], m, n)
     col_codes, col_scales = _stack([col for _, col in per_expert], n, m)
     return row_codes, row_scales, col_codes, col_scales
+
+
+# ---------------------------------------------------------------------------
+# V2 / V1_REQUANT oracles
+#
+# Everything below serves the recipes in ``nvfp4_recipe.py`` other than V1. Two
+# things are new relative to the section above: a dynamic (tensor-valued) sign
+# vector at Hadamard size 128, and dequantization -- the requantization ops consume
+# the *packed* forward weight, so the oracle has to reconstruct it the same way.
+# ---------------------------------------------------------------------------
+
+# MS-EDEN's block-scale ceiling, giving decode numerator 256 * 6 = 1536.
+EDEN_BLOCK_SCALE_MAX = 256.0
+
+# E2M1 magnitudes at magnitude codes 0..7. Bit 3 of a nibble is the sign.
+_FP4_MAGNITUDES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+
+
+def decode_fp4_codes(codes: torch.Tensor) -> torch.Tensor:
+    """(R, C//2) packed uint8 -> (R, C) float32 grid values, even element in the low
+    nibble.
+
+    Exact by construction: every E2M1 value is representable in float32, so this is
+    the inverse of ``pack_fp4`` with no rounding of its own.
+    """
+    lut = torch.tensor(_FP4_MAGNITUDES, dtype=torch.float32, device=codes.device)
+    lo = codes & 0xF
+    hi = codes >> 4
+    nibbles = torch.stack((lo, hi), dim=-1).reshape(codes.shape[0], -1).long()
+    magnitude = lut[nibbles & 0x7]
+    return torch.where(nibbles & 0x8 != 0, -magnitude, magnitude)
+
+
+def reference_dequantize_rowwise(
+    codes: torch.Tensor,
+    scales: torch.Tensor,
+    global_amax: torch.Tensor,
+    *,
+    is_swizzled: bool = True,
+    fp8_max: float = FP8_E4M3_MAX,
+) -> torch.Tensor:
+    """Reconstruct ``W_qdq`` in float32 from packed codes and E4M3 block scales.
+
+    The exact inverse of ``nvfp4_reference_quantize``'s scale chain:
+    ``value * f32(block_scale) * (1 / S_enc)``. Deliberately *not* routed through
+    ``NVFP4Tensor.dequantize``, which applies an ``E4M3_EPS`` floor and is therefore
+    only good to one fp8 ULP -- the requantization ops must be pinned bitwise.
+    """
+    rows = codes.shape[0]
+    cols = codes.shape[1] * 2
+    values = decode_fp4_codes(codes)
+    plain = (from_blocked(scales, rows, cols // 16) if is_swizzled else scales).float()
+    s_enc = global_encode_scale(global_amax, fp8_max)
+    decode = plain * (1.0 / s_enc)
+    return values * decode.repeat_interleave(16, dim=1)
+
+
+def reference_dynamic_rht(
+    A: torch.Tensor, sign_vector: torch.Tensor, *, transpose: bool
+) -> torch.Tensor:
+    """``A @ R`` or ``A.t() @ R`` where ``R = diag(sign_vector) @ H / sqrt(n)``.
+
+    ``n`` is read from ``sign_vector``'s length, so this serves both the RHT-16 and
+    RHT-128 paths. The bf16 downcast on the way out matches the kernels, which round
+    their fp32 Hadamard accumulator to bf16 before consuming it.
+    """
+    n = sign_vector.numel()
+    R = get_dynamic_rht_matrix(sign_vector, torch.bfloat16)
+    source = A.t().contiguous() if transpose else A
+    rows, cols = source.shape
+    return (
+        (source.reshape(-1, n).to(torch.bfloat16) @ R)
+        .reshape(rows, cols)
+        .to(torch.bfloat16)
+    )
+
+
+def reference_row_cast_col_rht_amax(
+    A: torch.Tensor, sign_vector: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """§11.8: ``(amax_rht_a_t, amax_a)`` -- transformed first, both scalar f32."""
+    return (
+        reference_dynamic_rht(A, sign_vector, transpose=True).float().abs().max(),
+        A.float().abs().max(),
+    )
+
+
+def reference_row_cast_col_rht_quantize(
+    A: torch.Tensor,
+    row_global_amax: torch.Tensor,
+    col_global_amax: torch.Tensor,
+    sign_vector: torch.Tensor,
+    *,
+    layout: str = "swizzled",
+) -> Tuple[NVFP4ReferenceOutput, NVFP4ReferenceOutput]:
+    """§11.9: ``(row, col)`` references, matching the op's rowwise-first return."""
+    row = nvfp4_reference_quantize(A, row_global_amax, block="1x16", layout=layout)
+    col = nvfp4_reference_quantize(
+        reference_dynamic_rht(A, sign_vector, transpose=True),
+        col_global_amax,
+        block="1x16",
+        layout=layout,
+    )
+    return row, col
+
+
+def reference_row_rht_col_rht_amax(
+    dy: torch.Tensor, dgrad_rht: torch.Tensor, wgrad_rht: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """§11.2: ``(amax_rht_dy, amax_rht_dy_t)`` -- rowwise first, both scalar f32.
+
+    ``dgrad_rht`` rotates the un-transposed tensor and ``wgrad_rht`` the transposed
+    one. Swapping them changes both outputs, which is the discriminating test.
+    """
+    return (
+        reference_dynamic_rht(dy, dgrad_rht, transpose=False).float().abs().max(),
+        reference_dynamic_rht(dy, wgrad_rht, transpose=True).float().abs().max(),
+    )
+
+
+def reference_row_cast_quantize(
+    W: torch.Tensor, global_amax: torch.Tensor, *, layout: str = "swizzled"
+) -> NVFP4ReferenceOutput:
+    """§11.1: rowwise 1x16 NVFP4, RTNE, no RHT, and **no columnwise output**.
+
+    Contrast ``reference_weight_quantize_2d``, which is 16x16 and returns a pair.
+    """
+    return nvfp4_reference_quantize(W, global_amax, block="1x16", layout=layout)
+
+
+def reference_col_cast_requant_amax(
+    row_fp4_w: torch.Tensor, row_sf_w: torch.Tensor, global_amax: torch.Tensor
+) -> torch.Tensor:
+    """§11.6: ``amax(abs(W_qdq.bf16().t()))``, scalar f32.
+
+    Equal to ``amax(abs(W_qdq))`` because a transpose does not change the element
+    set, and generally *not* equal to ``global_amax``, which bounds the original
+    weight rather than the quantized-dequantized one.
+    """
+    w_qdq = reference_dequantize_rowwise(row_fp4_w, row_sf_w, global_amax)
+    return w_qdq.to(torch.bfloat16).float().abs().max()
+
+
+def reference_col_cast_requantize(
+    row_fp4_w: torch.Tensor,
+    row_sf_w: torch.Tensor,
+    global_amax: torch.Tensor,
+    amax_w_qdq_t: torch.Tensor,
+    *,
+    layout: str = "swizzled",
+) -> NVFP4ReferenceOutput:
+    """§11.7: rowwise 1x16 NVFP4 of ``W_qdq.bf16().t()``."""
+    w_qdq = reference_dequantize_rowwise(row_fp4_w, row_sf_w, global_amax)
+    return nvfp4_reference_quantize(
+        w_qdq.to(torch.bfloat16).t().contiguous(),
+        amax_w_qdq_t,
+        block="1x16",
+        layout=layout,
+    )
+
+
+def reference_col_rht_requant_amax(
+    row_fp4_w: torch.Tensor,
+    row_sf_w: torch.Tensor,
+    global_amax: torch.Tensor,
+    dgrad_rht: torch.Tensor,
+) -> torch.Tensor:
+    """§11.4: ``amax(abs(W_qdq.bf16().t() @ R_n))``, scalar f32."""
+    w_qdq = reference_dequantize_rowwise(row_fp4_w, row_sf_w, global_amax)
+    rotated = reference_dynamic_rht(w_qdq.to(torch.bfloat16), dgrad_rht, transpose=True)
+    return rotated.float().abs().max()
+
+
+def reference_col_rht_requantize(
+    row_fp4_w: torch.Tensor,
+    row_sf_w: torch.Tensor,
+    global_amax: torch.Tensor,
+    amax_rht_w_qdq_t: torch.Tensor,
+    dgrad_rht: torch.Tensor,
+    *,
+    layout: str = "swizzled",
+) -> NVFP4ReferenceOutput:
+    """§11.5: rowwise 1x16 NVFP4 of ``W_qdq.bf16().t() @ R_n``."""
+    w_qdq = reference_dequantize_rowwise(row_fp4_w, row_sf_w, global_amax)
+    rotated = reference_dynamic_rht(w_qdq.to(torch.bfloat16), dgrad_rht, transpose=True)
+    return nvfp4_reference_quantize(
+        rotated, amax_rht_w_qdq_t, block="1x16", layout=layout
+    )
+
+
+# ---------------------------------------------------------------------------
+# Grouped V2 / V1_REQUANT oracles
+#
+# Every one of these is the corresponding linear oracle applied per group. That is
+# not a shortcut -- it *is* the specification: a grouped kernel is correct exactly
+# when each group matches the linear reference, and a kernel that is wrong only at
+# num_tensors > 1 has a group-index bug rather than a numerics bug.
+# ---------------------------------------------------------------------------
+
+
+def reference_group_row_cast_quantize(
+    W: torch.Tensor, global_amax: torch.Tensor, *, layout: str = "swizzled"
+):
+    """§11.1 per expert. ``W`` is ``(E, M, N)``; ``global_amax`` is ``(E,)``."""
+    return [
+        reference_row_cast_quantize(W[e], global_amax[e], layout=layout)
+        for e in range(W.shape[0])
+    ]
+
+
+def reference_group_col_cast_requant_amax(
+    row_fp4_w: torch.Tensor, row_sf_w: torch.Tensor, global_amax: torch.Tensor
+) -> torch.Tensor:
+    """§11.6 per expert -> ``(E,)`` float32."""
+    return torch.stack(
+        [
+            reference_col_cast_requant_amax(row_fp4_w[e], row_sf_w[e], global_amax[e])
+            for e in range(row_fp4_w.shape[0])
+        ]
+    )
+
+
+def reference_group_col_cast_requantize(
+    row_fp4_w: torch.Tensor,
+    row_sf_w: torch.Tensor,
+    global_amax: torch.Tensor,
+    amax_w_qdq_t: torch.Tensor,
+    *,
+    layout: str = "swizzled",
+):
+    """§11.7 per expert."""
+    return [
+        reference_col_cast_requantize(
+            row_fp4_w[e], row_sf_w[e], global_amax[e], amax_w_qdq_t[e], layout=layout
+        )
+        for e in range(row_fp4_w.shape[0])
+    ]
+
+
+def reference_group_col_rht_requant_amax(
+    row_fp4_w: torch.Tensor,
+    row_sf_w: torch.Tensor,
+    global_amax: torch.Tensor,
+    dgrad_rht: torch.Tensor,
+) -> torch.Tensor:
+    """§11.4 per expert -> ``(E,)`` float32. One ``dgrad_rht`` serves every expert."""
+    return torch.stack(
+        [
+            reference_col_rht_requant_amax(
+                row_fp4_w[e], row_sf_w[e], global_amax[e], dgrad_rht
+            )
+            for e in range(row_fp4_w.shape[0])
+        ]
+    )
+
+
+def reference_group_col_rht_requantize(
+    row_fp4_w: torch.Tensor,
+    row_sf_w: torch.Tensor,
+    global_amax: torch.Tensor,
+    amax_rht_w_qdq_t: torch.Tensor,
+    dgrad_rht: torch.Tensor,
+    *,
+    layout: str = "swizzled",
+):
+    """§11.5 per expert."""
+    return [
+        reference_col_rht_requantize(
+            row_fp4_w[e],
+            row_sf_w[e],
+            global_amax[e],
+            amax_rht_w_qdq_t[e],
+            dgrad_rht,
+            layout=layout,
+        )
+        for e in range(row_fp4_w.shape[0])
+    ]
+
+
+def reference_group_row_cast_col_rht_amax(
+    A: torch.Tensor,
+    sign_vector: torch.Tensor,
+    offsets: torch.Tensor,
+    num_tensors: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """§11.8 per group -> two ``(num_tensors,)`` float32 tensors, transformed first."""
+    col, row, start = [], [], 0
+    for size in _group_sizes(offsets, num_tensors):
+        group = A[start : start + size]
+        c, r = reference_row_cast_col_rht_amax(group, sign_vector)
+        col.append(c)
+        row.append(r)
+        start += size
+    return torch.stack(col), torch.stack(row)
+
+
+def reference_group_row_rht_col_rht_amax(
+    dy: torch.Tensor,
+    dgrad_rht: torch.Tensor,
+    wgrad_rht: torch.Tensor,
+    offsets: torch.Tensor,
+    num_tensors: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """§11.2 per group -> two ``(num_tensors,)`` float32 tensors, rowwise first."""
+    rows, cols, start = [], [], 0
+    for size in _group_sizes(offsets, num_tensors):
+        group = dy[start : start + size]
+        r, c = reference_row_rht_col_rht_amax(group, dgrad_rht, wgrad_rht)
+        rows.append(r)
+        cols.append(c)
+        start += size
+    return torch.stack(rows), torch.stack(cols)
+
+
+def reference_group_row_cast_col_rht_quantize(
+    A: torch.Tensor,
+    row_global_amax: torch.Tensor,
+    col_global_amax: torch.Tensor,
+    sign_vector: torch.Tensor,
+    offsets: torch.Tensor,
+    num_tensors: int,
+    *,
+    layout: str = "swizzled",
+):
+    """§11.9 per group -> a list of ``(row, col)`` reference pairs."""
+    out, start = [], 0
+    for g, size in enumerate(_group_sizes(offsets, num_tensors)):
+        group = A[start : start + size]
+        out.append(
+            reference_row_cast_col_rht_quantize(
+                group,
+                row_global_amax[g],
+                col_global_amax[g],
+                sign_vector,
+                layout=layout,
+            )
+        )
+        start += size
+    return out
