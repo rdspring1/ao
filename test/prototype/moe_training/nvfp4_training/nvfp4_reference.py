@@ -74,6 +74,7 @@ _FP32_MAX = torch.finfo(torch.float32).max
 
 __all__ = [
     "EDEN_BLOCK_SCALE_MAX",
+    "MSEdenReferenceOutput",
     "NVFP4ReferenceOutput",
     "decode_fp4_codes",
     "reference_col_cast_requant_amax",
@@ -90,6 +91,7 @@ __all__ = [
     "reference_group_row_cast_col_rht_quantize",
     "reference_group_row_cast_quantize",
     "reference_group_row_rht_col_rht_amax",
+    "reference_ms_eden",
     "reference_row_cast_col_rht_amax",
     "reference_row_cast_col_rht_quantize",
     "reference_row_cast_quantize",
@@ -157,10 +159,12 @@ def global_encode_scale(
     )
 
 
-def _block_scale(block_amax: torch.Tensor, s_enc: torch.Tensor) -> torch.Tensor:
+def _block_scale(
+    block_amax: torch.Tensor, s_enc: torch.Tensor, fp8_max: float = FP8_E4M3_MAX
+) -> torch.Tensor:
     """``compute_decoding_scaling_factor``: one rounding, upper clamp only."""
     scale = block_amax * (s_enc * (1.0 / FP4_E2M1_MAX))
-    return scale.clamp(max=FP8_E4M3_MAX).to(torch.float8_e4m3fn)
+    return scale.clamp(max=fp8_max).to(torch.float8_e4m3fn)
 
 
 def _encode_scale(block_scale_fp8: torch.Tensor, s_enc: torch.Tensor) -> torch.Tensor:
@@ -209,6 +213,7 @@ def nvfp4_reference_quantize(
     *,
     block: str = "1x16",
     layout: str = "plain",
+    fp8_max: float = FP8_E4M3_MAX,
 ) -> NVFP4ReferenceOutput:
     """NVFP4 quantize a 2-D tensor with TE's arithmetic.
 
@@ -219,6 +224,8 @@ def nvfp4_reference_quantize(
         block: ``"1x16"`` (activations) or ``"16x16"`` (2D weight scaling).
         layout: ``"plain"`` returns (R, C//16) scales; ``"swizzled"`` returns the
             ``to_blocked`` byte sequence the kernels emit.
+        fp8_max: block-scale ceiling. 448 for every plain NVFP4 cast; MS-EDEN passes
+            256 so the corrected scale has headroom before it overflows E4M3.
     """
     if block not in ("1x16", "16x16"):
         raise ValueError(f"block must be '1x16' or '16x16', got {block!r}")
@@ -227,8 +234,8 @@ def nvfp4_reference_quantize(
     block_rows = 1 if block == "1x16" else 16
 
     xf = x.float()
-    s_enc = global_encode_scale(global_amax)
-    block_scale = _block_scale(_block_amax(xf, block_rows), s_enc)
+    s_enc = global_encode_scale(global_amax, fp8_max)
+    block_scale = _block_scale(_block_amax(xf, block_rows), s_enc, fp8_max)
     enc = _encode_scale(block_scale, s_enc)
 
     # Broadcast the per-tile scale back over its elements.
@@ -499,6 +506,61 @@ def reference_dequantize_rowwise(
     s_enc = global_encode_scale(global_amax, fp8_max)
     decode = plain * (1.0 / s_enc)
     return values * decode.repeat_interleave(16, dim=1)
+
+
+@dataclass(frozen=True)
+class MSEdenReferenceOutput:
+    """The deterministic part of MS-EDEN -- everything up to the stochastic draw.
+
+    MS-EDEN's only random step is the E4M3 rounding of the corrected block scale, and
+    stochastic rounding is unbiased for whatever it rounds. So the FP4 codes are
+    seed-independent, and ``corrected_scale`` / ``ideal_dequant`` are the targets of
+    ``E[.]`` over the RNG *exactly* rather than approximately: the codes carry no
+    randomness, so they factor straight out of the expectation.
+
+    Note what ``ideal_dequant`` is not. It is not ``x``. The Eden correction
+    ``<v, v> / <v, q>`` rescales a block so its inner product with the input is
+    preserved, which is a different objective from reproducing the input, so
+    ``E[dequant]`` converges on the corrected reconstruction and stays a full FP4
+    quantization error away from ``x``.
+    """
+
+    codes: torch.Tensor  # (R, C//2) uint8, RTNE, identical for every seed
+    block_scale: torch.Tensor  # (R, C//16) float32, pre-correction E4M3 value
+    corrected_scale: torch.Tensor  # (R, C//16) float32, E[sampled scale]
+    ideal_dequant: torch.Tensor  # (R, C) float32, E[dequant]
+
+
+def reference_ms_eden(
+    x: torch.Tensor, global_amax: torch.Tensor
+) -> MSEdenReferenceOutput:
+    """MS-EDEN quantize a 2-D tensor, stopping short of the stochastic scale rounding.
+
+    The E4M3 ceiling is ``EDEN_BLOCK_SCALE_MAX`` rather than 448, which is what makes
+    the per-tensor numerator 1536. The per-block correction falls back to 1.0 where
+    the ratio is undefined -- a block that packs to all-zero codes has
+    ``<v, q> == 0`` -- matching the kernel's guard.
+    """
+    base = nvfp4_reference_quantize(
+        x, global_amax, block="1x16", layout="plain", fp8_max=EDEN_BLOCK_SCALE_MAX
+    )
+    rows, cols = base.values.shape
+    scaled = base.scaled.reshape(rows, cols // 16, 16)
+    values = decode_fp4_codes(base.codes).reshape(rows, cols // 16, 16)
+
+    ratio = (scaled * scaled).sum(dim=-1) / (scaled * values).sum(dim=-1)
+    correction = torch.where(torch.isfinite(ratio), ratio, torch.ones_like(ratio))
+
+    block_scale = base.block_scale.float()
+    corrected_scale = block_scale * correction
+    s_enc = global_encode_scale(global_amax, EDEN_BLOCK_SCALE_MAX)
+    decode = corrected_scale * (1.0 / s_enc)
+    return MSEdenReferenceOutput(
+        codes=base.codes,
+        block_scale=block_scale,
+        corrected_scale=corrected_scale,
+        ideal_dequant=(values * decode.unsqueeze(-1)).reshape(rows, cols),
+    )
 
 
 def reference_dynamic_rht(

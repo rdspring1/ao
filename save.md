@@ -92,21 +92,46 @@ Design doc §3 is therefore unimplemented by choice, and the kernel docstring sa
 Contract: remove the dead SR flag from §11.9 only. No kernel body written, no other
 op's schema touched, no behavior change for V1 or V1_REQUANT.
 
-### Reference gap, revised
+### MS-EDEN reference: written
 
-The four requantize oracles (§11.4-§11.7) already exist in `nvfp4_reference.py` and
-are asserted on by their test files. **MS-EDEN (§11.3) is the only missing
-reference.** Writing it needs, in order:
+`reference_ms_eden` now lives in `nvfp4_reference.py`, returning the deterministic
+half of MS-EDEN -- RTNE codes, the pre-correction block scale, the corrected fp32
+scale, and `ideal_dequant`. `fp8_max` is threaded through
+`nvfp4_reference_quantize` -> `_block_scale` (448 default, verified bitwise-neutral
+by the 825-test suite). The stochastic draw is **not** reproduced: the monorepo's
+`_philox4x32_10` reference was deliberately not ported, and the SR step is instead
+bounded by a converging hypothesis test.
 
-1. `fp8_max` threaded through `nvfp4_reference_quantize` -> `_block_scale` (it is
-   hardcoded 448 there; `global_encode_scale` already takes the parameter but the
-   caller drops it). Verify bitwise-neutral at the 448 default before building on it.
-2. The Eden correction, per 1x16 block:
-   `ratio = sum(scaled^2) / sum(scaled * dequant(codes))`, falling back to `1.0` when
-   `dot_cross == 0` or the ratio is non-finite; `sf *= ratio`.
-3. The SR of the corrected scale to E4M3 -- do **not** replicate Philox. Return the
-   pre-SR corrected fp32 scale and assert the kernel's byte is one of its two E4M3
-   neighbours. That pins steps 1-2 bitwise and bounds step 3 to two admissible values.
+Four §11.3 tests changed, all gated behind `_MS_EDEN_IMPLEMENTED`:
+
+* `test_ms_eden_is_unbiased` -- retargeted. It asserted `E[dequant] == dy @ R_n`,
+  which is a property MS-EDEN does not have: the codes are RTNE, so the only unbiased
+  step is the E4M3 rounding of the corrected block scale, and the expectation
+  converges on the Eden-corrected reconstruction instead. Measured at 128x256, the
+  old assertion would have *passed* at 0.0693 against its 0.02*max bar of 0.0869 --
+  a 20% margin on a false claim, equally likely to have become a spurious failure on
+  a different input. Now bounded at `5*SE + 1e-5*norm`, which tightens with `draws`.
+  It also passed `is_swizzled=False` where §11.3 returns swizzled scales.
+* `test_codes_are_rtne_from_the_pre_correction_scale` -- new. The assertion that
+  separates MS-EDEN from ordinary FP4 SR; a kernel that reached for
+  `_pack_fp4(..., STOCHASTIC_ROUNDING=True)` passes everything else in the file.
+* `test_each_rng_slice_drives_exactly_one_output` -- new. `rng_state` packs both axes
+  into one tensor, so a crossed slice correlates the two operands silently.
+* `test_codes_per_group_isolation` -- new, and the only multi-group numerics test
+  §11.3 has. Scales cannot be compared across group counts (the Philox counter is a
+  global element index), but codes can.
+
+Also ported `test_resampled_signs_change_the_output_without_retracing` (§11.2) from
+the monorepo: V2 resamples sign buffers in place, and neither failure mode -- graph
+retraced per microbatch, or the first draw baked in and cancellation lost -- raises.
+
+### Everything else in the monorepo suite is already covered
+
+Cancellation (x3) and the RHT matrix properties are in `test_rht_matrix.py`, which
+also has tests the monorepo lacks; forward/backward quality is in
+`test_nvfp4_linear_v2.py`. Not applicable: TP V2 (torchao raises by design) and
+everything four-over-six. `test_amax_rht_x_t_differs_from_plain_amax` is redundant
+against a bitwise reference match.
 
 ### CUDA ground truth (~/kitchen), for the record
 

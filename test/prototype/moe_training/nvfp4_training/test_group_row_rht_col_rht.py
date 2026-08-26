@@ -12,9 +12,12 @@ error, only a wrong gradient, so the tests that separate the two vectors are the
 important ones here.
 """
 
+import math
+
 import pytest
 import torch
 
+from ._assertions import assert_codes_bitwise
 from ._v2_marks import TRITON_AVAILABLE, kernel_gate, maybe_sm100
 from .nvfp4_reference import (
     reference_group_row_rht_col_rht_amax,
@@ -165,6 +168,51 @@ def test_zero_gradient_gives_zero_amaxes_without_nan():
     assert torch.equal(torch.stack(got), torch.zeros(2, 2, device="cuda"))
 
 
+@_needs_amax
+@torch.no_grad()
+def test_resampled_signs_change_the_output_without_retracing():
+    """V2 mutates its sign buffers in place, so they must stay runtime inputs.
+
+    ``resample_nvfp4_rht_signs`` copies a fresh draw into the live buffer every
+    accumulation microbatch. If the op lets the sign values into the traced graph,
+    one of two things happens and neither raises: the graph is retraced on every
+    draw, so each microbatch pays a compile, or the first draw is baked in, the
+    transform stops cancelling, and the gradient is quietly wrong. Counting graphs
+    is the only way to tell those apart from a working kernel, which is why this
+    asserts on the graph count as well as on the outputs moving.
+    """
+    graphs = []
+
+    def counting_backend(graph_module, _example_inputs):
+        graphs.append(graph_module)
+        return graph_module.forward
+
+    @torch.compile(backend=counting_backend, fullgraph=True)
+    def amax(dy, dgrad_rht, wgrad_rht, offs):
+        return triton_group_row_rht_col_rht_amax(
+            dy,
+            dgrad_rht,
+            wgrad_rht,
+            offs,
+            1,
+            dy.shape[0],
+            dy.shape[1],
+            VARYING_FIRST_DIM,
+            offs[-1:],
+        )
+
+    dy, offs = _packed([256], 512)
+    d, w = _signs(seed=0), _signs(seed=1)
+    first_row, first_col = amax(dy, d, w, offs)
+    d.copy_(_signs(seed=2))
+    w.copy_(_signs(seed=3))
+    second_row, second_col = amax(dy, d, w, offs)
+
+    assert len(graphs) == 1, f"resampling must not retrace; traced {len(graphs)} times"
+    assert not torch.equal(first_row, second_row), "rowwise amax must follow dgrad_rht"
+    assert not torch.equal(first_col, second_col), "colwise amax must follow wgrad_rht"
+
+
 # --- §11.3 ------------------------------------------------------------------
 
 
@@ -242,36 +290,190 @@ def test_fixed_rng_state_reproduces_bitwise():
 @_needs_ms_eden
 @torch.no_grad()
 def test_ms_eden_is_unbiased():
-    """The property MS-EDEN exists for: ``E[dequant(q(v))] == v`` over the RNG.
+    """``E[sampled scale] == corrected scale`` and ``E[dequant] == ideal_dequant``.
 
-    Averaged over many draws, the dequantized rowwise operand must converge on
-    ``dy @ R_n``. A biased quantizer would show a systematic offset that no number of
-    draws removes.
+    Deliberately *not* ``E[dequant] == dy @ R_n``. The FP4 codes are RTNE, so the only
+    unbiased step is the E4M3 rounding of the corrected block scale; the expectation
+    converges on the unrounded Eden-corrected reconstruction, which the correction
+    leaves a full FP4 quantization error away from the input. Asserting against the
+    input would be asserting a property MS-EDEN does not have.
+
+    The bound is five standard errors of the sample mean, so it tightens as ``draws``
+    grows. A fixed fraction of the tensor's magnitude would instead be satisfied by
+    any bias smaller than the residual FP4 error, which is most of them.
     """
+    from torchao.prototype.mx_formats.utils import from_blocked
+
     from .nvfp4_reference import (
         EDEN_BLOCK_SCALE_MAX,
         reference_dequantize_rowwise,
         reference_dynamic_rht,
+        reference_ms_eden,
     )
 
-    dy, offs = _packed([128], 256)
+    M, N = 128, 256
+    dy, offs = _packed([M], N)
     d, w = _signs(seed=0), _signs(seed=1)
     ar, ac = _amax(dy, d, w, offs, 1)
-    target = reference_dynamic_rht(dy, d, transpose=False).float()
+    ref = reference_ms_eden(reference_dynamic_rht(dy, d, transpose=False), ar[0])
 
     draws = 64
-    total = torch.zeros_like(target)
+    scales, dequants = [], []
     for i in range(draws):
         rng = torch.tensor([1, i, 2, i + 1000], dtype=torch.int64, device="cuda")
         _, _, row_codes, row_sf = triton_group_row_rht_col_rht_quantize_ms_eden(
-            dy, ar, ac, d, w, offs, 1, 128, 256, VARYING_FIRST_DIM, rng, offs[-1:]
+            dy, ar, ac, d, w, offs, 1, M, N, VARYING_FIRST_DIM, rng, offs[-1:]
         )
-        total += reference_dequantize_rowwise(
-            row_codes, row_sf, ar[0], is_swizzled=False, fp8_max=EDEN_BLOCK_SCALE_MAX
+        assert torch.equal(row_codes, ref.codes), (
+            "MS-EDEN codes are RTNE and must not move with the seed"
         )
-    mean = total / draws
-    scale = target.abs().max()
-    assert (mean - target).abs().mean() < 0.02 * scale
+        scales.append(from_blocked(row_sf, M, N // 16).float())
+        dequants.append(
+            reference_dequantize_rowwise(
+                row_codes, row_sf, ar[0], fp8_max=EDEN_BLOCK_SCALE_MAX
+            )
+        )
+
+    for samples, target, label in (
+        (torch.stack(scales), ref.corrected_scale, "block scale"),
+        (torch.stack(dequants), ref.ideal_dequant, "reconstruction"),
+    ):
+        mean = samples.mean(dim=0)
+        se = samples.std(dim=0, unbiased=True) / math.sqrt(draws)
+        assert (mean - target).norm() <= 5.0 * se.norm() + 1e-5 * target.norm(), (
+            f"{label} mean is biased away from the unrounded Eden target"
+        )
+
+
+@_needs_ms_eden
+@torch.no_grad()
+def test_codes_are_rtne_from_the_pre_correction_scale():
+    """Codes come from RTNE against the *original* block scale, not from FP4 SR.
+
+    MS-EDEN's randomness lives entirely in the block scale, so the codes have to be
+    reproducible bitwise from the pre-correction, pre-SR scale at every seed. This is
+    the assertion that separates MS-EDEN from ordinary NVFP4 stochastic rounding --
+    a kernel that reached for ``_pack_fp4(..., STOCHASTIC_ROUNDING=True)`` passes
+    every other test in this file. It also pins the whole deterministic chain at once:
+    RHT-128, the 256 ceiling, the block amax, the TE scale chain, RTNE and the packing.
+    """
+    from .nvfp4_reference import reference_dynamic_rht, reference_ms_eden
+
+    M, N = 256, 512
+    dy, offs = _packed([M], N, seed=2)
+    d, w = _signs(seed=0), _signs(seed=1)
+    ar, ac = _amax(dy, d, w, offs, 1)
+    row_ref = reference_ms_eden(reference_dynamic_rht(dy, d, transpose=False), ar[0])
+    col_ref = reference_ms_eden(reference_dynamic_rht(dy, w, transpose=True), ac[0])
+
+    for seed in (0, 1, 17, 29):
+        rng = torch.tensor([seed, 0, seed + 7, 0], dtype=torch.int64, device="cuda")
+        col_codes, _, row_codes, _ = triton_group_row_rht_col_rht_quantize_ms_eden(
+            dy, ar, ac, d, w, offs, 1, M, N, VARYING_FIRST_DIM, rng, offs[-1:]
+        )
+        assert_codes_bitwise(row_codes, row_ref.codes, f"rowwise codes @ seed {seed}")
+        assert_codes_bitwise(col_codes, col_ref.codes, f"colwise codes @ seed {seed}")
+
+
+@_needs_ms_eden
+@torch.no_grad()
+def test_each_rng_slice_drives_exactly_one_output():
+    """``rng_state`` is ``[col_seed, col_offset, row_seed, row_offset]``.
+
+    Both axes draw from one tensor, so a kernel that hands an axis the wrong slice
+    raises nothing -- it correlates the two operands' scales, which no shape or dtype
+    check catches. Same failure mode as the crossed sign vectors in §11.2, and the
+    same reason to test it explicitly.
+    """
+    M, N = 256, 512
+    dy, offs = _packed([M], N)
+    d, w = _signs(seed=0), _signs(seed=1)
+    ar, ac = _amax(dy, d, w, offs, 1)
+
+    def run(rng):
+        return triton_group_row_rht_col_rht_quantize_ms_eden(
+            dy,
+            ar,
+            ac,
+            d,
+            w,
+            offs,
+            1,
+            M,
+            N,
+            VARYING_FIRST_DIM,
+            torch.tensor(rng, dtype=torch.int64, device="cuda"),
+            offs[-1:],
+        )
+
+    base = run([1, 2, 3, 4])
+    for slot, name, drives_col in (
+        (0, "col_seed", True),
+        (1, "col_offset", True),
+        (2, "row_seed", False),
+        (3, "row_offset", False),
+    ):
+        rng = [1, 2, 3, 4]
+        rng[slot] += 100
+        col_codes, col_sf, row_codes, row_sf = run(rng)
+        assert torch.equal(col_codes, base[0]), "codes are RTNE and never move"
+        assert torch.equal(row_codes, base[2]), "codes are RTNE and never move"
+        moved, held = (col_sf, row_sf) if drives_col else (row_sf, col_sf)
+        moved_base, held_base = (base[1], base[3]) if drives_col else (base[3], base[1])
+        assert not torch.equal(moved, moved_base), f"{name} must move its own scales"
+        assert torch.equal(held, held_base), f"{name} must leave the other axis alone"
+
+
+@_needs_ms_eden
+@pytest.mark.parametrize("group_sizes", [[128, 128], [256, 128, 384]])
+@torch.no_grad()
+def test_codes_per_group_isolation(group_sizes):
+    """The only multi-group numerics test for §11.3.
+
+    Codes are RTNE and depend only on their own group's data and its own amax, so a
+    group's codes in a packed launch must equal its codes quantized alone. A
+    group-index bug -- wrong amax, or a tile straddling a boundary -- shows up here
+    and in none of the single-group tests above. Scales deliberately are not compared:
+    the Philox counter is derived from a global element index, so it legitimately
+    differs when the packed length does.
+    """
+    N = 512
+    E = len(group_sizes)
+    M = sum(group_sizes)
+    dy, offs = _packed(group_sizes, N, seed=3)
+    d, w = _signs(seed=0), _signs(seed=1)
+    ar, ac = _amax(dy, d, w, offs, E)
+    rng = torch.tensor([1, 2, 3, 4], dtype=torch.int64, device="cuda")
+    col_codes, _, row_codes, _ = triton_group_row_rht_col_rht_quantize_ms_eden(
+        dy, ar, ac, d, w, offs, E, M, N, VARYING_FIRST_DIM, rng, offs[-1:]
+    )
+
+    start = 0
+    for g, size in enumerate(group_sizes):
+        one = torch.tensor([size], dtype=torch.int32, device="cuda")
+        solo_col, _, solo_row, _ = triton_group_row_rht_col_rht_quantize_ms_eden(
+            dy[start : start + size].contiguous(),
+            ar[g : g + 1],
+            ac[g : g + 1],
+            d,
+            w,
+            one,
+            1,
+            size,
+            N,
+            VARYING_FIRST_DIM,
+            rng,
+            one,
+        )
+        assert_codes_bitwise(
+            row_codes[start : start + size], solo_row, f"rowwise codes[{g}]"
+        )
+        assert_codes_bitwise(
+            col_codes[:, start // 2 : (start + size) // 2],
+            solo_col,
+            f"colwise codes[{g}]",
+        )
+        start += size
 
 
 # --- wrapper layer, runs today ----------------------------------------------
