@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD 3-Clause license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Grouped rowwise-cast + columnwise-RHT quantize, dynamic signs. §11.9 (§2 and §3).
+"""Grouped rowwise-cast + columnwise-RHT quantize, dynamic signs. §11.9 (§2).
 
 The V2 forward activation quantize, producing per group both operands the recipe
 saves from one read of ``A``:
@@ -16,9 +16,9 @@ The RHT-128 dynamic-sign twin of the shipped ``triton_group_rht_quantize_row_col
 see ``group_row_cast_col_rht_amax_triton`` for why V2 needs its own op rather than
 an extra argument on the shipped one.
 
-``enable_stochastic_rounding`` selects between §2 (RTNE) and §3 (SR). It is a flag
-rather than a second op because the two differ only in the rounding mode of the FP4
-pack, and a second ``custom_op`` would duplicate the whole schema to express it.
+Both operands are RTNE. Design doc §3's stochastic-rounding variant is not implemented
+here: V2 casts only the forward activation through this op, and its backward gradient
+goes through MS-EDEN (§11.3) instead, so nothing in the recipe would set the flag.
 
 A dense linear is the degenerate ``num_tensors = 1`` case: ``offsets = [M]``.
 """
@@ -30,7 +30,7 @@ from torch.utils._triton import has_triton
 
 from torchao.utils import torch_version_at_least
 
-from .group_hadamard_utils import _validate_graph_amax, _validate_rng_state
+from .group_hadamard_utils import _validate_graph_amax
 
 RHT_SIZE = 128
 
@@ -65,7 +65,7 @@ if torch_version_at_least("2.10.0") and has_triton():
 
     @triton.autotune(
         configs=_GROUP_ROW_CAST_COL_RHT_QUANTIZE_CONFIGS,
-        key=["N", "STOCHASTIC_ROUNDING", "FAST_MATH"],
+        key=["N", "FAST_MATH"],
     )
     @triton.jit
     def _group_row_cast_col_rht_quantize_kernel(
@@ -78,14 +78,9 @@ if torch_version_at_least("2.10.0") and has_triton():
         global_amax_col_ptr,
         qa_t_ptr,
         sfa_t_ptr,
-        col_seed_base_ptr,
-        col_offset_base_ptr,
-        row_seed_base_ptr,
-        row_offset_base_ptr,
         M,
         N,
         num_tensors: tl.constexpr,
-        STOCHASTIC_ROUNDING: tl.constexpr,
         FAST_MATH: tl.constexpr,
         SHAPE_REP: tl.constexpr,
         BLOCK_M: tl.constexpr,
@@ -113,8 +108,7 @@ if torch_version_at_least("2.10.0") and has_triton():
                 col_sf, col_scaled = _nvfp4_quantize(
                     a_t_rht, tl.load(global_amax_col_ptr + group_idx),
                     BLOCK_N, BLOCK_M, FAST_MATH)
-                col_fp4 = _pack_fp4(col_scaled, BLOCK_N, BLOCK_M, STOCHASTIC_ROUNDING,
-                                    col_seed_base_ptr, col_offset_base_ptr, tile_idx)
+                col_fp4 = _pack_fp4(col_scaled, BLOCK_N, BLOCK_M, False, 0, 0, tile_idx)
                 _store_grouped_scales_swizzle(...)   # token axis is inner -> per-group
                 <store col_fp4 at qa_t_ptr[n, m], stride M // 2>
 
@@ -122,8 +116,7 @@ if torch_version_at_least("2.10.0") and has_triton():
                 row_sf, row_scaled = _nvfp4_quantize(
                     a, tl.load(global_amax_row_ptr + group_idx),
                     BLOCK_M, BLOCK_N, FAST_MATH)
-                row_fp4 = _pack_fp4(row_scaled, BLOCK_M, BLOCK_N, STOCHASTIC_ROUNDING,
-                                    row_seed_base_ptr, row_offset_base_ptr, tile_idx)
+                row_fp4 = _pack_fp4(row_scaled, BLOCK_M, BLOCK_N, False, 0, 0, tile_idx)
                 _store_scales_swizzle(...)           # token axis is outer -> contiguous
                 <store row_fp4 at qa_ptr[m, n], stride N // 2>
 
@@ -134,7 +127,7 @@ if torch_version_at_least("2.10.0") and has_triton():
         Rows at or beyond ``logical_packed_length`` are storage only and must be left
         zero-filled, not quantized.
         """
-        # TODO(nvfp4-v2): implement. See design doc §11.9 / §2 / §3.
+        # TODO(nvfp4-v2): implement. See design doc §11.9 / §2.
         tl.static_assert(
             False, "_group_row_cast_col_rht_quantize_kernel is not implemented"
         )
@@ -152,8 +145,6 @@ if torch_version_at_least("2.10.0") and has_triton():
         shape_rep: int,
         a_global_amax: torch.Tensor,
         d_global_amax: torch.Tensor,
-        rng_state: Optional[torch.Tensor],
-        enable_stochastic_rounding: bool,
         logical_packed_length: Optional[torch.Tensor] = None,
         use_fast_math: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -174,11 +165,6 @@ if torch_version_at_least("2.10.0") and has_triton():
                 the first element of that return. Taken post-RHT on purpose: a
                 pre-RHT amax under-bounds the rotated tile and every block scale
                 saturates.
-            rng_state: int64 CUDA tensor ``[col_seed, col_offset, row_seed,
-                row_offset]``, required when SR is on. The op forwards single-element
-                views and performs no host RNG, so the launch stays graph-safe; the
-                caller owns advancing the state across replays.
-            enable_stochastic_rounding: False selects §2 (RTNE), True selects §3 (SR).
             logical_packed_length: one-element int32 CUDA tensor, ``offsets[-1]``.
             use_fast_math: consume the FP32 RHT accumulator directly and take an
                 approximate reciprocal, matching TE under ``NVTE_USE_FAST_MATH=1``.
@@ -211,7 +197,6 @@ if torch_version_at_least("2.10.0") and has_triton():
             logical_packed_length,
             rht_size=RHT_SIZE,
         )
-        rng_state = _validate_rng_state(rng_state, A.device, enable_stochastic_rounding)
 
         qa_base = torch.empty(
             (packed_sequence_length, hidden_size // 2),
@@ -243,19 +228,6 @@ if torch_version_at_least("2.10.0") and has_triton():
         )
         sfd_return = sfd_storage.view(hidden_size, packed_sequence_length // 16)
 
-        if enable_stochastic_rounding:
-            col_seed_base = rng_state[0:1]
-            col_offset_base = rng_state[1:2]
-            row_seed_base = rng_state[2:3]
-            row_offset_base = rng_state[3:4]
-        else:
-            # Literal 0 is Triton's safe NULL pointer value; the kernel never
-            # dereferences these under STOCHASTIC_ROUNDING=False.
-            col_seed_base = 0
-            col_offset_base = 0
-            row_seed_base = 0
-            row_offset_base = 0
-
         m, n = A.shape
         if logical_packed_length is None:
             logical_packed_length = offsets[-1:]
@@ -270,14 +242,9 @@ if torch_version_at_least("2.10.0") and has_triton():
             col_amax,
             qd,
             sfd_storage,
-            col_seed_base,
-            col_offset_base,
-            row_seed_base,
-            row_offset_base,
             m,
             n,
             num_tensors=num_tensors,
-            STOCHASTIC_ROUNDING=enable_stochastic_rounding,
             FAST_MATH=use_fast_math,
             SHAPE_REP=shape_rep,
             BLOCK_M=BLOCK_M,
@@ -298,8 +265,6 @@ if torch_version_at_least("2.10.0") and has_triton():
         shape_rep,
         a_global_amax,
         d_global_amax,
-        rng_state,
-        enable_stochastic_rounding,
         logical_packed_length=None,
         use_fast_math=False,
     ):
@@ -327,8 +292,6 @@ else:
         shape_rep: int,
         a_global_amax: torch.Tensor,
         d_global_amax: torch.Tensor,
-        rng_state,
-        enable_stochastic_rounding: bool,
         logical_packed_length: Optional[torch.Tensor] = None,
         use_fast_math: bool = False,
     ):

@@ -214,8 +214,6 @@ class _NVFP4LinearV2(torch.autograd.Function):
             VARYING_FIRST_DIM,
             amax_x,
             amax_rht_x_t,
-            None,
-            False,  # RTNE in forward
             offsets,
             use_fast_math,
         )

@@ -282,8 +282,6 @@ class _NVFP4GroupedMMV2(torch.autograd.Function):
             VARYING_FIRST_DIM,
             amax_x,
             amax_rht_x_t,
-            None,
-            False,
             logical_packed_length,
             use_fast_math,
         )

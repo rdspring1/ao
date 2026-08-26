@@ -67,6 +67,62 @@ the `_grouped_mm` seam and the DTensor/spmd preamble is not duplicated.
 - 30+ new wrapper-layer tests pass today (validation, `register_fake`, cadence, RHT matrix).
 - `ruff check --select F,I` and `ruff format` clean.
 
+## What changed since cb564fac
+
+**Removed the stochastic-rounding arm of §11.9.** `enable_stochastic_rounding` /
+`rng_state` on `triton_group_row_cast_col_rht_quantize` had no caller: both V2
+forwards (`nvfp4_linear_v2.py`, `nvfp4_grouped_mm_v2.py`) passed `None, False`,
+because V2's backward gradient goes through MS-EDEN (§11.3) rather than through
+FP4 SR. The flag was copied from the shipped V1 op `triton_group_rht_quantize_row_col`,
+where it *is* load-bearing -- `nvfp4_grouped_mm.py` calls it with `False` in forward
+and `True` in backward -- and that op is untouched, as is `_validate_rng_state`
+(still used by §11.3 and the V1 path).
+
+Dropped from the schema, `register_fake`, the no-Triton fallback, the kernel
+signature (four seed/offset pointers + the `STOCHASTIC_ROUNDING` constexpr) and the
+autotune key, which is now `("N", "FAST_MATH")`. Three tests deleted:
+`test_stochastic_rounding_is_reproducible_and_offset_sensitive`,
+`test_rtne_and_sr_agree_on_exactly_representable_input`,
+`test_stochastic_rounding_requires_an_rng_state`.
+
+Design doc §3 is therefore unimplemented by choice, and the kernel docstring says so.
+
+### Preflight
+
+Contract: remove the dead SR flag from §11.9 only. No kernel body written, no other
+op's schema touched, no behavior change for V1 or V1_REQUANT.
+
+### Reference gap, revised
+
+The four requantize oracles (§11.4-§11.7) already exist in `nvfp4_reference.py` and
+are asserted on by their test files. **MS-EDEN (§11.3) is the only missing
+reference.** Writing it needs, in order:
+
+1. `fp8_max` threaded through `nvfp4_reference_quantize` -> `_block_scale` (it is
+   hardcoded 448 there; `global_encode_scale` already takes the parameter but the
+   caller drops it). Verify bitwise-neutral at the 448 default before building on it.
+2. The Eden correction, per 1x16 block:
+   `ratio = sum(scaled^2) / sum(scaled * dequant(codes))`, falling back to `1.0` when
+   `dot_cross == 0` or the ratio is non-finite; `sf *= ratio`.
+3. The SR of the corrected scale to E4M3 -- do **not** replicate Philox. Return the
+   pre-SR corrected fp32 scale and assert the kernel's byte is one of its two E4M3
+   neighbours. That pins steps 1-2 bitwise and bounds step 3 to two admissible values.
+
+### CUDA ground truth (~/kitchen), for the record
+
+Only two stubs have a single-kernel counterpart: §11.1 ->
+`quantize_transpose_vector_blockwise_fp4` (`return_identity=True`), and §11.3's
+MS-EDEN epilogue -> `quantize_transpose_vector_blockwise_fp4_eden`. §11.2/§11.8/§11.9
+must be composed from `hadamard_transform_sm90_plus[_amax]` plus a quantize op --
+and at dimension 128 kitchen returns only *one* of identity/transposed per call, so
+§11.2 needs two. The fused RHT+quantize kernel `quant_nvfp4_optionally_hadamard16`
+is RHT-16 only (uint16 sign mask) and is not a reference for any V2 stub. §11.4-§11.7
+have no kitchen kernel at all: nothing there consumes packed FP4 as input.
+
+Note the monorepo's V2 casts with **four-over-six**; torchao's does not
+(`NVFP4_CAST_NUMERATOR = 448*6`). `test_cuda_equiv_four_over_six.py` is therefore not
+a spec for §11.1 or §11.9.
+
 ## Next action
 
 Write the `@triton.jit` bodies, starting with **Phase A** (no RHT, unblocks

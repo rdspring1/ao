@@ -172,8 +172,6 @@ def test_quantize_matches_the_reference_per_group(group_sizes):
         VARYING_FIRST_DIM,
         row_amax,
         col_amax,
-        None,
-        False,
         offs[-1:],
         False,
     )
@@ -209,8 +207,6 @@ def test_rowwise_output_is_unchanged_by_the_sign_vector():
                 VARYING_FIRST_DIM,
                 ra,
                 ca,
-                None,
-                False,
                 offs,
                 False,
             )
@@ -218,84 +214,6 @@ def test_rowwise_output_is_unchanged_by_the_sign_vector():
     assert_codes_bitwise(outs[0][0], outs[1][0], "rowwise codes")
     assert_scales_bitwise(outs[0][1], outs[1][1], "rowwise scales")
     assert not torch.equal(outs[0][2], outs[1][2]), "columnwise codes must change"
-
-
-@_needs_quantize
-@torch.no_grad()
-def test_stochastic_rounding_is_reproducible_and_offset_sensitive():
-    A, offs = _packed([256], 512)
-    sv = _signs()
-    ca, ra = triton_group_row_cast_col_rht_amax(
-        A, sv, offs, 1, 256, 512, VARYING_FIRST_DIM, offs[-1:]
-    )
-
-    def run(rng):
-        return triton_group_row_cast_col_rht_quantize(
-            A,
-            sv,
-            offs,
-            1,
-            256,
-            512,
-            VARYING_FIRST_DIM,
-            ra,
-            ca,
-            torch.tensor(rng, dtype=torch.int64, device="cuda"),
-            True,
-            offs[-1:],
-            False,
-        )
-
-    a = run([11, 22, 33, 44])
-    b = run([11, 22, 33, 44])
-    c = run([11, 99, 33, 44])
-    assert_codes_bitwise(a[0], b[0], "fixed state must reproduce bitwise")
-    assert not torch.equal(a[2], c[2]), "a different col offset must change col codes"
-
-
-@_needs_quantize
-@torch.no_grad()
-def test_rtne_and_sr_agree_on_exactly_representable_input():
-    """Stochastic rounding is a no-op when nothing needs rounding."""
-    torch.manual_seed(0)
-    sign = torch.where(torch.rand(256, 512, device="cuda") >= 0.5, 1.0, -1.0)
-    A = (sign * 6.0).bfloat16()
-    offs = torch.tensor([256], dtype=torch.int32, device="cuda")
-    sv = _signs()
-    ca, ra = triton_group_row_cast_col_rht_amax(
-        A, sv, offs, 1, 256, 512, VARYING_FIRST_DIM, offs[-1:]
-    )
-    rtne = triton_group_row_cast_col_rht_quantize(
-        A,
-        sv,
-        offs,
-        1,
-        256,
-        512,
-        VARYING_FIRST_DIM,
-        ra,
-        ca,
-        None,
-        False,
-        offs[-1:],
-        False,
-    )
-    sr = triton_group_row_cast_col_rht_quantize(
-        A,
-        sv,
-        offs,
-        1,
-        256,
-        512,
-        VARYING_FIRST_DIM,
-        ra,
-        ca,
-        torch.tensor([1, 2, 3, 4], dtype=torch.int64, device="cuda"),
-        True,
-        offs[-1:],
-        False,
-    )
-    assert_codes_bitwise(sr[0], rtne[0], "rowwise SR on representable input")
 
 
 # --- wrapper layer, runs today ----------------------------------------------
@@ -326,8 +244,6 @@ def test_register_fake_shapes():
             VARYING_FIRST_DIM,
             amax,
             amax,
-            None,
-            False,
             None,
             False,
         )
@@ -362,29 +278,4 @@ def test_sign_vector_must_be_a_128_element_device_tensor():
     with pytest.raises((TypeError, RuntimeError)):
         triton_group_row_cast_col_rht_amax(
             A, tuple(range(128)), offs, E, M, N, VARYING_FIRST_DIM, offs[-1:]
-        )
-
-
-@maybe_sm100
-@torch.no_grad()
-def test_stochastic_rounding_requires_an_rng_state():
-    M, N, E = 512, 256, 2
-    A = torch.randn(M, N, dtype=torch.bfloat16, device="cuda")
-    offs = torch.tensor([256, 512], dtype=torch.int32, device="cuda")
-    amax = torch.ones(E, dtype=torch.float32, device="cuda")
-    with pytest.raises(TypeError, match="rng_state must be a torch.Tensor"):
-        triton_group_row_cast_col_rht_quantize(
-            A,
-            torch.ones(128, dtype=torch.int8, device="cuda"),
-            offs,
-            E,
-            M,
-            N,
-            VARYING_FIRST_DIM,
-            amax,
-            amax,
-            None,
-            True,
-            offs[-1:],
-            False,
         )
