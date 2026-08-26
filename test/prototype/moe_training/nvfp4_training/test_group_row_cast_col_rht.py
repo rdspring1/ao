@@ -175,14 +175,17 @@ def test_quantize_matches_the_reference_per_group(group_sizes):
         offs[-1:],
         False,
     )
-    refs = reference_group_row_cast_col_rht_quantize(A, row_amax, col_amax, sv, offs, E)
-    start = 0
-    for g, size in enumerate(group_sizes):
-        row_ref, _ = refs[g]
-        assert_codes_bitwise(
-            row_codes[start : start + size], row_ref.codes, f"row codes[{g}]"
-        )
-        start += size
+    ref_row_codes, ref_row_sf, ref_col_codes, ref_col_sf = (
+        reference_group_row_cast_col_rht_quantize(A, row_amax, col_amax, sv, offs, E)
+    )
+    assert_codes_bitwise(row_codes, ref_row_codes, "row codes")
+    assert_scales_bitwise(row_sf, ref_row_sf, "row scales")
+    assert_codes_bitwise(col_codes, ref_col_codes, "col codes")
+    # The columnwise scales are the assertion this test exists for. Their swizzle
+    # tiling restarts at every group boundary, so a whole-extent blocking -- the
+    # natural thing to write when pasting the rowwise store -- puts every group but
+    # the first at the wrong offset, which the GEMM reads without complaint.
+    assert_scales_bitwise(col_sf, ref_col_sf, "col scales")
 
 
 @_needs_quantize

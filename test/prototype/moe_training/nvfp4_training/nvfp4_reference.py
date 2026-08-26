@@ -77,6 +77,7 @@ __all__ = [
     "MSEdenReferenceOutput",
     "NVFP4ReferenceOutput",
     "decode_fp4_codes",
+    "from_blocked_grouped",
     "reference_col_cast_requant_amax",
     "reference_col_cast_requantize",
     "reference_col_rht_requant_amax",
@@ -91,6 +92,7 @@ __all__ = [
     "reference_group_row_cast_col_rht_quantize",
     "reference_group_row_cast_quantize",
     "reference_group_row_rht_col_rht_amax",
+    "reference_group_row_rht_col_rht_quantize_ms_eden",
     "reference_ms_eden",
     "reference_row_cast_col_rht_amax",
     "reference_row_cast_col_rht_quantize",
@@ -139,6 +141,26 @@ def to_blocked_grouped(plain: torch.Tensor, group_sizes) -> torch.Tensor:
         parts.append(to_blocked(plain[:, col : col + width]).flatten())
         col += width
     return torch.cat(parts)
+
+
+def from_blocked_grouped(blocked: torch.Tensor, rows: int, group_sizes) -> torch.Tensor:
+    """Inverse of ``to_blocked_grouped``: grouped blocked buffer -> plain (rows, cols).
+
+    Each group was blocked over its own extent, so each has to be un-blocked over its
+    own extent too. Group row counts are 128-aligned, which makes every group's width
+    a multiple of 4 and therefore its blocked buffer exactly ``rows * width`` elements
+    with no tile padding to skip.
+    """
+    flat = blocked.flatten()
+    parts, pos = [], 0
+    for size in group_sizes:
+        width = size // 16
+        count = rows * width
+        parts.append(
+            from_blocked(flat[pos : pos + count].reshape(rows, width), rows, width)
+        )
+        pos += count
+    return torch.cat(parts, dim=1)
 
 
 def global_encode_scale(
@@ -827,21 +849,87 @@ def reference_group_row_cast_col_rht_quantize(
     sign_vector: torch.Tensor,
     offsets: torch.Tensor,
     num_tensors: int,
-    *,
-    layout: str = "swizzled",
-):
-    """§11.9 per group -> a list of ``(row, col)`` reference pairs."""
-    out, start = [], 0
-    for g, size in enumerate(_group_sizes(offsets, num_tensors)):
-        group = A[start : start + size]
-        out.append(
-            reference_row_cast_col_rht_quantize(
-                group,
-                row_global_amax[g],
-                col_global_amax[g],
-                sign_vector,
-                layout=layout,
-            )
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """§11.9 per group -> ``(row_codes, row_sf, col_codes, col_sf)``.
+
+    Assembled into the kernel's whole-buffer shapes rather than returned per group,
+    because the columnwise scale buffer cannot be checked group by group: it puts the
+    grouped token axis on the inner, 64-blocked side, so its swizzle tiling restarts
+    at every group boundary and only the assembled byte sequence is meaningful. That
+    is the same reason ``reference_group_rht_quantize_row_col`` is shaped this way,
+    and the layout this is guarding is the one a mispasted columnwise store gets wrong.
+    """
+    psl, hidden = A.shape
+    sizes = _group_sizes(offsets, num_tensors)
+
+    row_codes = A.new_zeros((psl, hidden // 2), dtype=torch.uint8)
+    row_sf_plain = A.new_zeros((psl, hidden // 16), dtype=torch.float8_e4m3fn)
+    col_codes = A.new_zeros((hidden, psl // 2), dtype=torch.uint8)
+    col_sf_blocks = []
+
+    start = 0
+    for g, size in enumerate(sizes):
+        end = start + size
+        row, col = reference_row_cast_col_rht_quantize(
+            A[start:end],
+            row_global_amax[g],
+            col_global_amax[g],
+            sign_vector,
+            layout="plain",
         )
+        row_codes[start:end] = row.codes
+        row_sf_plain[start:end] = row.scales
+        col_codes[:, start // 2 : end // 2] = col.codes
+        col_sf_blocks.append(col.scales)
         start += size
-    return out
+
+    row_sf = to_blocked(row_sf_plain).view(psl, hidden // 16)
+    col_sf = to_blocked_grouped(torch.cat(col_sf_blocks, dim=1), sizes).view(
+        hidden, psl // 16
+    )
+    return row_codes, row_sf, col_codes, col_sf
+
+
+def reference_group_row_rht_col_rht_quantize_ms_eden(
+    dy: torch.Tensor,
+    amax_rht_dy: torch.Tensor,
+    amax_rht_dy_t: torch.Tensor,
+    dgrad_rht: torch.Tensor,
+    wgrad_rht: torch.Tensor,
+    offsets: torch.Tensor,
+    num_tensors: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """§11.3 per group -> ``(col_codes, col_scale, row_codes, row_scale)``.
+
+    Columnwise first, matching the op. The codes are assembled into the kernel's
+    whole-buffer shapes and are exact; the scales are the *unrounded corrected*
+    fp32 scales in plain layout, since the kernel's bytes are one stochastic draw
+    away and can only be bounded, not matched. Compare them after unswizzling --
+    ``from_blocked`` for the rowwise buffer, ``from_blocked_grouped`` for the
+    columnwise one, whose tiling restarts at each group boundary.
+    """
+    psl, hidden = dy.shape
+    sizes = _group_sizes(offsets, num_tensors)
+
+    row_codes = dy.new_zeros((psl, hidden // 2), dtype=torch.uint8)
+    row_scale = dy.new_zeros((psl, hidden // 16), dtype=torch.float32)
+    col_codes = dy.new_zeros((hidden, psl // 2), dtype=torch.uint8)
+    col_scale = dy.new_zeros((hidden, psl // 16), dtype=torch.float32)
+
+    start = 0
+    for g, size in enumerate(sizes):
+        end = start + size
+        group = dy[start:end]
+        row = reference_ms_eden(
+            reference_dynamic_rht(group, dgrad_rht, transpose=False), amax_rht_dy[g]
+        )
+        col = reference_ms_eden(
+            reference_dynamic_rht(group, wgrad_rht, transpose=True), amax_rht_dy_t[g]
+        )
+        row_codes[start:end] = row.codes
+        row_scale[start:end] = row.corrected_scale
+        col_codes[:, start // 2 : end // 2] = col.codes
+        col_scale[:, start // 16 : end // 16] = col.corrected_scale
+        start += size
+
+    return col_codes, col_scale, row_codes, row_scale

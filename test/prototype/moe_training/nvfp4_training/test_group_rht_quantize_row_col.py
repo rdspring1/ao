@@ -44,6 +44,7 @@ from test.prototype.moe_training.nvfp4_training._assertions import (
     assert_scales_bitwise,
 )
 from test.prototype.moe_training.nvfp4_training.nvfp4_reference import (
+    from_blocked_grouped,
     reference_group_rht_quantize_row_col,
     to_blocked_grouped,
 )
@@ -61,8 +62,6 @@ from torchao.prototype.mx_formats.nvfp4_tensor import (
 )
 from torchao.prototype.mx_formats.utils import from_blocked, to_blocked
 from torchao.utils import is_sm_at_least_100, torch_version_at_least
-
-_TILE_ELEMS = 32 * 16  # elements in one swizzled scale tile
 
 if has_triton() and is_sm_at_least_100() and torch_version_at_least("2.10.0"):
     from torchao.prototype.moe_training.nvfp4_training.group_hadamard_amax_triton import (
@@ -196,24 +195,6 @@ def _assert_scales_adjacent(got: torch.Tensor, ref: torch.Tensor, label: str) ->
     )
 
 
-def _from_blocked_grouped(sfd, hidden, group_sizes):
-    """De-swizzle a columnwise scale buffer, whose groups are blocked separately.
-
-    The columnwise scales put the grouped token axis on the 64-blocked inner
-    side, so each group is blocked on its own extent and the buffers are
-    concatenated flat -- one whole-extent de-swizzle would read the wrong tiles
-    for every group. The rowwise buffer needs no equivalent: there the grouped
-    axis is the outer one, where a group is already contiguous.
-    """
-    out, base = [], 0
-    for m in group_sizes:
-        span = (hidden // 128) * (m // 64) * _TILE_ELEMS
-        chunk = sfd.reshape(-1)[base : base + span].reshape(hidden, m // 16)
-        out.append(from_blocked(chunk, hidden, m // 16))
-        base += span
-    return torch.cat(out, dim=1)
-
-
 def _make_rng_state(device, values=(1, 2, 3, 4)) -> torch.Tensor:
     """[col_seed, col_offset, row_seed, row_offset] caller-owned Philox state."""
     return torch.tensor(list(values), dtype=torch.int64, device=device)
@@ -302,7 +283,7 @@ def triton_group_rht_quantize_row_col_ref(
     expected_row_sf = torch.empty(
         (psl, hs // 16), dtype=torch.float8_e4m3fn, device=A.device
     )
-    col_sf_plain = _from_blocked_grouped(sfd, hs, spec.groups)
+    col_sf_plain = from_blocked_grouped(sfd, hs, spec.groups)
     row_sf_plain = from_blocked(sfa, psl, hs // 16)
 
     row_offset = 0
@@ -456,8 +437,8 @@ def test_group_rht_fast_math_sqnr(graph_case, kernel):
     row_sqnr = compute_error(e_row, f_row)
     assert row_sqnr >= 25.0, f"Row fast-vs-exact SQNR {row_sqnr:.2f} dB < 25.0 dB"
 
-    e_col_sf = _from_blocked_grouped(e_sfd, hs, spec.groups)
-    f_col_sf = _from_blocked_grouped(f_sfd, hs, spec.groups)
+    e_col_sf = from_blocked_grouped(e_sfd, hs, spec.groups)
+    f_col_sf = from_blocked_grouped(f_sfd, hs, spec.groups)
     col_sqnr = compute_error(
         _dequantize_plain(e_qd, e_col_sf, amax_col[0]),
         _dequantize_plain(f_qd, f_col_sf, amax_col[0]),
@@ -634,7 +615,7 @@ def test_group_rht_padded_capacity_masks_spare_rows(kernel):
     actual_sfa_plain = from_blocked(actual_sfa, capacity_rows, hidden_size // 16)
     # Only the one group's extent: the capacity tail lies past every group's
     # blocked buffer, so it is not part of the columnwise scale layout at all.
-    actual_sfd_plain = _from_blocked_grouped(actual_sfd, hidden_size, (logical_rows,))
+    actual_sfd_plain = from_blocked_grouped(actual_sfd, hidden_size, (logical_rows,))
 
     assert torch.equal(actual_qa[:logical_rows], expected_qa)
     assert torch.equal(

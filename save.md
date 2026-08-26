@@ -125,6 +125,41 @@ Also ported `test_resampled_signs_change_the_output_without_retracing` (§11.2) 
 the monorepo: V2 resamples sign buffers in place, and neither failure mode -- graph
 retraced per microbatch, or the first draw baked in and cancellation lost -- raises.
 
+### Grouped references: assembled buffers, not per-group pairs
+
+`reference_group_row_cast_col_rht_quantize` (§11.9) and the new
+`reference_group_row_rht_col_rht_quantize_ms_eden` (§11.3) return the kernel's
+whole-buffer shapes. They have to: the columnwise scale buffer puts the grouped token
+axis on the inner, 64-blocked side, so its swizzle tiling restarts at every group
+boundary and only the assembled byte sequence means anything. Per-group pairs are why
+§11.9's test previously asserted rowwise codes and nothing else -- three of its four
+outputs, including that columnwise scale buffer, were unchecked.
+
+§11.3's scale bytes are one stochastic draw from the reference, so they are bounded
+rather than matched: `assert_scales_adjacent(..., max_ulps=1)`. SR always lands on one
+of the two E4M3 neighbours of the value it rounds and positive E4M3 bytes are
+magnitude-monotonic, so one ULP is exact. The bound is loose on value and tight on
+*position* -- a scale written to the wrong offset lands nowhere near its neighbour
+pair -- which is what makes it a swizzle-layout guard without touching Philox.
+
+`from_blocked_grouped` now lives beside its `to_blocked_grouped` inverse in
+`nvfp4_reference.py`; it replaced an identical private copy in
+`test_group_rht_quantize_row_col.py` and that file's five call sites now import it.
+
+### Note for whoever pastes §11.8 / §11.9
+
+Their bodies are copies of the shipped V1 kernels. `_group_rht_amax_triton_kernel` is
+already generic -- it takes `RHT_SIZE: tl.constexpr` and the wrapper derives
+`rht_size = B.shape[0]` -- so §11.8 is verbatim. `group_rht_quantize_row_col_triton.py`
+is *not*: lines 126 and 131 hardcode the RHT size. Those are the only two RHT-sized
+literals in the file; every other `16` is the NVFP4 1x16 scaling block, which stays 16.
+Change one and not the other and you get a well-formed tensor full of garbage, caught
+by the columnwise assertions added above and by nothing else.
+
+RHT-128 is intrinsically 8x the transform FLOPs of RHT-16 per tile (128/16). That is
+the recipe's cost, not an implementation artifact, and CuteDSL will not recover it.
+What may need retuning is register pressure from the 128x128 bf16 fragment.
+
 ### Everything else in the monorepo suite is already covered
 
 Cancellation (x3) and the RHT matrix properties are in `test_rht_matrix.py`, which

@@ -17,7 +17,7 @@ import math
 import pytest
 import torch
 
-from ._assertions import assert_codes_bitwise
+from ._assertions import assert_codes_bitwise, assert_scales_adjacent
 from ._v2_marks import TRITON_AVAILABLE, kernel_gate, maybe_sm100
 from .nvfp4_reference import (
     reference_group_row_rht_col_rht_amax,
@@ -315,19 +315,21 @@ def test_ms_eden_is_unbiased():
     dy, offs = _packed([M], N)
     d, w = _signs(seed=0), _signs(seed=1)
     ar, ac = _amax(dy, d, w, offs, 1)
-    ref = reference_ms_eden(reference_dynamic_rht(dy, d, transpose=False), ar[0])
+    row_ref = reference_ms_eden(reference_dynamic_rht(dy, d, transpose=False), ar[0])
+    col_ref = reference_ms_eden(reference_dynamic_rht(dy, w, transpose=True), ac[0])
 
     draws = 64
-    scales, dequants = [], []
+    row_scales, col_scales, dequants = [], [], []
     for i in range(draws):
         rng = torch.tensor([1, i, 2, i + 1000], dtype=torch.int64, device="cuda")
-        _, _, row_codes, row_sf = triton_group_row_rht_col_rht_quantize_ms_eden(
+        _, col_sf, row_codes, row_sf = triton_group_row_rht_col_rht_quantize_ms_eden(
             dy, ar, ac, d, w, offs, 1, M, N, VARYING_FIRST_DIM, rng, offs[-1:]
         )
-        assert torch.equal(row_codes, ref.codes), (
+        assert torch.equal(row_codes, row_ref.codes), (
             "MS-EDEN codes are RTNE and must not move with the seed"
         )
-        scales.append(from_blocked(row_sf, M, N // 16).float())
+        row_scales.append(from_blocked(row_sf, M, N // 16).float())
+        col_scales.append(from_blocked(col_sf, N, M // 16).float())
         dequants.append(
             reference_dequantize_rowwise(
                 row_codes, row_sf, ar[0], fp8_max=EDEN_BLOCK_SCALE_MAX
@@ -335,8 +337,9 @@ def test_ms_eden_is_unbiased():
         )
 
     for samples, target, label in (
-        (torch.stack(scales), ref.corrected_scale, "block scale"),
-        (torch.stack(dequants), ref.ideal_dequant, "reconstruction"),
+        (torch.stack(row_scales), row_ref.corrected_scale, "rowwise block scale"),
+        (torch.stack(col_scales), col_ref.corrected_scale, "colwise block scale"),
+        (torch.stack(dequants), row_ref.ideal_dequant, "reconstruction"),
     ):
         mean = samples.mean(dim=0)
         se = samples.std(dim=0, unbiased=True) / math.sqrt(draws)
@@ -425,18 +428,27 @@ def test_each_rng_slice_drives_exactly_one_output():
 
 
 @_needs_ms_eden
-@pytest.mark.parametrize("group_sizes", [[128, 128], [256, 128, 384]])
+@pytest.mark.parametrize("group_sizes", [[256], [128, 128], [256, 128, 384]])
 @torch.no_grad()
-def test_codes_per_group_isolation(group_sizes):
-    """The only multi-group numerics test for §11.3.
+def test_multi_group_matches_the_reference(group_sizes):
+    """The only multi-group numerics test for §11.3, and the only scale-layout one.
 
-    Codes are RTNE and depend only on their own group's data and its own amax, so a
-    group's codes in a packed launch must equal its codes quantized alone. A
-    group-index bug -- wrong amax, or a tile straddling a boundary -- shows up here
-    and in none of the single-group tests above. Scales deliberately are not compared:
-    the Philox counter is derived from a global element index, so it legitimately
-    differs when the packed length does.
+    Codes are RTNE, so they are pinned bitwise. The scale bytes are one stochastic
+    draw away and cannot be, but stochastic rounding always lands on one of the two
+    E4M3 neighbours of the value it rounds, so every byte must be within one ULP of
+    the reference's corrected scale -- positive E4M3 bytes are magnitude-monotonic,
+    which makes a byte delta a ULP delta. That bound is loose on value and *tight* on
+    position: a scale written to the wrong offset lands nowhere near its neighbour
+    pair. It is what guards the columnwise swizzle, whose tiling restarts at every
+    group boundary, and which no other test in this file reads.
     """
+    from torchao.prototype.mx_formats.utils import from_blocked
+
+    from .nvfp4_reference import (
+        from_blocked_grouped,
+        reference_group_row_rht_col_rht_quantize_ms_eden,
+    )
+
     N = 512
     E = len(group_sizes)
     M = sum(group_sizes)
@@ -444,36 +456,27 @@ def test_codes_per_group_isolation(group_sizes):
     d, w = _signs(seed=0), _signs(seed=1)
     ar, ac = _amax(dy, d, w, offs, E)
     rng = torch.tensor([1, 2, 3, 4], dtype=torch.int64, device="cuda")
-    col_codes, _, row_codes, _ = triton_group_row_rht_col_rht_quantize_ms_eden(
-        dy, ar, ac, d, w, offs, E, M, N, VARYING_FIRST_DIM, rng, offs[-1:]
+    col_codes, col_sf, row_codes, row_sf = (
+        triton_group_row_rht_col_rht_quantize_ms_eden(
+            dy, ar, ac, d, w, offs, E, M, N, VARYING_FIRST_DIM, rng, offs[-1:]
+        )
+    )
+    ref_col_codes, ref_col_scale, ref_row_codes, ref_row_scale = (
+        reference_group_row_rht_col_rht_quantize_ms_eden(dy, ar, ac, d, w, offs, E)
     )
 
-    start = 0
-    for g, size in enumerate(group_sizes):
-        one = torch.tensor([size], dtype=torch.int32, device="cuda")
-        solo_col, _, solo_row, _ = triton_group_row_rht_col_rht_quantize_ms_eden(
-            dy[start : start + size].contiguous(),
-            ar[g : g + 1],
-            ac[g : g + 1],
-            d,
-            w,
-            one,
-            1,
-            size,
-            N,
-            VARYING_FIRST_DIM,
-            rng,
-            one,
-        )
-        assert_codes_bitwise(
-            row_codes[start : start + size], solo_row, f"rowwise codes[{g}]"
-        )
-        assert_codes_bitwise(
-            col_codes[:, start // 2 : (start + size) // 2],
-            solo_col,
-            f"colwise codes[{g}]",
-        )
-        start += size
+    assert_codes_bitwise(row_codes, ref_row_codes, "row codes")
+    assert_codes_bitwise(col_codes, ref_col_codes, "col codes")
+    assert_scales_adjacent(
+        from_blocked(row_sf, M, N // 16),
+        ref_row_scale.to(torch.float8_e4m3fn),
+        "row scales",
+    )
+    assert_scales_adjacent(
+        from_blocked_grouped(col_sf, N, group_sizes),
+        ref_col_scale.to(torch.float8_e4m3fn),
+        "col scales",
+    )
 
 
 # --- wrapper layer, runs today ----------------------------------------------
