@@ -4,15 +4,16 @@
 # This source code is licensed under the BSD 3-Clause license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Grouped lazy columnwise NVFP4 weight requantization. Design doc §11.6 and §11.7.
+"""Grouped lazy columnwise NVFP4 weight requantization.
 
 The V1_REQUANT backward weight path. Forward saved only the packed rowwise weight
-(``group_row_cast_quantize``, §11.1); these two ops rebuild the transposed operand
+(``group_row_cast_quantize``); these two ops rebuild the transposed operand
 the dgrad GEMM needs, per expert:
 
-    W_qdq        = dequantize(row_fp4_w, row_sf_w, global_amax)   # on chip, per tile
-    amax_w_qdq_t = amax(abs(W_qdq.bf16().t()))                    # §11.6
-    col_fp4_w_t  = nvfp4_cast(W_qdq.bf16().t())                   # §11.7
+    # on chip, per tile
+    W_qdq        = dequantize(row_fp4_w, row_sf_w, global_amax)
+    amax_w_qdq_t = amax(abs(W_qdq.bf16().t()))
+    col_fp4_w_t  = nvfp4_cast(W_qdq.bf16().t())
 
 The original BF16 weight is **never** re-read. Deriving the backward operand from
 the quantized forward weight is what makes the forward and dgrad GEMMs agree on
@@ -24,7 +25,7 @@ sharing is a correctness requirement, not an optimization: if the amax pass and 
 quantize pass reconstructed ``W_qdq`` differently, ``amax_w_qdq_t`` would not bound
 the tensor actually being quantized and both gradients would come out biased low.
 
-No sign vector: these apply no transform. The rotated twins are §11.4/§11.5 in
+No sign vector: these apply no transform. The rotated twins are in
 ``group_col_rht_requantize_triton.py``.
 
 A dense linear is the degenerate ``num_experts = 1`` case.
@@ -53,10 +54,10 @@ if torch_version_at_least("2.10.0") and has_triton():
         _load_scales_swizzle,
         _nvfp4_global_scales,
         _nvfp4_quantize,
-        _pack_fp4,
         _rescale_fp4,
         _store_scales_swizzle,
         _swizzle_scales,
+        convert_8xfp32_to_4xfp4_packed,
     )
 
     # Weights are static, so M is a safe autotune key here (unlike the activation
@@ -69,8 +70,8 @@ if torch_version_at_least("2.10.0") and has_triton():
 
     @triton.jit
     def _load_requant_weight_tile(
-        row_fp4_w_ptr,
-        row_sf_w_ptr,
+        qw_ptr,
+        sfw_ptr,
         global_amax_ptr,
         expert,
         pid_m,
@@ -85,31 +86,49 @@ if torch_version_at_least("2.10.0") and has_triton():
         Shared by both kernels below -- see the module docstring for why that is
         load-bearing. Returns a ``(BLOCK_N, BLOCK_M)`` bf16 tile.
 
-        Sketch of the intended body:
-            global_amax = tl.load(global_amax_ptr + expert)
-            _, gds = _nvfp4_global_scales(global_amax, 448.0)   # decode numerator 2688
-            row_fp4_w = <load (BLOCK_M, BLOCK_N//2) packed codes for this expert>
-            row_sf_w  = _load_scales_swizzle(<expert sf base>, pid_m, pid_n,
-                                             M, N, BLOCK_M, BLOCK_N)
-            w_qdq = _rescale_fp4(row_fp4_w, row_sf_w, gds, BLOCK_M, BLOCK_N)
-            # A NaN or inf global_amax must reconstruct to zero, not propagate.
-            valid = (global_amax == global_amax) & (tl.abs(global_amax) != float("inf"))
-            w_qdq = tl.where(valid, w_qdq, 0.0).to(tl.bfloat16)
-            return tl.trans(tl.reshape(w_qdq, [BLOCK_M, BLOCK_N]))
-
         The bf16 round-through before the transpose is required, not incidental:
         the reference takes it, and dropping it makes the codes differ.
         """
-        # TODO(nvfp4-v2): implement. See design doc §11.6.
-        tl.static_assert(False, "_load_requant_weight_tile is not implemented")
+
+        # Load packed fp4 codes
+        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        packed_inner = pid_n * (BLOCK_N // 2) + tl.arange(0, BLOCK_N // 2)
+        packed_offsets = offs_m[:, None] * (N // 2) + packed_inner[None, :]
+        qw_expert_ptr = qw_ptr + expert * M * (N // 2)
+        qw = tl.load(qw_expert_ptr + packed_offsets)
+
+        # Load swizzled scales
+        sfw_expert_stride = (M // 128) * (N // 64) * 32 * 16
+        sfw_expert_ptr = sfw_ptr + expert * sfw_expert_stride
+        sfw = _load_scales_swizzle(
+            sfw_expert_ptr,
+            pid_m,
+            pid_n,
+            M,
+            N,
+            BLOCK_M,
+            BLOCK_N,
+        )
+
+        # Load global amax precomputed in forward pass. Per expert -- a reduction
+        # across experts would decode every expert with expert 0's scale.
+        FP8_E4M3_MAX: tl.constexpr = 448.0
+        amax_w = tl.load(global_amax_ptr + expert)
+        _, global_decode_scale = _nvfp4_global_scales(amax_w, FP8_E4M3_MAX)
+        dequant_w = _rescale_fp4(qw, sfw, global_decode_scale, BLOCK_M, BLOCK_N)
+
+        # A NaN or inf global_amax must reconstruct to zero, not propagate.
+        valid_amax = (amax_w == amax_w) & (tl.abs(amax_w) != float("inf"))
+        dequant_w = tl.where(valid_amax, dequant_w, 0.0).to(tl.bfloat16)
+        return tl.trans(tl.reshape(dequant_w, [BLOCK_M, BLOCK_N]))
 
     @triton.autotune(configs=_GROUP_COL_CAST_REQUANT_CONFIGS, key=["M", "N"])
     @triton.jit
     def _group_col_cast_requant_amax_kernel(
-        row_fp4_w_ptr,
-        row_sf_w_ptr,
+        qw_ptr,
+        sfw_ptr,
         global_amax_ptr,
-        amax_w_qdq_t_ptr,
+        amax_dw_t_ptr,
         M,
         N,
         BLOCK_M: tl.constexpr,
@@ -118,48 +137,97 @@ if torch_version_at_least("2.10.0") and has_triton():
         """Per-expert amax over the reconstructed weight transpose.
 
         Grid ``(cdiv(M, BLOCK_M), cdiv(N, BLOCK_N), E)``; reduce into slot ``expert``
-        with ``tl.atomic_max``. Re-inject NaN explicitly -- ``tl.max`` drops it:
-
-            amax = tl.max(tl.max(tl.abs(w_qdq_t), axis=1), axis=0)
-            has_nan = tl.max(tl.max((w_qdq_t != w_qdq_t).to(tl.int32), axis=1), axis=0)
-            amax = tl.where(has_nan != 0, float("nan"), amax)
-            tl.atomic_max(amax_w_qdq_t_ptr + expert, amax.to(tl.float32))
+        with ``tl.atomic_max``. Re-inject NaN explicitly -- ``tl.max`` drops it.
         """
-        # TODO(nvfp4-v2): implement. See design doc §11.6.
-        tl.static_assert(
-            False, "_group_col_cast_requant_amax_kernel is not implemented"
+        pid_m = tl.program_id(0)
+        pid_n = tl.program_id(1)
+        expert = tl.program_id(2).to(tl.int64)
+        dw_t = _load_requant_weight_tile(
+            qw_ptr,
+            sfw_ptr,
+            global_amax_ptr,
+            expert,
+            pid_m,
+            pid_n,
+            M,
+            N,
+            BLOCK_M,
+            BLOCK_N,
         )
+        amax_dw_t = tl.max(tl.abs(dw_t))
+
+        # Re-inject NaN explicitly -- ``tl.max`` drops it. The probe has to run on the
+        # tile: by this point ``amax_dw_t`` is the reduction that dropped the NaN.
+        tile_has_nan = tl.max((dw_t != dw_t).to(tl.int32))
+        amax_dw_t = tl.where(tile_has_nan != 0, float("nan"), amax_dw_t)
+
+        tl.atomic_max(amax_dw_t_ptr + expert, amax_dw_t.to(tl.float32))
 
     @triton.autotune(configs=_GROUP_COL_CAST_REQUANT_CONFIGS, key=["M", "N"])
     @triton.jit
     def _group_col_cast_requantize_kernel(
-        row_fp4_w_ptr,
-        row_sf_w_ptr,
+        qw_ptr,
+        sfw_ptr,
         global_amax_ptr,
-        amax_w_qdq_t_ptr,
-        qa_t_ptr,
-        sfa_t_ptr,
+        amax_dw_t_ptr,
+        qdq_w_t_ptr,
+        sfw_t_ptr,
         M,
         N,
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
     ):
-        """Per-expert rowwise 1x16 NVFP4 quantization of the reconstructed transpose.
-
+        """Per-expert rowwise 1x16 NVFP4 quantization of the reconstructed transpose
         Same reconstruction as the amax kernel, then quantize and store transposed:
-
-            w_qdq_t = _load_requant_weight_tile(...)          # (BLOCK_N, BLOCK_M)
-            sf, scaled = _nvfp4_quantize(w_qdq_t,
-                                         tl.load(amax_w_qdq_t_ptr + expert),
-                                         BLOCK_N, BLOCK_M)
-            qa_t = _pack_fp4(scaled, BLOCK_N, BLOCK_M, False, 0, 0, 0)   # RTNE
-            <store at qa_t_ptr + expert * N * (M // 2), addressed [n, m]>
-            _store_scales_swizzle(_swizzle_scales(sf, BLOCK_N, BLOCK_M),
-                                  <expert sf_t base>, pid_n, pid_m, N, M,
-                                  BLOCK_N, BLOCK_M)
         """
-        # TODO(nvfp4-v2): implement. See design doc §11.7.
-        tl.static_assert(False, "_group_col_cast_requantize_kernel is not implemented")
+        pid_m = tl.program_id(0)
+        pid_n = tl.program_id(1)
+        expert = tl.program_id(2).to(tl.int64)
+
+        dw_t = _load_requant_weight_tile(
+            qw_ptr,
+            sfw_ptr,
+            global_amax_ptr,
+            expert,
+            pid_m,
+            pid_n,
+            M,
+            N,
+            BLOCK_M,
+            BLOCK_N,
+        )
+
+        global_amax = tl.load(amax_dw_t_ptr + expert)
+        sfw_t, qdq_w_t = _nvfp4_quantize(dw_t, global_amax, BLOCK_N, BLOCK_M)
+
+        # Pack FP4 values into uint8 -- non-transposed: (BLOCK_M, BLOCK_N//2, 2).
+        qdq_w_t_pairs = qdq_w_t.reshape(BLOCK_N, BLOCK_M // 2, 2).split()
+        qdq_w_t_fp4x2 = convert_8xfp32_to_4xfp4_packed(qdq_w_t_pairs)
+
+        # Store packed FP4 values in this expert's rowwise output.
+        outer = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        packed_inner = pid_m * (BLOCK_M // 2) + tl.arange(0, BLOCK_M // 2)
+        packed_offsets = outer[:, None] * (M // 2) + packed_inner[None, :]
+
+        # Shift base pointers for packed NVFP4 tensors to this expert.
+        qdq_w_t_expert_ptr = qdq_w_t_ptr + expert * N * (M // 2)
+        tl.store(qdq_w_t_expert_ptr + packed_offsets, qdq_w_t_fp4x2)
+
+        # Shift base pointers for FP8 scale factors to this expert.
+        sfw_t_expert_stride = (N // 128) * (M // 64) * 32 * 16
+        sfw_t_expert_ptr = sfw_t_ptr + expert * sfw_t_expert_stride
+
+        swizzle_sfw_t = _swizzle_scales(sfw_t, BLOCK_N, BLOCK_M)
+        _store_scales_swizzle(
+            swizzle_sfw_t,
+            sfw_t_expert_ptr,
+            pid_n,
+            pid_m,
+            N,
+            M,
+            BLOCK_N,
+            BLOCK_M,
+        )
 
     @torch.library.custom_op(
         "torchao::triton_group_col_cast_requant_amax", mutates_args=()

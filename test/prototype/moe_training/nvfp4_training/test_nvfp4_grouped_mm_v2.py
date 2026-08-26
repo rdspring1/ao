@@ -21,7 +21,7 @@ from torchao.quantization.utils import compute_error
 
 from ._v2_marks import TRITON_AVAILABLE, kernel_gate, maybe_sm100
 
-_V1_REQUANT_KERNELS_IMPLEMENTED = False
+_V1_REQUANT_KERNELS_IMPLEMENTED = True
 _V2_KERNELS_IMPLEMENTED = False
 _needs_v1_requant = kernel_gate(
     _V1_REQUANT_KERNELS_IMPLEMENTED, "the §11.1/§11.6/§11.7 kernels"

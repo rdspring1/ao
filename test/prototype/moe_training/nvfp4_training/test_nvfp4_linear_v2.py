@@ -33,7 +33,7 @@ from ._v2_marks import kernel_gate, kernel_skip, maybe_sm100
 
 # Every grouped kernel these recipes call must be implemented before the numerics
 # tests mean anything. V1_REQUANT needs only the three no-RHT ops; V2 needs all of them.
-_V1_REQUANT_KERNELS_IMPLEMENTED = False
+_V1_REQUANT_KERNELS_IMPLEMENTED = True
 _V2_KERNELS_IMPLEMENTED = False
 _needs_v1_requant = kernel_gate(
     _V1_REQUANT_KERNELS_IMPLEMENTED, "the §11.1/§11.6/§11.7 kernels"

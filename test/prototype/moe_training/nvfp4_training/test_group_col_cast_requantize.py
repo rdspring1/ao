@@ -25,7 +25,7 @@ from .nvfp4_reference import (
 )
 
 # Flip to True once both @triton.jit bodies in group_col_cast_requantize_triton.py land.
-_KERNEL_IMPLEMENTED = False
+_KERNEL_IMPLEMENTED = True
 _needs_kernel = kernel_gate(_KERNEL_IMPLEMENTED, "group_col_cast_requantize_triton.py")
 
 if TRITON_AVAILABLE:

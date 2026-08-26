@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD 3-Clause license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Grouped 1D (1x16) rowwise NVFP4 weight quantization. Design doc §11.1.
+"""Grouped 1D (1x16) rowwise NVFP4 weight quantization.
 
 Replaces ``triton_group_weight_quantize_2d`` in the forward of the V1_REQUANT and
 V2 recipes. Two differences from the 2D kernel it replaces:
@@ -15,7 +15,7 @@ V2 recipes. Two differences from the 2D kernel it replaces:
   instead of ``N * D / 256``.
 * **Rowwise only.** No columnwise output is produced. The transposed operand the
   dgrad GEMM needs is rebuilt in backward from these packed codes, by
-  ``group_col_cast_requantize`` (§11.7) or ``group_col_rht_requantize`` (§11.5).
+  ``group_col_cast_requantize`` or ``group_col_rht_requantize``.
   Both GEMMs then decode to one and the same ``W_qdq``, which is a stronger
   property than the shared scale byte it replaces.
 
@@ -40,9 +40,9 @@ if torch_version_at_least("2.10.0") and has_triton():
 
     from torchao.prototype.moe_training.nvfp4_training.hadamard_utils import (  # noqa: F401
         _nvfp4_quantize,
-        _pack_fp4,
         _store_scales_swizzle,
         _swizzle_scales,
+        convert_8xfp32_to_4xfp4_packed,
     )
     from torchao.utils import is_sm_at_least_100
 
@@ -69,22 +69,55 @@ if torch_version_at_least("2.10.0") and has_triton():
     ):
         """Per-expert rowwise 1x16 NVFP4 quantization -- one tile per CTA.
 
-        Grid is ``(cdiv(M, BLOCK_M), cdiv(N, BLOCK_N), E)``; ``program_id(2)`` is the
-        expert. Expert base offsets must be widened with ``.to(tl.int64)`` before
-        multiplying by a row stride: at DeepSeek expert shapes ``E * M * N`` passes
-        2**31 and a 32-bit product wraps to a bad address.
-
-        Sketch of the intended body:
-            expert = tl.program_id(2).to(tl.int64)
-            global_amax = tl.load(global_amax_ptr + expert)
-            a = <load (BLOCK_M, BLOCK_N) tile from a_ptr + expert * M * N>
-            sfa, qa = _nvfp4_quantize(a, global_amax, BLOCK_M, BLOCK_N)
-            qa_fp4 = _pack_fp4(qa, BLOCK_M, BLOCK_N, False, 0, 0, 0)   # RTNE
-            <store qa_fp4 at qa_ptr + expert * M * (N // 2)>
-            _store_scales_swizzle(_swizzle_scales(sfa, BLOCK_M, BLOCK_N), ...)
+        Grid is ``(cdiv(M, BLOCK_M), cdiv(N, BLOCK_N), E)``; ``program_id(2)`` is
+        the expert. Expert base offsets must be widened with ``.to(tl.int64)``
+        before multiplying by a row stride: at DeepSeek expert shapes ``E * M * N``
+        passes 2**31 and a 32-bit product wraps to a bad address.
         """
-        # TODO(nvfp4-v2): implement. See design doc §11.1.
-        tl.static_assert(False, "_group_row_cast_quantize_kernel is not implemented")
+        pid_m = tl.program_id(0)
+        pid_n = tl.program_id(1)
+        expert = tl.program_id(2).to(tl.int64)
+
+        # Get global amax for this expert (float32).
+        global_amax = tl.load(global_amax_ptr + expert)
+
+        # Shift base pointers for packed NVFP4 tensors to this expert.
+        qa_expert_ptr = qa_ptr + expert * M * (N // 2)
+
+        # Shift base pointers for FP8 scale factors to this expert.
+        sfa_expert_stride = (M // 128) * (N // 64) * 32 * 16
+        sfa_expert_ptr = sfa_ptr + expert * sfa_expert_stride
+
+        # Load a 2D (BLOCK_M, BLOCK_N) tile for this expert.
+        a_expert_ptr = a_ptr + expert * M * N
+        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        a = tl.load(a_expert_ptr + offs_m[:, None] * N + offs_n[None, :])
+
+        # Compute per-1x16-vector scales and scaled values.
+        sfa, qa = _nvfp4_quantize(a, global_amax, BLOCK_M, BLOCK_N)
+
+        # Pack FP4 values into uint8 -- non-transposed: (BLOCK_M, BLOCK_N//2, 2).
+        qa_pairs = qa.reshape(BLOCK_M, BLOCK_N // 2, 2).split()
+        qa_fp4x2 = convert_8xfp32_to_4xfp4_packed(qa_pairs)
+
+        # Store packed FP4 values in this expert's rowwise output.
+        outer = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        packed_inner = pid_n * (BLOCK_N // 2) + tl.arange(0, BLOCK_N // 2)
+        packed_offsets = outer[:, None] * (N // 2) + packed_inner[None, :]
+        tl.store(qa_expert_ptr + packed_offsets, qa_fp4x2)
+
+        swizzle_sfa = _swizzle_scales(sfa, BLOCK_M, BLOCK_N)
+        _store_scales_swizzle(
+            swizzle_sfa,
+            sfa_expert_ptr,
+            pid_m,
+            pid_n,
+            M,
+            N,
+            BLOCK_M,
+            BLOCK_N,
+        )
 
     @torch.library.custom_op("torchao::triton_group_row_cast_quantize", mutates_args=())
     def triton_group_row_cast_quantize(

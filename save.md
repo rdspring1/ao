@@ -28,8 +28,8 @@ kernel set** for V1_REQUANT or V2, now or later.
 | `nvfp4_rht_cadence.py` | `resample_nvfp4_rht_signs(model, seed, step, microbatch)` — in-place, deterministic, per-FQN |
 | `nvfp4_linear_v2.py` | `_NVFP4LinearV2`, `_NVFP4LinearV1Requant` + wrappers, `_degenerate_group_args` |
 | `nvfp4_grouped_mm_v2.py` | `nvfp4_v2_grouped_mm`, `nvfp4_v1_requant_grouped_mm` |
-| `group_row_cast_quantize_triton.py` | §11.1 **stub** |
-| `group_col_cast_requantize_triton.py` | §11.6 + §11.7 **stubs** (share `_load_requant_weight_tile`) |
+| `group_row_cast_quantize_triton.py` | §11.1 **implemented** |
+| `group_col_cast_requantize_triton.py` | §11.6 + §11.7 **implemented** (share `_load_requant_weight_tile`) |
 | `group_col_rht_requantize_triton.py` | §11.4 + §11.5 **stubs** (share `_load_rht_requant_weight_tile`) |
 | `group_row_cast_col_rht_amax_triton.py` | §11.8 **stub** (RHT-128, dynamic signs) |
 | `group_row_cast_col_rht_quantize_triton.py` | §11.9 **stub** |
@@ -183,23 +183,55 @@ Note the monorepo's V2 casts with **four-over-six**; torchao's does not
 (`NVFP4_CAST_NUMERATOR = 448*6`). `test_cuda_equiv_four_over_six.py` is therefore not
 a spec for §11.1 or §11.9.
 
+## Phase A is done: V1_REQUANT runs end to end
+
+§11.1, §11.6 and §11.7 are written and green. **853 passed, 88 skipped** across
+`nvfp4_training/` + `test_nvfp4_grouped_mm.py`, up from 825/116 -- 28 tests moved from
+skipped to passing and the totals reconcile exactly, so no V1 regression. Flags now
+`True`: `_KERNEL_IMPLEMENTED` in `test_group_row_cast_quantize.py` and
+`test_group_col_cast_requantize.py`, `_V1_REQUANT_KERNELS_IMPLEMENTED` in both
+integration files. `_V2_KERNELS_IMPLEMENTED` stays `False`.
+
+V1_REQUANT is ready for the DSV3 671B 300-step convergence run. Decide the acceptance
+criterion first: it will **not** match V1 step for step, because the weight path moves
+from 16x16 2D scaling to 1x16 rowwise plus lazy requantization -- that is the recipe,
+not a bug. Pick a final-loss delta or a curve-divergence band before starting or the
+result is not decidable.
+
+### Bugs found reviewing the first implementation
+
+Recorded because the same shapes will recur in Phase B. Two were silent, the rest
+were trace-time NameErrors:
+
+* **Missing expert offset on the decode amax.** `tl.load(amax_w_ptr)` with no
+  `+ expert`, so every expert decoded `W_qdq` with expert 0's global amax. Fixing the
+  NameError alone leaves it compiling and wrong. `test_requant_amax_per_expert_isolation`
+  is the guard.
+* **NaN probe on the reduced scalar.** The re-injection tested `amax_dw_t != amax_dw_t`
+  after `tl.max` had already stripped the NaN. It has to test the tile.
+* `tl.atomic_max` given a loaded value instead of a pointer; `_nvfp4_global_scales`
+  called without its `FP8_E4M3_MAX` constexpr (it has no default); leftover
+  `qa_t_ptr` / `sfa_t_ptr` plumbing from `group_quantize_2d`, which §11.1 has no
+  transposed output for; `convert_8xfp32_to_4xfp4_packed` used but not imported in
+  either file.
+
+### One test of ours was wrong, not the kernel
+
+`test_rowwise_error_is_no_worse_than_the_2d_scheme` asserted 1x16 error <= 16x16
+**per block**. False: about one block in six is worse, because a 1x16 scale is finer
+but still rounds to E4M3 and a coarser scale can land on a luckier byte. The claim
+that holds -- and the one justifying the extra backward pass -- is the aggregate, near
+82% of the 2D error across five seeds. Retargeted to `err_1d.sum() < 0.95 *
+err_2d.sum()`.
+
 ## Next action
 
-Write the `@triton.jit` bodies, starting with **Phase A** (no RHT, unblocks
-V1_REQUANT end-to-end): §11.1, then §11.6/§11.7. Each stub's docstring carries a
-sketch of the intended body and the specific hazards (int64 widening, NaN
-re-injection, bf16 round-through placement).
-
-Then flip `_KERNEL_IMPLEMENTED = False` → `True` at the top of the matching test file:
-
-| Kernel | Test file |
-| --- | --- |
-| §11.1 | `test_group_row_cast_quantize.py` |
-| §11.6, §11.7 | `test_group_col_cast_requantize.py` |
-| §11.8, §11.9 | `test_group_row_cast_col_rht.py` (two flags) |
-| §11.2, §11.3 | `test_group_row_rht_col_rht.py` (two flags) |
-| §11.4, §11.5 | `test_group_col_rht_requantize.py` |
-| integration | `test_nvfp4_linear_v2.py`, `test_nvfp4_grouped_mm_v2.py` |
+Phase B: §11.8 and §11.9 first (copies -- see the paste note below), then §11.2, then
+the real work in §11.4/§11.5 and §11.3. Flip `_AMAX_IMPLEMENTED` /
+`_QUANTIZE_IMPLEMENTED` in `test_group_row_cast_col_rht.py`, `_AMAX_IMPLEMENTED` /
+`_MS_EDEN_IMPLEMENTED` in `test_group_row_rht_col_rht.py`, `_KERNEL_IMPLEMENTED` in
+`test_group_col_rht_requantize.py`, and `_V2_KERNELS_IMPLEMENTED` in both integration
+files.
 
 MS-EDEN (§11.3) additionally needs `stochastic_rounding_fp8_e4m3` and
 `_quantize_ms_eden` ported from `cutile/nvfp4_v2_triton/kernels/hadamard_utils.py`
@@ -265,8 +297,9 @@ of §15/§17 that is scaffolded rather than finished.
 - CuteDSL kernels for the new recipes (Triton only).
 - Tensor-parallel V2 — `NVFP4Linear.forward` raises for non-V1 recipes with a
   `process_group`, since torchtitan does not use TP NVFP4 linears.
-- `benchmarks/prototype/nvfp4_training/bench_group_*.py` for the 7 new kernels; repo
-  convention expects one per kernel, deferred to the implementation change.
+- `benchmarks/prototype/nvfp4_training/bench_group_*.py`; repo convention expects one
+  per kernel. Deferred to the implementation change, and still owed for §11.1, §11.6
+  and §11.7 now that those have landed.
 - Wiring `resample_nvfp4_rht_signs` into a torchtitan training loop (see the open
   item above).
 
