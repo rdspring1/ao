@@ -178,7 +178,7 @@ if torch_version_at_least("2.10.0") and has_triton():
         BLOCK_N: tl.constexpr,
     ):
         """Per-expert rowwise 1x16 NVFP4 quantization of the reconstructed transpose
-        Same reconstruction as the amax kernel, then quantize and store transposed:
+        Same reconstruction as the amax kernel, then quantize and store transposed.
         """
         pid_m = tl.program_id(0)
         pid_n = tl.program_id(1)

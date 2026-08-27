@@ -4,9 +4,9 @@
 # This source code is licensed under the BSD 3-Clause license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Grouped lazy columnwise RHT-128 weight requantization. Design doc §11.4 and §11.5.
+"""Grouped lazy columnwise RHT-128 weight requantization.
 
-The V2 backward weight path -- §11.6/§11.7 with the rotation added:
+The V2 backward weight path with the Random Hadamard Transform added:
 
     W_qdq            = dequantize(row_fp4_w, row_sf_w, global_amax)   # on chip
     R_n              = diag(dgrad_rht) @ H_128 / sqrt(128)
@@ -22,9 +22,9 @@ One ``dgrad_rht`` is shared across all experts, so a single ``B`` operand serves
 whole weight stack. That is the only grouped-plus-RHT combination supported here:
 a per-expert ``B`` would need a different operand per group and is not implemented.
 
-As in §11.6/§11.7, both ops share ``_load_rht_requant_weight_tile`` and that sharing
-is a correctness requirement -- if the amax pass and the quantize pass reconstructed
-or rotated ``W_qdq`` differently, the amax would not bound the tensor being quantized.
+Both ops share ``_load_rht_requant_weight_tile`` and that sharing is a correctness
+requirement. If the amax pass and the quantize pass reconstructed or rotated
+``W_qdq`` differently, the amax would not bound the tensor being quantized.
 
 Note the decode numerator here is 2688, not 1536: the weight is a *cast* operand
 even in V2. Only the MS-EDEN gradient operands use 1536.
@@ -56,10 +56,10 @@ if torch_version_at_least("2.10.0") and has_triton():
         _load_scales_swizzle,
         _nvfp4_global_scales,
         _nvfp4_quantize,
-        _pack_fp4,
         _rescale_fp4,
         _store_scales_swizzle,
         _swizzle_scales,
+        convert_8xfp32_to_4xfp4_packed,
         get_dynamic_rht_matrix,
     )
 
@@ -72,8 +72,8 @@ if torch_version_at_least("2.10.0") and has_triton():
 
     @triton.jit
     def _load_rht_requant_weight_tile(
-        row_fp4_w_ptr,
-        row_sf_w_ptr,
+        qw_ptr,
+        sfw_ptr,
         global_amax_ptr,
         rht_ptr,
         expert,
@@ -90,35 +90,64 @@ if torch_version_at_least("2.10.0") and has_triton():
         Shared by both kernels below; see the module docstring for why that matters.
         Returns ``(BLOCK_N * BLOCK_M // RHT_SIZE, RHT_SIZE)`` bf16.
 
-        Sketch of the intended body:
-            global_amax = tl.load(global_amax_ptr + expert)
-            _, gds = _nvfp4_global_scales(global_amax, 448.0)   # 2688, a cast operand
-            row_fp4_w = <load (BLOCK_M, BLOCK_N//2) packed codes for this expert>
-            row_sf_w  = _load_scales_swizzle(<expert sf base>, pid_m, pid_n,
-                                             M, N, BLOCK_M, BLOCK_N)
-            w_qdq = _rescale_fp4(row_fp4_w, row_sf_w, gds, BLOCK_M, BLOCK_N)
-            valid = (global_amax == global_amax) & (tl.abs(global_amax) != float("inf"))
-            w_qdq = tl.where(valid, w_qdq, 0.0).to(tl.bfloat16)
-
-            hadamard = <load (RHT_SIZE, RHT_SIZE) from rht_ptr>
-            w_qdq_t = tl.trans(tl.reshape(w_qdq, [BLOCK_M, BLOCK_N]))
-            w_qdq_t = tl.reshape(w_qdq_t, [BLOCK_N * BLOCK_M // RHT_SIZE, RHT_SIZE])
-            return tl.dot(w_qdq_t, hadamard).to(tl.bfloat16)
-
         The bf16 round-through *before* the rotation is required to match the
         reference; so is the one after the ``tl.dot``.
         """
-        # TODO(nvfp4-v2): implement. See design doc §11.4.
-        tl.static_assert(False, "_load_rht_requant_weight_tile is not implemented")
+        # The reshape below is only correct while an RHT chunk stays inside one row
+        # of the transposed tile, whose inner extent is BLOCK_M. Violating this
+        # applies the transform across the wrong axis with no error, only a wrong
+        # gradient.
+        tl.static_assert(
+            BLOCK_M % RHT_SIZE == 0, "columnwise RHT requires BLOCK_M % RHT_SIZE == 0"
+        )
+
+        # Load packed fp4 codes
+        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        packed_inner = pid_n * (BLOCK_N // 2) + tl.arange(0, BLOCK_N // 2)
+        packed_offsets = offs_m[:, None] * (N // 2) + packed_inner[None, :]
+        qw_expert_ptr = qw_ptr + expert * M * (N // 2)
+        qw = tl.load(qw_expert_ptr + packed_offsets)
+
+        # Load swizzled scales
+        sfw_expert_stride = (M // 128) * (N // 64) * 32 * 16
+        sfw_expert_ptr = sfw_ptr + expert * sfw_expert_stride
+        sfw = _load_scales_swizzle(
+            sfw_expert_ptr,
+            pid_m,
+            pid_n,
+            M,
+            N,
+            BLOCK_M,
+            BLOCK_N,
+        )
+
+        # Load global amax precomputed in forward pass. Per expert -- a reduction
+        # across experts would decode every expert with expert 0's scale.
+        FP8_E4M3_MAX: tl.constexpr = 448.0
+        amax_w = tl.load(global_amax_ptr + expert)
+        _, global_decode_scale = _nvfp4_global_scales(amax_w, FP8_E4M3_MAX)
+        dequant_w = _rescale_fp4(qw, sfw, global_decode_scale, BLOCK_M, BLOCK_N)
+
+        # A NaN or inf global_amax must reconstruct to zero, not propagate.
+        valid_amax = (amax_w == amax_w) & (tl.abs(amax_w) != float("inf"))
+        dequant_w = tl.where(valid_amax, dequant_w, 0.0).to(tl.bfloat16)
+
+        rht_range = tl.arange(0, RHT_SIZE)
+        rht_offsets = rht_range[:, None] * RHT_SIZE + rht_range[None, :]
+        rht = tl.load(rht_ptr + rht_offsets)
+
+        dequant_w_t = tl.trans(tl.reshape(dequant_w, [BLOCK_M, BLOCK_N]))
+        dequant_w_t = tl.reshape(dequant_w_t, [BLOCK_N * BLOCK_M // RHT_SIZE, RHT_SIZE])
+        return tl.dot(dequant_w_t, rht).to(tl.bfloat16)
 
     @triton.autotune(configs=_GROUP_COL_RHT_REQUANT_CONFIGS, key=["M", "N"])
     @triton.jit
     def _group_col_rht_requant_amax_kernel(
-        row_fp4_w_ptr,
-        row_sf_w_ptr,
+        qw_ptr,
+        sfw_ptr,
         global_amax_ptr,
         rht_ptr,
-        amax_rht_w_qdq_t_ptr,
+        amax_rht_dw_t_ptr,
         M,
         N,
         BLOCK_M: tl.constexpr,
@@ -131,19 +160,43 @@ if torch_version_at_least("2.10.0") and has_triton():
         ``expert``. Re-inject NaN explicitly -- ``tl.max`` drops it. A NaN or inf
         ``global_amax`` must reconstruct to zero and leave the amax at zero, not NaN.
         """
-        # TODO(nvfp4-v2): implement. See design doc §11.4.
-        tl.static_assert(False, "_group_col_rht_requant_amax_kernel is not implemented")
+        pid_m = tl.program_id(0)
+        pid_n = tl.program_id(1)
+        expert = tl.program_id(2).to(tl.int64)
+        rht_dw_t = _load_rht_requant_weight_tile(
+            qw_ptr,
+            sfw_ptr,
+            global_amax_ptr,
+            rht_ptr,
+            expert,
+            pid_m,
+            pid_n,
+            M,
+            N,
+            BLOCK_M,
+            BLOCK_N,
+            RHT_SIZE,
+        )
+        amax_rht_dw_t = tl.max(tl.abs(rht_dw_t))
+
+        # Re-inject NaN explicitly -- ``tl.max`` drops it. The probe has to run on
+        # the  tile: by this point ``amax_rht_dw_t`` is the reduction that dropped
+        # the NaN.
+        tile_has_nan = tl.max((rht_dw_t != rht_dw_t).to(tl.int32))
+        amax_rht_dw_t = tl.where(tile_has_nan != 0, float("nan"), amax_rht_dw_t)
+
+        tl.atomic_max(amax_rht_dw_t_ptr + expert, amax_rht_dw_t.to(tl.float32))
 
     @triton.autotune(configs=_GROUP_COL_RHT_REQUANT_CONFIGS, key=["M", "N"])
     @triton.jit
     def _group_col_rht_requantize_kernel(
-        row_fp4_w_ptr,
-        row_sf_w_ptr,
+        qw_ptr,
+        sfw_ptr,
         global_amax_ptr,
         rht_ptr,
-        amax_rht_w_qdq_t_ptr,
-        qa_t_ptr,
-        sfa_t_ptr,
+        amax_rht_dw_t_ptr,
+        rht_qdq_w_t_ptr,
+        sfw_t_ptr,
         M,
         N,
         BLOCK_M: tl.constexpr,
@@ -152,13 +205,59 @@ if torch_version_at_least("2.10.0") and has_triton():
     ):
         """Per-expert NVFP4 quantization of the rotated, reconstructed transpose.
 
-        Same reconstruction as the amax kernel, then quantize with
-        ``amax_rht_w_qdq_t[expert]`` and store transposed at
-        ``qa_t_ptr + expert * N * (M // 2)``, addressed ``[n, m]``. RTNE only --
-        weights never use stochastic rounding.
+        Same reconstruction and rotation as the amax kernel, then quantize and store
+        transposed.
         """
-        # TODO(nvfp4-v2): implement. See design doc §11.5.
-        tl.static_assert(False, "_group_col_rht_requantize_kernel is not implemented")
+        pid_m = tl.program_id(0)
+        pid_n = tl.program_id(1)
+        expert = tl.program_id(2).to(tl.int64)
+
+        rht_dw_t = _load_rht_requant_weight_tile(
+            qw_ptr,
+            sfw_ptr,
+            global_amax_ptr,
+            rht_ptr,
+            expert,
+            pid_m,
+            pid_n,
+            M,
+            N,
+            BLOCK_M,
+            BLOCK_N,
+            RHT_SIZE,
+        )
+
+        global_amax = tl.load(amax_rht_dw_t_ptr + expert)
+        sfw_t, rht_qdq_w_t = _nvfp4_quantize(rht_dw_t, global_amax, BLOCK_N, BLOCK_M)
+
+        # Pack FP4 values into uint8 -- non-transposed: (BLOCK_M, BLOCK_N//2, 2).
+        rht_qdq_w_t_pairs = rht_qdq_w_t.reshape(BLOCK_N, BLOCK_M // 2, 2).split()
+        rht_qdq_w_t_fp4x2 = convert_8xfp32_to_4xfp4_packed(rht_qdq_w_t_pairs)
+
+        # Store packed FP4 values in this expert's rowwise output.
+        outer = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        packed_inner = pid_m * (BLOCK_M // 2) + tl.arange(0, BLOCK_M // 2)
+        packed_offsets = outer[:, None] * (M // 2) + packed_inner[None, :]
+
+        # Shift base pointers for packed NVFP4 tensors to this expert.
+        rht_qdq_w_t_expert_ptr = rht_qdq_w_t_ptr + expert * N * (M // 2)
+        tl.store(rht_qdq_w_t_expert_ptr + packed_offsets, rht_qdq_w_t_fp4x2)
+
+        # Shift base pointers for FP8 scale factors to this expert.
+        sfw_t_expert_stride = (N // 128) * (M // 64) * 32 * 16
+        sfw_t_expert_ptr = sfw_t_ptr + expert * sfw_t_expert_stride
+
+        swizzle_sfw_t = _swizzle_scales(sfw_t, BLOCK_N, BLOCK_M)
+        _store_scales_swizzle(
+            swizzle_sfw_t,
+            sfw_t_expert_ptr,
+            pid_n,
+            pid_m,
+            N,
+            M,
+            BLOCK_N,
+            BLOCK_M,
+        )
 
     def _rht_operand(dgrad_rht: torch.Tensor, device: torch.device) -> torch.Tensor:
         if dgrad_rht.ndim != 1 or dgrad_rht.numel() != RHT_SIZE:
