@@ -408,6 +408,70 @@ if has_triton():
         return qa_f32_blocked * sfa[:, :, None] * gds
 
     @triton.jit
+    def _reconstruct_qdq_weight_tile(
+        qw_ptr,
+        sfw_ptr,
+        global_amax_ptr,
+        expert,
+        pid_m,
+        pid_n,
+        M,
+        N,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+    ):
+        """Reconstruct one ``W_qdq`` tile of expert ``expert`` on chip, in bf16.
+
+        Reads the rowwise operand §11.1 saved -- ``(E, M, N//2)`` packed codes plus
+        ``(E, M//128, N//64, 32, 16)`` swizzled scales -- and returns a
+        ``(BLOCK_M, BLOCK_N)`` bf16 tile, un-transposed and un-rotated.
+
+        Every lazy requantization path starts here: the cast one (§11.6/§11.7) then
+        transposes, the RHT one (§11.4/§11.5) transposes and rotates. It is one
+        function rather than one per file because the amax pass and the quantize pass
+        must reconstruct bit-identically -- if they drift, the amax stops bounding the
+        tensor being quantized and both gradients come out biased low. The two files
+        select between each other by recipe off the same saved weight, so that
+        invariant has to hold across them, not just within each.
+
+        The bf16 round-through here is required, not incidental: the reference takes
+        it, and dropping it makes the codes differ.
+        """
+        # Load packed fp4 codes
+        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        packed_inner = pid_n * (BLOCK_N // 2) + tl.arange(0, BLOCK_N // 2)
+        packed_offsets = offs_m[:, None] * (N // 2) + packed_inner[None, :]
+        qw_expert_ptr = qw_ptr + expert * M * (N // 2)
+        qw = tl.load(qw_expert_ptr + packed_offsets)
+
+        # Load swizzled scales
+        sfw_expert_stride = (M // 128) * (N // 64) * 32 * 16
+        sfw_expert_ptr = sfw_ptr + expert * sfw_expert_stride
+        sfw = _load_scales_swizzle(
+            sfw_expert_ptr,
+            pid_m,
+            pid_n,
+            M,
+            N,
+            BLOCK_M,
+            BLOCK_N,
+        )
+
+        # Load global amax precomputed in forward pass. Per expert -- a reduction
+        # across experts would decode every expert with expert 0's scale. This must be
+        # the exact scale the forward encoded with, which is why it goes through
+        # _nvfp4_global_scales rather than an open-coded divide.
+        FP8_E4M3_MAX: tl.constexpr = 448.0
+        amax_w = tl.load(global_amax_ptr + expert)
+        _, global_decode_scale = _nvfp4_global_scales(amax_w, FP8_E4M3_MAX)
+        dequant_w = _rescale_fp4(qw, sfw, global_decode_scale, BLOCK_M, BLOCK_N)
+
+        # A NaN or inf global_amax must reconstruct to zero, not propagate.
+        valid_amax = (amax_w == amax_w) & (tl.abs(amax_w) != float("inf"))
+        dequant_w = tl.where(valid_amax, dequant_w, 0.0).to(tl.bfloat16)
+        return tl.reshape(dequant_w, [BLOCK_M, BLOCK_N])
+
+    @triton.jit
     def _nvfp4_quantize(
         a_t_rht,
         global_amax,
@@ -646,6 +710,9 @@ else:
 
     def _rescale_fp4(*args, **kwargs):
         raise RuntimeError("_rescale_fp4 requires Triton")
+
+    def _reconstruct_qdq_weight_tile(*args, **kwargs):
+        raise RuntimeError("_reconstruct_qdq_weight_tile requires Triton")
 
     def _nvfp4_quantize(*args, **kwargs):
         raise RuntimeError("_nvfp4_quantize requires Triton")

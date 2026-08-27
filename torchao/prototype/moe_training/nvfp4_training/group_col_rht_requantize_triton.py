@@ -24,7 +24,9 @@ a per-expert ``B`` would need a different operand per group and is not implement
 
 Both ops share ``_load_rht_requant_weight_tile`` and that sharing is a correctness
 requirement. If the amax pass and the quantize pass reconstructed or rotated
-``W_qdq`` differently, the amax would not bound the tensor being quantized.
+``W_qdq`` differently, the amax would not bound the tensor being quantized. The
+reconstruction under it is ``_reconstruct_qdq_weight_tile`` in ``hadamard_utils``,
+shared with the un-rotated twins so the invariant holds across the two files too.
 
 Note the decode numerator here is 2688, not 1536: the weight is a *cast* operand
 even in V2. Only the MS-EDEN gradient operands use 1536.
@@ -53,10 +55,8 @@ if torch_version_at_least("2.10.0") and has_triton():
     import triton.language as tl
 
     from torchao.prototype.moe_training.nvfp4_training.hadamard_utils import (  # noqa: F401
-        _load_scales_swizzle,
-        _nvfp4_global_scales,
         _nvfp4_quantize,
-        _rescale_fp4,
+        _reconstruct_qdq_weight_tile,
         _store_scales_swizzle,
         _swizzle_scales,
         convert_8xfp32_to_4xfp4_packed,
@@ -90,8 +90,10 @@ if torch_version_at_least("2.10.0") and has_triton():
         Shared by both kernels below; see the module docstring for why that matters.
         Returns ``(BLOCK_N * BLOCK_M // RHT_SIZE, RHT_SIZE)`` bf16.
 
-        The bf16 round-through *before* the rotation is required to match the
-        reference; so is the one after the ``tl.dot``.
+        The reconstruction is ``_reconstruct_qdq_weight_tile``, the same one the cast
+        twins use, which is what keeps the two files decoding the saved weight
+        identically. Its bf16 round-through *before* the rotation is required to match
+        the reference; so is the one after the ``tl.dot``.
         """
         # The reshape below is only correct while an RHT chunk stays inside one row
         # of the transposed tile, whose inner extent is BLOCK_M. Violating this
@@ -101,18 +103,11 @@ if torch_version_at_least("2.10.0") and has_triton():
             BLOCK_M % RHT_SIZE == 0, "columnwise RHT requires BLOCK_M % RHT_SIZE == 0"
         )
 
-        # Load packed fp4 codes
-        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-        packed_inner = pid_n * (BLOCK_N // 2) + tl.arange(0, BLOCK_N // 2)
-        packed_offsets = offs_m[:, None] * (N // 2) + packed_inner[None, :]
-        qw_expert_ptr = qw_ptr + expert * M * (N // 2)
-        qw = tl.load(qw_expert_ptr + packed_offsets)
-
-        # Load swizzled scales
-        sfw_expert_stride = (M // 128) * (N // 64) * 32 * 16
-        sfw_expert_ptr = sfw_ptr + expert * sfw_expert_stride
-        sfw = _load_scales_swizzle(
-            sfw_expert_ptr,
+        w_qdq = _reconstruct_qdq_weight_tile(
+            qw_ptr,
+            sfw_ptr,
+            global_amax_ptr,
+            expert,
             pid_m,
             pid_n,
             M,
@@ -121,24 +116,14 @@ if torch_version_at_least("2.10.0") and has_triton():
             BLOCK_N,
         )
 
-        # Load global amax precomputed in forward pass. Per expert -- a reduction
-        # across experts would decode every expert with expert 0's scale.
-        FP8_E4M3_MAX: tl.constexpr = 448.0
-        amax_w = tl.load(global_amax_ptr + expert)
-        _, global_decode_scale = _nvfp4_global_scales(amax_w, FP8_E4M3_MAX)
-        dequant_w = _rescale_fp4(qw, sfw, global_decode_scale, BLOCK_M, BLOCK_N)
-
-        # A NaN or inf global_amax must reconstruct to zero, not propagate.
-        valid_amax = (amax_w == amax_w) & (tl.abs(amax_w) != float("inf"))
-        dequant_w = tl.where(valid_amax, dequant_w, 0.0).to(tl.bfloat16)
-
         rht_range = tl.arange(0, RHT_SIZE)
         rht_offsets = rht_range[:, None] * RHT_SIZE + rht_range[None, :]
         rht = tl.load(rht_ptr + rht_offsets)
 
-        dequant_w_t = tl.trans(tl.reshape(dequant_w, [BLOCK_M, BLOCK_N]))
-        dequant_w_t = tl.reshape(dequant_w_t, [BLOCK_N * BLOCK_M // RHT_SIZE, RHT_SIZE])
-        return tl.dot(dequant_w_t, rht).to(tl.bfloat16)
+        w_qdq_t = tl.reshape(
+            tl.trans(w_qdq), [BLOCK_N * BLOCK_M // RHT_SIZE, RHT_SIZE]
+        )
+        return tl.dot(w_qdq_t, rht).to(tl.bfloat16)
 
     @triton.autotune(configs=_GROUP_COL_RHT_REQUANT_CONFIGS, key=["M", "N"])
     @triton.jit

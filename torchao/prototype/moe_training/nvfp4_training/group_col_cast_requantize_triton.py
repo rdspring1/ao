@@ -23,7 +23,9 @@ shared scale byte instead.
 Both ops live in one file because they share ``_load_requant_weight_tile``. That
 sharing is a correctness requirement, not an optimization: if the amax pass and the
 quantize pass reconstructed ``W_qdq`` differently, ``amax_w_qdq_t`` would not bound
-the tensor actually being quantized and both gradients would come out biased low.
+the tensor actually being quantized and both gradients would come out biased low. The
+reconstruction itself is ``_reconstruct_qdq_weight_tile`` in ``hadamard_utils``, shared
+with the rotated twins so the invariant holds across the two files as well.
 
 No sign vector: these apply no transform. The rotated twins are in
 ``group_col_rht_requantize_triton.py``.
@@ -51,10 +53,8 @@ if torch_version_at_least("2.10.0") and has_triton():
     import triton.language as tl
 
     from torchao.prototype.moe_training.nvfp4_training.hadamard_utils import (  # noqa: F401
-        _load_scales_swizzle,
-        _nvfp4_global_scales,
         _nvfp4_quantize,
-        _rescale_fp4,
+        _reconstruct_qdq_weight_tile,
         _store_scales_swizzle,
         _swizzle_scales,
         convert_8xfp32_to_4xfp4_packed,
@@ -86,22 +86,15 @@ if torch_version_at_least("2.10.0") and has_triton():
         Shared by both kernels below -- see the module docstring for why that is
         load-bearing. Returns a ``(BLOCK_N, BLOCK_M)`` bf16 tile.
 
-        The bf16 round-through before the transpose is required, not incidental:
-        the reference takes it, and dropping it makes the codes differ.
+        The reconstruction itself lives in ``_reconstruct_qdq_weight_tile`` so that
+        this file and the RHT one decode the saved weight identically; all this adds
+        is the transpose.
         """
-
-        # Load packed fp4 codes
-        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-        packed_inner = pid_n * (BLOCK_N // 2) + tl.arange(0, BLOCK_N // 2)
-        packed_offsets = offs_m[:, None] * (N // 2) + packed_inner[None, :]
-        qw_expert_ptr = qw_ptr + expert * M * (N // 2)
-        qw = tl.load(qw_expert_ptr + packed_offsets)
-
-        # Load swizzled scales
-        sfw_expert_stride = (M // 128) * (N // 64) * 32 * 16
-        sfw_expert_ptr = sfw_ptr + expert * sfw_expert_stride
-        sfw = _load_scales_swizzle(
-            sfw_expert_ptr,
+        w_qdq = _reconstruct_qdq_weight_tile(
+            qw_ptr,
+            sfw_ptr,
+            global_amax_ptr,
+            expert,
             pid_m,
             pid_n,
             M,
@@ -109,18 +102,7 @@ if torch_version_at_least("2.10.0") and has_triton():
             BLOCK_M,
             BLOCK_N,
         )
-
-        # Load global amax precomputed in forward pass. Per expert -- a reduction
-        # across experts would decode every expert with expert 0's scale.
-        FP8_E4M3_MAX: tl.constexpr = 448.0
-        amax_w = tl.load(global_amax_ptr + expert)
-        _, global_decode_scale = _nvfp4_global_scales(amax_w, FP8_E4M3_MAX)
-        dequant_w = _rescale_fp4(qw, sfw, global_decode_scale, BLOCK_M, BLOCK_N)
-
-        # A NaN or inf global_amax must reconstruct to zero, not propagate.
-        valid_amax = (amax_w == amax_w) & (tl.abs(amax_w) != float("inf"))
-        dequant_w = tl.where(valid_amax, dequant_w, 0.0).to(tl.bfloat16)
-        return tl.trans(tl.reshape(dequant_w, [BLOCK_M, BLOCK_N]))
+        return tl.trans(w_qdq)
 
     @triton.autotune(configs=_GROUP_COL_CAST_REQUANT_CONFIGS, key=["M", "N"])
     @triton.jit
