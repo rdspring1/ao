@@ -70,14 +70,6 @@ def prepare_for_cuda_graph(
     # diag(signs) @ H128 per launch and so have no sign vector to enumerate here,
     # but the Hadamard itself must still be allocated outside the graph pool.
     get_hadamard_matrix(128, key, torch.bfloat16)
-    # The V2/V1_REQUANT dense linears' one-element offsets buffer. Four bytes, but
-    # it is written every forward and every backward, so its address has to be
-    # stable across replays like the workspace above.
-    from torchao.prototype.moe_training.nvfp4_training.nvfp4_linear_v2 import (
-        prewarm_degenerate_group_args,
-    )
-
-    prewarm_degenerate_group_args(key)
     return _TMA_WORKSPACES[key]
 
 

@@ -12,7 +12,6 @@ that claim rather than to check numerics: that no non-grouped kernel is reachabl
 and that the linear path and the grouped path agree at ``E = 1``.
 """
 
-from unittest import mock
 
 import pytest
 import torch
@@ -131,57 +130,28 @@ def test_every_quantize_op_it_imports_is_grouped():
 
 
 @maybe_sm100
-def test_degenerate_group_offsets_reuse_one_buffer_across_row_counts():
-    """The CUDA-graph invariant: one address, whatever the row count.
+@pytest.mark.parametrize("recipe", [NVFP4Recipe.V1_REQUANT, NVFP4Recipe.V2])
+def test_torch_compile_survives_a_prior_eager_forward(recipe):
+    """The regression the per-device offsets buffer caused.
 
-    A fresh scalar per forward allocates into the graph pool. A cache keyed on the
-    row count is no better -- it hands out a different address per value, so a count
-    first seen during capture allocates into the pool too. Only a buffer that is
-    overwritten has an address stable enough to replay, which is why this asserts
-    identity across DIFFERENT row counts rather than the same one.
+    That buffer held a real one-element tensor and filled it in place every forward
+    and backward, for a stable address across CUDA-graph replays. Dynamo traces under
+    a FakeTensorMode in every compile mode, so once anything had allocated it --
+    an eager forward, or prepare_for_cuda_graph, which prewarmed it even for a
+    V1-only setup that never read it -- filling it while tracing raised, and
+    torch.compile was dead for the rest of the process.
+
+    Eager first, then compile, is the order that failed; compiling from a cold
+    process always worked, which is why it survived the existing tests.
     """
-    v2_mod._DEGENERATE_OFFSETS.clear()
-    a = v2_mod._degenerate_group_args(_M, "cuda:0")
-    b = v2_mod._degenerate_group_args(_M, "cuda:0")
-    c = v2_mod._degenerate_group_args(2 * _M, "cuda:0")
-    assert a is b is c, "row count changed the buffer's identity"
-    assert a.data_ptr() == c.data_ptr()
-    assert c.tolist() == [2 * _M] and c.dtype == torch.int32
-    assert len(v2_mod._DEGENERATE_OFFSETS) == 1
+    layer = _layer(recipe)
+    x = torch.randn(_M, _K, device="cuda", dtype=torch.bfloat16)
+    layer(x).sum().backward()
+    layer.weight.grad = None
 
-
-@maybe_sm100
-def test_degenerate_group_offsets_do_not_populate_the_buffer_while_tracing():
-    """An unwarmed first call under tracing must not reach process-wide state.
-
-    torch.empty under a FakeTensorMode returns a FakeTensor bound to that mode;
-    storing it hands the same object to every later mode, which asserts
-    "Mixing fake modes NYI". That is how the lru_cache version failed -- on every
-    rank, under full activation checkpointing, at moe.shared_experts.w1.
-
-    is_compiling() is monkeypatched rather than driven through torch.compile because
-    the contract under test is the guard itself.
-    """
-    v2_mod._DEGENERATE_OFFSETS.clear()
-    with mock.patch.object(torch.compiler, "is_compiling", lambda: True):
-        a = v2_mod._degenerate_group_args(_M, "cuda:0")
-        b = v2_mod._degenerate_group_args(_M, "cuda:0")
-    assert a is not b, "an unwarmed traced call was served from the buffer"
-    assert not v2_mod._DEGENERATE_OFFSETS, "a traced call populated the buffer"
-    assert a.tolist() == [_M] and a.dtype == torch.int32
-
-
-@maybe_sm100
-def test_prewarmed_buffer_is_used_while_tracing():
-    """Once prewarmed the buffer is real, so tracing must use it -- that IS the
-    capture path. A guard that always bypassed while compiling would defeat the
-    stable address it exists to protect."""
-    v2_mod._DEGENERATE_OFFSETS.clear()
-    warm = v2_mod.prewarm_degenerate_group_args("cuda:0")
-    with mock.patch.object(torch.compiler, "is_compiling", lambda: True):
-        got = v2_mod._degenerate_group_args(_M, "cuda:0")
-    assert got is warm
-    assert v2_mod.prewarm_degenerate_group_args("cuda:0") is warm, "not idempotent"
+    out = torch.compile(layer)(x)
+    assert out.shape == (_M, _N)
+    assert torch.isfinite(out).all()
 
 
 @maybe_sm100
