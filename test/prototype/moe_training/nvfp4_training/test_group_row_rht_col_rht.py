@@ -24,7 +24,7 @@ from .nvfp4_reference import (
     reference_row_rht_col_rht_amax,
 )
 
-_AMAX_IMPLEMENTED = False
+_AMAX_IMPLEMENTED = True
 # MS-EDEN also needs `stochastic_rounding_fp8_e4m3` and `_quantize_ms_eden` ported
 # from the monorepo; see the kernel module docstring.
 _MS_EDEN_IMPLEMENTED = False
@@ -164,7 +164,7 @@ def test_amax_per_group_isolation():
 @torch.no_grad()
 def test_zero_gradient_gives_zero_amaxes_without_nan():
     dy, offs = _packed([128, 128], 512)
-    got = _amax(torch.zeros_like(dy), _signs(0), _signs(1), offs, 2)
+    got = _amax(torch.zeros_like(dy), _signs(seed=0), _signs(seed=1), offs, 2)
     assert torch.equal(torch.stack(got), torch.zeros(2, 2, device="cuda"))
 
 

@@ -96,6 +96,16 @@ if torch_version_at_least("2.10.0") and has_triton():
         logical_packed_length_ptr,
     ):
         """Grouped fused RHT columnwise and direct rowwise NVFP4 quantization."""
+        # The RHT runs along the inner axis of the reshape below, so each
+        # (BLOCK_N * BLOCK_M // RHT_SIZE, RHT_SIZE) chunk must stay inside one row of
+        # a_t -- i.e. inside one hidden column's run of BLOCK_M tokens. At
+        # BLOCK_M % RHT_SIZE != 0 a chunk straddles two hidden columns and the
+        # transform is applied across the wrong axis, which raises nothing and yields
+        # a wrong amax. Compile-time so an autotune config that breaks it cannot be
+        # benchmarked, let alone selected.
+        tl.static_assert(
+            BLOCK_M % RHT_SIZE == 0, "columnwise RHT requires BLOCK_M % RHT_SIZE == 0"
+        )
         VARYING_FIRST_DIM: tl.constexpr = 1
 
         tile_idx = tl.program_id(0)

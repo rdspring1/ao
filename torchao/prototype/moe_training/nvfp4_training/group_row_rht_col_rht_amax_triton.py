@@ -85,6 +85,17 @@ if torch_version_at_least("2.10.0") and has_triton():
 
         Both reductions must re-inject NaN explicitly, since ``tl.max`` drops it.
         """
+        # Both axes are transformed here, so both reshapes must keep an RHT chunk
+        # inside one row: `a` is (BLOCK_M, BLOCK_N) and chunks along the hidden axis,
+        # `a_t` is (BLOCK_N, BLOCK_M) and chunks along the token axis. Violating
+        # either applies the transform across the wrong axis with no error, only a
+        # wrong gradient.
+        tl.static_assert(
+            BLOCK_N % RHT_SIZE == 0, "rowwise RHT requires BLOCK_N % RHT_SIZE == 0"
+        )
+        tl.static_assert(
+            BLOCK_M % RHT_SIZE == 0, "columnwise RHT requires BLOCK_M % RHT_SIZE == 0"
+        )
         VARYING_FIRST_DIM: tl.constexpr = 1
 
         num_tiles_token = tl.cdiv(M, BLOCK_M)
