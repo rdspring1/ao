@@ -391,8 +391,19 @@ if has_triton():
         return global_encode_scale, tl.div_rn(one, global_encode_scale)
 
     @triton.jit
-    def _rescale_fp4(qa_fp4, sfa, gds, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
-        """Dequantize a packed FP4 tile back to FP32 -- the ``W_qdq`` reconstruction.
+    def _nvfp4_dequantize(
+        qa_fp4, sfa, gds, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr
+    ):
+        """Decode one packed NVFP4 tile back to FP32. The inverse of the encode half
+        of ``_nvfp4_quantize``.
+
+        Two steps, both of which the name has to carry: **unpack** the two FP4 codes
+        per byte into FP32 lanes, then **rescale** each 16-element vector by its FP8
+        block scale and the per-tensor global decode scale. It is not a rescale alone
+        -- the unpack is why the output has 2x the elements of the input.
+
+        Used to dequantize the quantize forward weight tile and in four or six 
+        quantization in forward.
 
         Args:
             qa_fp4: ``(BLOCK_M, BLOCK_N//2)`` packed uint8 FP4 codes.
@@ -402,6 +413,11 @@ if has_triton():
 
         Returns ``(BLOCK_M, BLOCK_N//16, 16)`` FP32; reshape to ``(BLOCK_M, BLOCK_N)``
         for a plain 2D view.
+
+        Used by:
+            ``_reconstruct_qdq_weight_tile`` below, its only caller -- which is to say
+            every lazy requantization kernel, and nothing else. The forward quantize
+            path never decodes.
         """
         qa_f32_unpacked = convert_4xfp4_packed_to_8xfp32(qa_fp4)
         qa_f32_blocked = qa_f32_unpacked.reshape(BLOCK_M, BLOCK_N // 16, 16)
@@ -436,6 +452,20 @@ if has_triton():
 
         The bf16 round-through here is required, not incidental: the reference takes
         it, and dropping it makes the codes differ.
+
+        Used by:
+            ``_load_requant_weight_tile`` in ``group_col_cast_requantize_triton.py``,
+            feeding ``_group_col_cast_requant_amax_kernel`` (§11.6) and
+            ``_group_col_cast_requantize_kernel`` (§11.7).
+
+            ``_load_rht_requant_weight_tile`` in ``group_col_rht_requantize_triton.py``,
+            feeding ``_group_col_rht_requant_amax_kernel`` (§11.4) and
+            ``_group_col_rht_requantize_kernel`` (§11.5).
+
+            All four are lazy-requantization kernels: they rebuild the backward
+            operand from the rowwise weight §11.1 saved, rather than re-reading the
+            original BF16 weight. Any new kernel that decodes a saved forward weight
+            belongs on this helper too.
         """
         # Load packed fp4 codes
         offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -464,7 +494,7 @@ if has_triton():
         FP8_E4M3_MAX: tl.constexpr = 448.0
         amax_w = tl.load(global_amax_ptr + expert)
         _, global_decode_scale = _nvfp4_global_scales(amax_w, FP8_E4M3_MAX)
-        dequant_w = _rescale_fp4(qw, sfw, global_decode_scale, BLOCK_M, BLOCK_N)
+        dequant_w = _nvfp4_dequantize(qw, sfw, global_decode_scale, BLOCK_M, BLOCK_N)
 
         # A NaN or inf global_amax must reconstruct to zero, not propagate.
         valid_amax = (amax_w == amax_w) & (tl.abs(amax_w) != float("inf"))
@@ -708,8 +738,8 @@ else:
     def _nvfp4_global_scales(*args, **kwargs):
         raise RuntimeError("_nvfp4_global_scales requires Triton")
 
-    def _rescale_fp4(*args, **kwargs):
-        raise RuntimeError("_rescale_fp4 requires Triton")
+    def _nvfp4_dequantize(*args, **kwargs):
+        raise RuntimeError("_nvfp4_dequantize requires Triton")
 
     def _reconstruct_qdq_weight_tile(*args, **kwargs):
         raise RuntimeError("_reconstruct_qdq_weight_tile requires Triton")

@@ -37,7 +37,7 @@ kernel set** for V1_REQUANT or V2, now or later.
 | `group_row_rht_col_rht_quantize_ms_eden_triton.py` | §11.3 **stub** |
 
 Modified: `hadamard_utils.py` (H128 via Kronecker, `get_dynamic_rht_matrix`,
-`_nvfp4_global_scales` / `_rescale_fp4` / `_load_scales_swizzle` /
+`_nvfp4_global_scales` / `_nvfp4_dequantize` / `_load_scales_swizzle` /
 `convert_4xfp4_packed_to_8xfp32` ported from the monorepo, tensor guard on
 `get_rht_matrix`), `group_hadamard_utils.py` (`rht_size` param,
 `_validate_requant_weight_inputs`), `nvfp4_training.py` (`recipe` field + dispatch),
