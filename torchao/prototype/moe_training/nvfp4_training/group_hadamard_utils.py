@@ -55,6 +55,21 @@ if torch_version_at_least("2.10.0") and has_triton():
                 end = mid
         return start
 
+    @triton.jit
+    def _atomic_max_2d(values, output_ptr, group_idx):
+        """Reduce a 2D tile to one atomic_max into ``output_ptr[group_idx]``.
+
+        ``tl.max`` drops NaN, so a NaN activation would silently produce a finite
+        amax; it is re-injected explicitly.
+        """
+        amax = tl.max(tl.max(values, axis=1), axis=0)
+        amax_has_nan = tl.max(
+            tl.max((values != values).to(tl.int32), axis=1),
+            axis=0,
+        )
+        amax = tl.where(amax_has_nan != 0, float("nan"), amax)
+        tl.atomic_max(output_ptr + group_idx, amax.to(tl.float32))
+
 
 def _rht_matrix(
     sign_vector,

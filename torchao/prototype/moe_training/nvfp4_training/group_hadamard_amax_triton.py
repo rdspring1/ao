@@ -29,6 +29,7 @@ if torch_version_at_least("2.10.0") and has_triton():
     from torchao.prototype.moe_training.nvfp4_training.group_hadamard_utils import (
         BLOCK_M,
         BLOCK_N,
+        _atomic_max_2d,
         _get_group_idx_binary,
         _rht_matrix,
         _validate_grouped_hadamard_inputs,
@@ -56,16 +57,6 @@ if torch_version_at_least("2.10.0") and has_triton():
         for ns in (3, 4)
         for nw in (4, 8)
     ]
-
-    @triton.jit
-    def _atomic_max_2d(values, output_ptr, group_idx):
-        amax = tl.max(tl.max(values, axis=1), axis=0)
-        amax_has_nan = tl.max(
-            tl.max((values != values).to(tl.int32), axis=1),
-            axis=0,
-        )
-        amax = tl.where(amax_has_nan != 0, float("nan"), amax)
-        tl.atomic_max(output_ptr + group_idx, amax.to(tl.float32))
 
     @triton.jit
     def _group_rht_amax_triton_kernel(

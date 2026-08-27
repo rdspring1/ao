@@ -4,9 +4,9 @@
 # This source code is licensed under the BSD 3-Clause license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Grouped rowwise-RHT + columnwise-RHT amax. Design doc §11.2 (§5).
+"""Grouped rowwise-RHT + columnwise-RHT amax.
 
-The V2 backward gradient amax pass. Unlike §11.8, **both** axes are transformed,
+The V2 backward gradient amax pass. **Both** axes are transformed,
 with **independent** sign vectors:
 
     R_n              = diag(dgrad_rht) @ H_128 / sqrt(128)
@@ -42,13 +42,14 @@ if torch_version_at_least("2.10.0") and has_triton():
     import triton
     import triton.language as tl
 
-    from torchao.prototype.moe_training.nvfp4_training.group_hadamard_utils import (  # noqa: F401
+    from torchao.prototype.moe_training.nvfp4_training.group_hadamard_utils import (
         BLOCK_M,
         BLOCK_N,
+        _atomic_max_2d,
         _get_group_idx_binary,
         _validate_grouped_hadamard_inputs,
     )
-    from torchao.prototype.moe_training.nvfp4_training.hadamard_utils import (  # noqa: F401
+    from torchao.prototype.moe_training.nvfp4_training.hadamard_utils import (
         get_dynamic_rht_matrix,
     )
 
@@ -80,32 +81,64 @@ if torch_version_at_least("2.10.0") and has_triton():
     ):
         """Grouped RHT-128 amax on both axes, one tile per CTA.
 
-        Two independent Hadamard operands are loaded, not one. Sketch:
-
-            token_tile_idx = (tile_idx // num_tiles_hidden).to(tl.int64)   # int64!
-            token_offset = token_tile_idx * BLOCK_M
-            if token_offset < tl.load(logical_packed_length_ptr):
-                group_idx = _get_group_idx_binary(token_offset, offsets_ptr, num_tensors)
-                a = <load (BLOCK_M, BLOCK_N) tile>
-                row_rht = <load (RHT_SIZE, RHT_SIZE) from row_rht_ptr>   # R_n
-                col_rht = <load (RHT_SIZE, RHT_SIZE) from col_rht_ptr>   # R_m
-
-                a_r = tl.reshape(a, [BLOCK_M * BLOCK_N // RHT_SIZE, RHT_SIZE])
-                a_rht = tl.dot(a_r, row_rht).to(tl.bfloat16)
-                <atomic_max abs(a_rht) into amax_row_rht_ptr + group_idx>
-
-                a_t_r = tl.reshape(tl.trans(a), [BLOCK_N * BLOCK_M // RHT_SIZE, RHT_SIZE])
-                a_t_rht = tl.dot(a_t_r, col_rht).to(tl.bfloat16)
-                <atomic_max abs(a_t_rht) into amax_col_rht_ptr + group_idx>
-
-        ``row_rht`` multiplies the un-transposed tile and ``col_rht`` the transposed
-        one. Wiring them the other way round is the single most likely bug here and
-        produces no error, only a wrong gradient.
+        ``row_rht`` multiplies the original tile and ``col_rht`` the transposee one.
 
         Both reductions must re-inject NaN explicitly, since ``tl.max`` drops it.
         """
-        # TODO(nvfp4-v2): implement. See design doc §11.2 / §5.
-        tl.static_assert(False, "_group_row_rht_col_rht_amax_kernel is not implemented")
+        VARYING_FIRST_DIM: tl.constexpr = 1
+
+        num_tiles_token = tl.cdiv(M, BLOCK_M)
+        num_tiles_hidden = tl.cdiv(N, BLOCK_N)
+        tile_idx = tl.program_id(0)
+        # int64 tile index: offsets_m * N overflows int32 once the packed token
+        # count times N exceeds 2**31.
+        token_tile_idx = (tile_idx // num_tiles_hidden).to(tl.int64)
+        hidden_tile_idx = tile_idx - token_tile_idx * num_tiles_hidden
+        token_offset = token_tile_idx * BLOCK_M
+        logical_packed_length = tl.load(logical_packed_length_ptr)
+
+        if token_offset < logical_packed_length:
+            if SHAPE_REP == VARYING_FIRST_DIM:
+                group_idx = _get_group_idx_binary(
+                    token_offset,
+                    offsets_ptr,
+                    num_tensors,
+                )
+            else:
+                group_idx = token_tile_idx // (num_tiles_token // num_tensors)
+
+            offsets_m = token_offset + tl.arange(0, BLOCK_M)
+            offsets_n = hidden_tile_idx * BLOCK_N + tl.arange(0, BLOCK_N)
+            a = tl.load(a_ptr + offsets_m[:, None] * N + offsets_n[None, :])
+
+            rht_offsets = (
+                tl.arange(0, RHT_SIZE)[:, None] * RHT_SIZE
+                + tl.arange(0, RHT_SIZE)[None, :]
+            )
+            # Two independent operands, unlike every other RHT kernel here. R_n
+            # multiplies the un-transposed tile, R_m the transposed one; crossing
+            # them raises nothing and yields a wrong gradient.
+            row_rht = tl.load(row_rht_ptr + rht_offsets)
+            col_rht = tl.load(col_rht_ptr + rht_offsets)
+
+            a_reshape = tl.reshape(a, [BLOCK_M * BLOCK_N // RHT_SIZE, RHT_SIZE])
+            a_rht = tl.dot(a_reshape, row_rht).to(tl.bfloat16)
+
+            _atomic_max_2d(
+                tl.abs(a_rht),
+                amax_row_rht_ptr,
+                group_idx,
+            )
+
+            a_t = tl.trans(a)
+            a_t_reshape = tl.reshape(a_t, [BLOCK_N * BLOCK_M // RHT_SIZE, RHT_SIZE])
+            a_t_rht = tl.dot(a_t_reshape, col_rht).to(tl.bfloat16)
+
+            _atomic_max_2d(
+                tl.abs(a_t_rht),
+                amax_col_rht_ptr,
+                group_idx,
+            )
 
     @torch.library.custom_op(
         "torchao::triton_group_row_rht_col_rht_amax", mutates_args=()
