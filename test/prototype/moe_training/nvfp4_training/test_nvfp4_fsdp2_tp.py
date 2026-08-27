@@ -6,6 +6,10 @@
 """
 4-GPU FSDP2 + TP smoke coverage for NVFP4Linear.
 
+V1 runs FSDP2 + TP. V1_REQUANT and V2 raise on ``process_group``, so they get an
+FSDP2-only test instead -- which is also the only place the V2 sign-resample
+cadence meets parameter sharding.
+
 Run with:
     torchrun --standalone --nproc_per_node=4 -m pytest \
         test/prototype/moe_training/nvfp4_training/test_nvfp4_fsdp2_tp.py -q
@@ -44,6 +48,14 @@ from torchao.prototype.moe_training.nvfp4_training.nvfp4_tensor_parallel import 
     NVFP4ColwiseParallel,
     NVFP4RowwiseParallel,
 )
+from torchao.prototype.moe_training.nvfp4_training.nvfp4_recipe import (
+    NVFP4Recipe,
+    recipe_uses_dynamic_signs,
+)
+from torchao.prototype.moe_training.nvfp4_training.nvfp4_rht_cadence import (
+    iter_dynamic_sign_buffers,
+    resample_nvfp4_rht_signs,
+)
 from torchao.prototype.moe_training.nvfp4_training.nvfp4_training import NVFP4Linear
 from torchao.quantization.quantize_.common.kernel_preference import KernelPreference
 from torchao.utils import is_sm_at_least_100, torch_version_at_least
@@ -69,6 +81,7 @@ class NVFP4MLP(nn.Module):
         device: str | torch.device,
         dtype: torch.dtype,
         kernel_preference: KernelPreference = KernelPreference.TRITON,
+        recipe: NVFP4Recipe = NVFP4Recipe.V1,
     ):
         super().__init__()
         self.w1 = NVFP4Linear(
@@ -78,6 +91,7 @@ class NVFP4MLP(nn.Module):
             kernel_preference=kernel_preference,
             device=device,
             dtype=dtype,
+            recipe=recipe,
         )
         self.w2 = NVFP4Linear(
             size,
@@ -86,6 +100,7 @@ class NVFP4MLP(nn.Module):
             kernel_preference=kernel_preference,
             device=device,
             dtype=dtype,
+            recipe=recipe,
         )
         self.out_proj = NVFP4Linear(
             hidden_size,
@@ -94,6 +109,7 @@ class NVFP4MLP(nn.Module):
             kernel_preference=kernel_preference,
             device=device,
             dtype=dtype,
+            recipe=recipe,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -279,3 +295,89 @@ def test_nvfp4_mlp_fsdp2_tp_cutedsl_cuda_graph_smoke(distributed_env: DeviceMesh
     _test_nvfp4_mlp_fsdp2_tp_smoke(
         distributed_env, compile_model=True, kernel_preference=KernelPreference.CUTEDSL
     )
+
+
+def _assert_signs_agree_across_ranks(model: nn.Module) -> None:
+    """Every rank must hold the same sign vector for the same buffer.
+
+    nvfp4_rht_cadence derives each vector from the module FQN with no collective, so
+    agreement is a property of the names matching. A wrapper that renames modules on
+    some ranks and not others -- or a buffer FSDP2 decided to shard -- desynchronizes
+    the RHT and silently corrupts gradients, with nothing else in the step to catch it.
+    """
+    for fqn, name, buffer, _ in iter_dynamic_sign_buffers(model):
+        local = _local_tensor(buffer).to(torch.int32)
+        gathered = [torch.empty_like(local) for _ in range(dist.get_world_size())]
+        dist.all_gather(gathered, local)
+        for rank, other in enumerate(gathered):
+            assert torch.equal(local, other), (
+                f"{fqn}.{name} differs on rank {rank}: ranks disagree on the RHT"
+            )
+
+
+def _test_nvfp4_mlp_fsdp2_smoke(
+    distributed_env: DeviceMesh, *, recipe: NVFP4Recipe
+) -> None:
+    """FSDP2 without TP, driving the resample cadence the way a trainer must.
+
+    Sharding uses the 2-rank ``dp`` submesh, so the two ``tp`` coordinates train
+    independent replicas. That covers what is untested for these recipes -- parameter
+    sharding, the per-step sign resample, and their interaction -- without a TP path
+    they deliberately do not have.
+    """
+    mesh = distributed_env
+    dp_mesh = mesh["dp"]
+    dp_rank, _ = mesh.get_coordinate()
+    device = mesh.device_type
+    # V2 needs M, K and N all divisible by 128, against 16 for the V1 recipes.
+    M, K, H = 512, 256, 512
+
+    model = NVFP4MLP(K, H, device=device, dtype=torch.bfloat16, recipe=recipe)
+    model = fully_shard(model, mesh=dp_mesh)
+    optim = torch.optim.SGD(model.parameters(), lr=1e-2)
+
+    # Three linears, each owning a wgrad and a dgrad vector, and only under a recipe
+    # that resamples. A zero here is how a mis-wired training loop shows up.
+    expected_updates = 6 if recipe_uses_dynamic_signs(recipe) else 0
+
+    for iter_idx in range(2):
+        updated = resample_nvfp4_rht_signs(model, seed=7, step=iter_idx, microbatch=0)
+        assert updated == expected_updates, (
+            f"{recipe.value}: resampled {updated} sign buffers, want {expected_updates}"
+        )
+        _assert_signs_agree_across_ranks(model)
+
+        x, target = _local_batch(
+            dp_rank=dp_rank,
+            tp_rank=0,
+            iter_idx=iter_idx,
+            dp_size=dp_mesh.size(),
+            tp_size=1,
+            m=M,
+            k=K,
+            device=device,
+        )
+
+        optim.zero_grad(set_to_none=True)
+        out = model(x)
+        assert out.shape == (M, K)
+        assert out.dtype == torch.bfloat16
+        assert not out.isnan().any(), f"{recipe.value} FSDP2 output contains NaN"
+
+        loss = F.mse_loss(out.float(), target.float())
+        loss.backward()
+
+        for name, param in model.named_parameters():
+            assert param.grad is not None, f"{name}.grad is None"
+            grad = _local_tensor(param.grad)
+            assert not grad.isnan().any(), f"{name}.grad contains NaN"
+
+        optim.step()
+        torch.cuda.synchronize()
+
+
+@pytest.mark.skipif(not has_triton(), reason="unsupported without triton")
+@pytest.mark.skipif(not is_sm_at_least_100(), reason="Requires SM100+")
+@pytest.mark.parametrize("recipe", [NVFP4Recipe.V1_REQUANT, NVFP4Recipe.V2])
+def test_nvfp4_mlp_fsdp2_smoke(distributed_env: DeviceMesh, recipe: NVFP4Recipe):
+    _test_nvfp4_mlp_fsdp2_smoke(distributed_env, recipe=recipe)
