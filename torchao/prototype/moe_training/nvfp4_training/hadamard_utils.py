@@ -508,6 +508,7 @@ if has_triton():
         BLOCK_N: tl.constexpr,
         BLOCK_M: tl.constexpr,
         FAST_MATH: tl.constexpr = False,
+        FP8_E4M3_MAX: tl.constexpr = 448.0,
     ):
         """Compute per-vector FP8 scale factors and scaled FP32 values ready for FP4 packing.
 
@@ -518,7 +519,6 @@ if has_triton():
         rounding it through bfloat16 -- belongs to the caller, because only the
         columnwise path has an accumulator.
         """
-        FP8_E4M3_MAX: tl.constexpr = 448.0
         FP4_E2M1_MAX: tl.constexpr = 6.0
         FP32_MAX: tl.constexpr = torch.finfo(torch.float32).max
 
