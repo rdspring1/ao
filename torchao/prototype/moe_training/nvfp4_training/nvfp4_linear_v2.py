@@ -77,6 +77,10 @@ _SWIZZLE = [F.SwizzleType.SWIZZLE_32_4_4, F.SwizzleType.NO_SWIZZLE]
 
 
 @functools.lru_cache(maxsize=None)
+def _degenerate_group_args_cached(num_rows: int, device_key: str) -> torch.Tensor:
+    return torch.tensor([num_rows], dtype=torch.int32, device=device_key)
+
+
 def _degenerate_group_args(num_rows: int, device_key: str) -> torch.Tensor:
     """The one-element ``offsets`` tensor describing a dense tensor as a single group.
 
@@ -87,8 +91,27 @@ def _degenerate_group_args(num_rows: int, device_key: str) -> torch.Tensor:
 
     ``logical_packed_length`` is the same tensor -- for one group, ``offsets[-1:]``
     *is* the logical length -- so a single allocation serves both arguments.
+
+    The cache is BYPASSED while tracing. A call made under a ``FakeTensorMode``
+    returns a FakeTensor bound to that mode, and ``lru_cache`` then hands the same
+    object to every later mode, which asserts ``Mixing fake modes NYI``. Full
+    activation checkpointing makes that near-certain rather than unlucky: the
+    checkpointed region is retraced under its own mode, so two modes see this
+    function within a single step.
+
+    ``get_rht_matrix`` in ``hadamard_utils`` caches tensors too and is safe only
+    because ``prepare_for_cuda_graph`` prewarms it with real tensors before compile.
+    That defence is unavailable here -- the cache key is the token count, which is
+    not known ahead of time -- so the guard is on the read instead.
+
+    Bypassing costs nothing on the traced path: a ``torch.tensor`` literal inside the
+    traced region is folded into the graph, so there is no per-step allocation and
+    nothing enters the CUDA-graph pool. The eager and capture paths still hit the
+    cache and are unchanged.
     """
-    return torch.tensor([num_rows], dtype=torch.int32, device=device_key)
+    if torch.compiler.is_compiling():
+        return torch.tensor([num_rows], dtype=torch.int32, device=device_key)
+    return _degenerate_group_args_cached(num_rows, device_key)
 
 
 def _nvfp4_fp4_matmul(

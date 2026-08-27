@@ -12,6 +12,8 @@ that claim rather than to check numerics: that no non-grouped kernel is reachabl
 and that the linear path and the grouped path agree at ``E = 1``.
 """
 
+from unittest import mock
+
 import pytest
 import torch
 import torch.nn as nn
@@ -135,6 +137,32 @@ def test_degenerate_group_offsets_are_cached_not_reallocated():
     a = v2_mod._degenerate_group_args(_M, "cuda:0")
     b = v2_mod._degenerate_group_args(_M, "cuda:0")
     assert a is b
+    assert a.tolist() == [_M] and a.dtype == torch.int32
+
+
+@maybe_sm100
+def test_degenerate_group_offsets_are_not_cached_while_tracing():
+    """The other half: a call made under tracing must NOT reach the cache.
+
+    Under a FakeTensorMode this function returns a FakeTensor bound to that mode.
+    Caching it makes lru_cache hand the same object to every later mode, which
+    asserts "Mixing fake modes NYI" -- and full activation checkpointing retraces
+    the checkpointed region under a second mode, so two modes see this function
+    within one step. That is a compile-time crash no eager test can reach, and the
+    test above passes either way, so it needs its own guard.
+
+    is_compiling() is monkeypatched rather than driven through torch.compile because
+    the contract under test is the guard itself; the real path is covered by the
+    671B run.
+    """
+    v2_mod._degenerate_group_args_cached.cache_clear()
+    with mock.patch.object(torch.compiler, "is_compiling", lambda: True):
+        a = v2_mod._degenerate_group_args(_M, "cuda:0")
+        b = v2_mod._degenerate_group_args(_M, "cuda:0")
+    assert a is not b, "cache was consulted while tracing"
+    assert v2_mod._degenerate_group_args_cached.cache_info().currsize == 0, (
+        "a traced call populated the cache"
+    )
     assert a.tolist() == [_M] and a.dtype == torch.int32
 
 
