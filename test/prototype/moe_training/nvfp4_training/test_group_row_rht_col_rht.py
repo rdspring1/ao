@@ -25,9 +25,7 @@ from .nvfp4_reference import (
 )
 
 _AMAX_IMPLEMENTED = True
-# MS-EDEN also needs `stochastic_rounding_fp8_e4m3` and `_quantize_ms_eden` ported
-# from the monorepo; see the kernel module docstring.
-_MS_EDEN_IMPLEMENTED = False
+_MS_EDEN_IMPLEMENTED = True
 _needs_amax = kernel_gate(_AMAX_IMPLEMENTED, "group_row_rht_col_rht_amax_triton.py")
 _needs_ms_eden = kernel_gate(
     _AMAX_IMPLEMENTED and _MS_EDEN_IMPLEMENTED,

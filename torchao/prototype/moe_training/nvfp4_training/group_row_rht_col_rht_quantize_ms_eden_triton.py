@@ -48,20 +48,25 @@ if torch_version_at_least("2.10.0") and has_triton():
     import triton
     import triton.language as tl
 
-    from torchao.prototype.moe_training.nvfp4_training.group_hadamard_utils import (  # noqa: F401
+    from torchao.prototype.moe_training.nvfp4_training.group_hadamard_utils import (
         BLOCK_M,
         BLOCK_N,
         _get_group_idx_binary,
         _validate_grouped_hadamard_inputs,
     )
-    from torchao.prototype.moe_training.nvfp4_training.hadamard_utils import (  # noqa: F401
-        _nvfp4_global_scales,
+    from torchao.prototype.moe_training.nvfp4_training.hadamard_utils import (
+        _nvfp4_quantize,
         _store_grouped_scales_swizzle,
         _store_scales_swizzle,
         _swizzle_scales,
+        convert_4xfp4_packed_to_8xfp32,
         convert_8xfp32_to_4xfp4_packed,
         get_dynamic_rht_matrix,
     )
+
+    # A jit'ed body cannot read a plain module-level float, so the ceiling crosses
+    # into the kernel as a constexpr alias of the same constant.
+    _EDEN_BLOCK_SCALE_MAX = tl.constexpr(EDEN_BLOCK_SCALE_MAX)
 
     # num_warps pinned at 4 for the same reason as the other grouped quantize
     # kernels: the body is register-heavy and the 8-warp win is M-dependent, while
@@ -71,71 +76,70 @@ if torch_version_at_least("2.10.0") and has_triton():
     ]
 
     @triton.jit
-    def _ms_eden_correction_with_sr(sf,
-                            fp4,
-                            packed_fp4,
-                            seed_base_ptr,
-                            offset_base_ptr,
-                            pid_m,
-                            offs_n,
-                            M,
-                            BLOCK_M,
-                            BLOCK_N):
-        # Get MS-EDEN correction factor: dot(v, q) / dot(q, q) where v is the
-        # original fp32 values scaled and clamped to fp4 range but not quantized
-        # to its fp4 codebook. q is the dequantized packed fp4 values, so it is
-        # the fp32 version of the quantized fp4 codes. 
-        fp4_dequant = convert_4xfp4_packed_to_8xfp32(packed_fp4)
-        fp4_blocks = fp4.reshape(BLOCK_M, BLOCK_N // 16, 16)
-        fp4_dequant_blocks = fp4_dequant.reshape(BLOCK_M, BLOCK_N // 16, 16)
-        dot_sq = tl.sum(fp4_blocks * fp4_blocks, axis=-1)
-        dot_cross = tl.sum(fp4_blocks * fp4_dequant_blocks, axis=-1)
+    def _ms_eden_correction_with_sr(
+        block_scale,
+        scaled,
+        packed_fp4,
+        seed_ptr,
+        offset_base_ptr,
+        pid_inner,
+        offs_outer,
+        INNER,
+        BLOCK_OUTER: tl.constexpr,
+        BLOCK_INNER: tl.constexpr,
+    ):
+        """MS-EDEN's stochastic epilogue: correct the block scale, then round it.
+
+        ``scaled`` is the pre-quantization fp32 tile (v) and ``packed_fp4`` the RTNE
+        codes just written (q). The correction ``<v, v> / <v, q>`` rescales each
+        16-element block so its inner product with the input is preserved -- a
+        different objective from reproducing the input, which is why the expected
+        dequant stays a full FP4 error away from it. It falls back to 1.0 where the
+        ratio is undefined: a block that packs to all-zero codes has ``<v, q> == 0``.
+
+        The E4M3 rounding is MS-EDEN's only random step, and it happens here in fp32.
+        The returned value already sits exactly on the E4M3 grid, so the implicit
+        fp32 -> float8_e4m3fn conversion in the scale store is exact and cannot
+        re-round the draw away.
+
+        Indices are outer/inner rather than row/col because both operands call this:
+        the rowwise tile is ``(BLOCK_M, BLOCK_N)`` over hidden extent ``N``, and the
+        columnwise tile is ``(BLOCK_N, BLOCK_M)`` over packed-token extent ``M``.
+        """
+        dequant = convert_4xfp4_packed_to_8xfp32(packed_fp4)
+        v = tl.reshape(scaled, [BLOCK_OUTER, BLOCK_INNER // 16, 16])
+        q = tl.reshape(dequant, [BLOCK_OUTER, BLOCK_INNER // 16, 16])
+        dot_sq = tl.sum(v * v, axis=-1)
+        dot_cross = tl.sum(v * q, axis=-1)
         ratio = dot_sq / dot_cross
         is_finite = tl.abs(ratio) < float("inf")
         correction = tl.where((dot_cross != 0.0) & is_finite, ratio, 1.0)
+        # Corrects the already-narrowed E4M3 block scale, not the pre-narrowing
+        # pvscale, matching the reference. Triton widens the fp8 operand here.
+        corrected = block_scale * correction
 
-        # Apply stochastic rounding and MS-EDEN correction to the block scale.
-        corrected_sf = sf * correction
-        sr_corrected_sf = _stochastic_rounding_fp8_e4m3(
-            corrected_sf,
-            BLOCK_M,
-            BLOCK_N,
-            seed_base_ptr,
-            offset_base_ptr,
-            pid_m,
-            offs_n,
-            M,
-        )
-        return sr_corrected_sf
-
-    @triton.jit
-    def _stochastic_rounding_fp8_e4m3(
-        x,
-        BLOCK_N: tl.constexpr,
-        BLOCK_M: tl.constexpr,
-        seed_ptr,
-        offset_base_ptr,
-        pid_m,
-        offs_n,
-        M,
-    ):
+        # Apply stochastic rounding to the corrected block scale.
         seed = tl.load(seed_ptr)
         offset_base = tl.load(offset_base_ptr).to(tl.uint64) & 0xFFFFFFFF
-
-        # Generate a index tile
-        BLOCK_M_SF: tl.constexpr = BLOCK_M // 16
-        packed_inner_t = pid_m * BLOCK_M_SF + tl.arange(0, BLOCK_M_SF)
-        linear_idx = offs_n[:, None] * (M // 16) + packed_inner_t[None, :]
-
+        # Same int64 reasoning as the tile indices: this counter is
+        # outer_extent * inner_extent // 16, which passes 2**31 on large token counts.
+        BLOCK_INNER_SF: tl.constexpr = BLOCK_INNER // 16
+        INNER_SF = INNER // 16
+        outer_idx = offs_outer[:, None].to(tl.int64)
+        inner_sf = pid_inner * BLOCK_INNER_SF + tl.arange(0, BLOCK_INNER_SF)
+        linear_idx = outer_idx * INNER_SF + inner_sf[None, :]
         offset = (linear_idx.to(tl.uint64) << 32) | offset_base
         rbits = tl.randint(seed, offset).to(tl.uint32)
 
-        r = x * (2.0**-120)
+        # Truncate the fp32 mantissa to E4M3's 3 bits after adding a random addend
+        # over the 20 discarded bits. The 2**-120 / 2**120 round trip keeps E4M3
+        # subnormals clear of fp32's own subnormal range, where the shift would stop
+        # being a truncation.
+        r = corrected * (2.0**-120)
         r_int = r.to(tl.uint32, bitcast=True)
         u = r_int + (rbits & ((1 << 20) - 1))
         u = (u >> 20) << 20
-        u_float = u.to(tl.float32, bitcast=True)
-        return u_float * (2.0**120)
+        return u.to(tl.float32, bitcast=True) * (2.0**120)
 
     @triton.autotune(configs=_GROUP_MS_EDEN_CONFIGS, key=["N"])
     @triton.jit
@@ -165,36 +169,19 @@ if torch_version_at_least("2.10.0") and has_triton():
     ):
         """Grouped MS-EDEN quantization of ``dy @ R_n`` and ``dy.t() @ R_m``.
 
-        Flat grid ``(cdiv(M, BLOCK_M) * cdiv(N, BLOCK_N),)``. Sketch:
+        Flat grid ``(cdiv(M, BLOCK_M) * cdiv(N, BLOCK_N),)``. Both operands come out
+        of one load of the ``(BLOCK_M, BLOCK_N)`` tile: the columnwise half rotates
+        ``trans(a)`` by ``R_m`` and the rowwise half rotates ``a`` by ``R_n``, each
+        against its own per-group amax and its own Philox stream.
 
-            token_tile_idx = (tile_idx // num_tiles_hidden).to(tl.int64)   # int64!
-            token_offset = token_tile_idx * BLOCK_M
-            if token_offset < tl.load(logical_packed_length_ptr):
-                group_idx = _get_group_idx_binary(token_offset, offsets_ptr, num_tensors)
-                a = <load (BLOCK_M, BLOCK_N) tile>
+        MS-EDEN specifics the body honors:
 
-                # --- rowwise / dgrad, returned first per the return contract ---
-                a_rht = tl.dot(<reshaped a>, <row_rht>)                   # R_n
-                row_sf, row_scaled = _quantize_ms_eden(
-                    a_rht, tl.load(amax_row_rht_ptr + group_idx),
-                    BLOCK_M, BLOCK_N, row_seed_base_ptr, row_offset_base_ptr, tile_idx)
-                ...
-                # --- columnwise / wgrad ---
-                a_t_rht = tl.dot(<reshaped trans(a)>, <col_rht>)          # R_m
-                col_sf, col_scaled = _quantize_ms_eden(
-                    a_t_rht, tl.load(amax_col_rht_ptr + group_idx),
-                    BLOCK_N, BLOCK_M, col_seed_base_ptr, col_offset_base_ptr, tile_idx)
-
-        MS-EDEN specifics the body must honor:
-
-        * The global scales come from ``_nvfp4_global_scales(amax, 256.0)``, not
-          ``448.0``. This is what makes the operand's decode numerator 1536.
-        * Codes are RTNE (``convert_8xfp32_to_4xfp4_packed``); randomness enters only
-          through the E4M3 block scale.
-        * The correction factor is ``dot(v, q) / dot(q, q)``-shaped. Clamp it to 1.0
-          when ``dot_cross`` is zero or the ratio is non-finite -- an exactly
-          representable block must correct by exactly 1.0.
-        * Row and column streams draw from independent Philox counters.
+        * The global scales come from ``_nvfp4_quantize(..., EDEN_BLOCK_SCALE_MAX)``,
+          not 448. That is what makes these operands' decode numerator 1536.
+        * Codes are RTNE; randomness enters only through the E4M3 block scale, and
+          only in ``_ms_eden_correction_with_sr``.
+        * The correction reads back the codes it just packed, so each pack must
+          precede its own scale epilogue -- it measures that exact rounding.
 
         The columnwise scale store is the one place grouping changes the layout: each
         group owns a separately swizzled ``(hidden, group_tokens//16)`` block and the
@@ -202,15 +189,18 @@ if torch_version_at_least("2.10.0") and has_triton():
         in 64-bit** -- at ``hidden = 7168`` a 32-bit product wraps past roughly 300k
         rows. ``_store_grouped_scales_swizzle`` already handles this.
 
-        Rows at or beyond ``logical_packed_length`` must be left zero-filled.
+        Rows at or beyond ``logical_packed_length`` are left as allocated.
         """
-        # The RHT runs along the inner axis of the reshape below, so each
-        # (BLOCK_N * BLOCK_M // RHT_SIZE, RHT_SIZE) chunk must stay inside one row
-        # of  a_t -- i.e. inside one hidden column's run of BLOCK_M tokens. At
-        # BLOCK_M % RHT_SIZE != 0 a chunk straddles two hidden columns and the
-        # transform is applied across the wrong axis
+        # The RHT runs along the inner axis of each reshape below, so a
+        # (.., RHT_SIZE) chunk must stay inside one row of the reshaped operand.
+        # Columnwise that row is one hidden column's run of BLOCK_M tokens;
+        # rowwise it is one token's run of BLOCK_N hidden elements. A chunk that
+        # straddles two of them raises nothing and rotates the wrong axis.
         tl.static_assert(
             BLOCK_M % RHT_SIZE == 0, "columnwise RHT requires BLOCK_M % RHT_SIZE == 0"
+        )
+        tl.static_assert(
+            BLOCK_N % RHT_SIZE == 0, "rowwise RHT requires BLOCK_N % RHT_SIZE == 0"
         )
         VARYING_FIRST_DIM: tl.constexpr = 1
 
@@ -218,7 +208,7 @@ if torch_version_at_least("2.10.0") and has_triton():
         num_tiles_token = tl.cdiv(M, BLOCK_M)
         num_tiles_hidden = tl.cdiv(N, BLOCK_N)
         # int64 tile indices: the A load (offs_m * N) and the packed-store offsets
-        # (outer * N//2, outer_t * M//2) overflow int32 once the packed token count
+        # (offs_m * N//2, offs_n * M//2) overflow int32 once the packed token count
         # times N exceeds 2**31, silently wrapping to bad addresses.
         pid_m = (tile_idx // num_tiles_hidden).to(tl.int64)
         pid_n = tile_idx - pid_m * num_tiles_hidden
@@ -246,56 +236,43 @@ if torch_version_at_least("2.10.0") and has_triton():
             row_rht = tl.load(row_rht_ptr + rht_offsets)
             col_rht = tl.load(col_rht_ptr + rht_offsets)
 
-            row_global_amax = tl.load(amax_row_rht_ptr + group_idx)
+            # --- columnwise / wgrad: ms_eden(dy.t() @ R_m) ---
             col_global_amax = tl.load(amax_col_rht_ptr + group_idx)
-
-            a_reshape = tl.reshape(a, [BLOCK_M * BLOCK_N // RHT_SIZE, RHT_SIZE])
-            a_rht = tl.dot(a_reshape, row_rht)
-
             a_t = tl.trans(a)
             a_t_reshape = tl.reshape(a_t, [BLOCK_N * BLOCK_M // RHT_SIZE, RHT_SIZE])
-            a_t_rht = tl.dot(a_t_reshape, col_rht)
+            # No fast-math variant: the MS-EDEN reference rounds the RHT accumulator
+            # through bfloat16, and this op exposes no switch to skip it.
+            a_t_rht = tl.dot(a_t_reshape, col_rht).to(tl.bfloat16)
 
-            # TE's fast math consumes the fp32 accumulator directly, so the bfloat16
-            # round-through is exact-mode only.
-            if not FAST_MATH:
-                a_rht = a_rht.to(tl.bfloat16)
-                a_t_rht = a_t_rht.to(tl.bfloat16)
-
-            col_block_amax = tl.max(
-                tl.abs(tl.reshape(a_t_rht, [BLOCK_N, BLOCK_M // 16, 16])), axis=-1
-            )
             col_scale, col_scaled = _nvfp4_quantize(
                 a_t_rht,
-                col_block_amax,
                 col_global_amax,
                 BLOCK_N,
                 BLOCK_M,
-                FAST_MATH,
-                256.0,  # FP8_E4M3_MAX
+                False,  # FAST_MATH
+                _EDEN_BLOCK_SCALE_MAX,
             )
-
-            col_scaled_pairs = col_scaled.reshape(BLOCK_N, BLOCK_M // 2, 2).split()
-            col_fp4 = convert_8xfp32_to_4xfp4_packed(col_scaled_pairs)
+            col_pairs = col_scaled.reshape(BLOCK_N, BLOCK_M // 2, 2).split()
+            col_fp4 = convert_8xfp32_to_4xfp4_packed(col_pairs)
             packed_inner_t = pid_m * (BLOCK_M // 2) + tl.arange(0, BLOCK_M // 2)
-            packed_offsets_t = offs_n[:, None] * (M // 2) + packed_inner_t[None, :]
+            packed_offsets_t = (
+                offs_n[:, None].to(tl.int64) * (M // 2) + packed_inner_t[None, :]
+            )
             tl.store(qa_t_ptr + packed_offsets_t, col_fp4)
 
-            # Apply ms_eden correction to col_scale after packed fp4 codes created
-            sr_corrected_col_scale = _ms_eden_correction_with_sr(
+            col_sf = _ms_eden_correction_with_sr(
                 col_scale,
                 col_scaled,
                 col_fp4,
                 col_seed_base_ptr,
                 col_offset_base_ptr,
-                pid_n,
-                offs_m,
-                N,
+                pid_m,
+                offs_n,
+                M,
                 BLOCK_N,
                 BLOCK_M,
             )
-
-            col_swizzled = _swizzle_scales(sr_corrected_col_scale, BLOCK_N, BLOCK_M)
+            col_swizzled = _swizzle_scales(col_sf, BLOCK_N, BLOCK_M)
             # Columnwise puts the grouped token axis on the inner (64-blocked) side,
             # so the tiling restarts per group. The rowwise store below has it on
             # the outer axis, where a group is already contiguous.
@@ -311,42 +288,38 @@ if torch_version_at_least("2.10.0") and has_triton():
                 BLOCK_M,
             )
 
-            row_block_amax = tl.max(
-                tl.abs(tl.reshape(a_rht, [BLOCK_N, BLOCK_M // 16, 16])), axis=-1
-            )
+            # --- rowwise / dgrad: ms_eden(dy @ R_n) ---
+            row_global_amax = tl.load(amax_row_rht_ptr + group_idx)
+            a_reshape = tl.reshape(a, [BLOCK_M * BLOCK_N // RHT_SIZE, RHT_SIZE])
+            a_rht = tl.dot(a_reshape, row_rht).to(tl.bfloat16)
+
             row_scale, row_scaled = _nvfp4_quantize(
                 a_rht,
-                row_block_amax,
                 row_global_amax,
                 BLOCK_M,
                 BLOCK_N,
-                FAST_MATH,
-                256.0,  # FP8_E4M3_MAX
+                False,  # FAST_MATH
+                _EDEN_BLOCK_SCALE_MAX,
             )
-            row_scaled_pairs = row_scaled.reshape(BLOCK_N, BLOCK_M // 2, 2).split()
-            row_fp4 = convert_8xfp32_to_4xfp4_packed(col_scaled_pairs)
-
-            # Store the packed fp4 codes
-            outer = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+            row_pairs = row_scaled.reshape(BLOCK_M, BLOCK_N // 2, 2).split()
+            row_fp4 = convert_8xfp32_to_4xfp4_packed(row_pairs)
             packed_inner = pid_n * (BLOCK_N // 2) + tl.arange(0, BLOCK_N // 2)
-            packed_offsets = outer[:, None] * (N // 2) + packed_inner[None, :]
+            packed_offsets = offs_m[:, None] * (N // 2) + packed_inner[None, :]
             tl.store(qa_ptr + packed_offsets, row_fp4)
 
-            # Apply ms_eden correction to row_scale after packed fp4 codes created
-            sr_corrected_row_scale = _ms_eden_correction_with_sr(
+            row_sf = _ms_eden_correction_with_sr(
                 row_scale,
                 row_scaled,
                 row_fp4,
                 row_seed_base_ptr,
                 row_offset_base_ptr,
-                pid_m,
-                offs_n,
-                M,
+                pid_n,
+                offs_m,
+                N,
                 BLOCK_M,
                 BLOCK_N,
             )
-
-            row_swizzled = _swizzle_scales(row_scale, BLOCK_M, BLOCK_N)
+            row_swizzled = _swizzle_scales(row_sf, BLOCK_M, BLOCK_N)
             _store_scales_swizzle(
                 row_swizzled,
                 sfa_ptr,

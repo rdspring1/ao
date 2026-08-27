@@ -22,7 +22,7 @@ from torchao.quantization.utils import compute_error
 from ._v2_marks import TRITON_AVAILABLE, kernel_gate, maybe_sm100
 
 _V1_REQUANT_KERNELS_IMPLEMENTED = True
-_V2_KERNELS_IMPLEMENTED = False
+_V2_KERNELS_IMPLEMENTED = True
 _needs_v1_requant = kernel_gate(
     _V1_REQUANT_KERNELS_IMPLEMENTED, "the §11.1/§11.6/§11.7 kernels"
 )
@@ -228,7 +228,7 @@ def test_recipes_can_be_swapped():
     )
     out = nvfp4_v1_requant_grouped_mm(
         F.silu(gate),
-        w2.transpose(-2, -1).contiguous(),
+        w2,
         sign_vector=(1,) * 16,
         sr_seed=_seed(2),
         offs=offs,
