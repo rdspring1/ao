@@ -218,17 +218,18 @@ def test_resampled_signs_change_the_output_without_retracing():
 
 @_needs_ms_eden
 @torch.no_grad()
-def test_return_order_is_columnwise_first():
-    """§11.3 returns the wgrad pair first, unlike every sibling quantize op.
+def test_return_order_is_rowwise_first():
+    """§11.3 returns the dgrad pair first, like every sibling quantize op.
 
     Pinned by shape on a non-square input, where a swapped unpack is a shape error.
     On a square layer it would corrupt silently, which is why this is asserted rather
-    than left to the type checker.
+    than left to the type checker -- and why this op was moved off the design doc's
+    columnwise-first spelling onto the directory-wide one.
     """
     dy, offs = _packed([256], 512)
     d, w = _signs(seed=0), _signs(seed=1)
     ar, ac = _amax(dy, d, w, offs, 1)
-    col_codes, col_sf, row_codes, row_sf = (
+    row_codes, row_sf, col_codes, col_sf = (
         triton_group_row_rht_col_rht_quantize_ms_eden(
             dy,
             ar,
@@ -244,8 +245,8 @@ def test_return_order_is_columnwise_first():
             offs[-1:],
         )
     )
-    assert col_codes.shape == (512, 128), "columnwise operand must come first"
-    assert row_codes.shape == (256, 256), "rowwise operand must come second"
+    assert row_codes.shape == (256, 256), "rowwise operand must come first"
+    assert col_codes.shape == (512, 128), "columnwise operand must come second"
 
 
 @_needs_ms_eden
@@ -255,7 +256,7 @@ def test_block_scales_never_exceed_the_eden_ceiling():
     dy, offs = _packed([256], 512)
     d, w = _signs(seed=0), _signs(seed=1)
     ar, ac = _amax(dy, d, w, offs, 1)
-    _, col_sf, _, row_sf = triton_group_row_rht_col_rht_quantize_ms_eden(
+    _, row_sf, _, col_sf = triton_group_row_rht_col_rht_quantize_ms_eden(
         dy,
         ar,
         ac,
@@ -322,7 +323,7 @@ def test_ms_eden_is_unbiased():
     row_scales, col_scales, dequants = [], [], []
     for i in range(draws):
         rng = torch.tensor([1, i, 2, i + 1000], dtype=torch.int64, device="cuda")
-        _, col_sf, row_codes, row_sf = triton_group_row_rht_col_rht_quantize_ms_eden(
+        row_codes, row_sf, _, col_sf = triton_group_row_rht_col_rht_quantize_ms_eden(
             dy, ar, ac, d, w, offs, 1, M, N, VARYING_FIRST_DIM, rng, offs[-1:]
         )
         assert torch.equal(row_codes, row_ref.codes), (
@@ -371,7 +372,7 @@ def test_codes_are_rtne_from_the_pre_correction_scale():
 
     for seed in (0, 1, 17, 29):
         rng = torch.tensor([seed, 0, seed + 7, 0], dtype=torch.int64, device="cuda")
-        col_codes, _, row_codes, _ = triton_group_row_rht_col_rht_quantize_ms_eden(
+        row_codes, _, col_codes, _ = triton_group_row_rht_col_rht_quantize_ms_eden(
             dy, ar, ac, d, w, offs, 1, M, N, VARYING_FIRST_DIM, rng, offs[-1:]
         )
         assert_codes_bitwise(row_codes, row_ref.codes, f"rowwise codes @ seed {seed}")
@@ -418,11 +419,11 @@ def test_each_rng_slice_drives_exactly_one_output():
     ):
         rng = [1, 2, 3, 4]
         rng[slot] += 100
-        col_codes, col_sf, row_codes, row_sf = run(rng)
-        assert torch.equal(col_codes, base[0]), "codes are RTNE and never move"
-        assert torch.equal(row_codes, base[2]), "codes are RTNE and never move"
+        row_codes, row_sf, col_codes, col_sf = run(rng)
+        assert torch.equal(row_codes, base[0]), "codes are RTNE and never move"
+        assert torch.equal(col_codes, base[2]), "codes are RTNE and never move"
         moved, held = (col_sf, row_sf) if drives_col else (row_sf, col_sf)
-        moved_base, held_base = (base[1], base[3]) if drives_col else (base[3], base[1])
+        moved_base, held_base = (base[3], base[1]) if drives_col else (base[1], base[3])
         assert not torch.equal(moved, moved_base), f"{name} must move its own scales"
         assert torch.equal(held, held_base), f"{name} must leave the other axis alone"
 
@@ -456,12 +457,12 @@ def test_multi_group_matches_the_reference(group_sizes):
     d, w = _signs(seed=0), _signs(seed=1)
     ar, ac = _amax(dy, d, w, offs, E)
     rng = torch.tensor([1, 2, 3, 4], dtype=torch.int64, device="cuda")
-    col_codes, col_sf, row_codes, row_sf = (
+    row_codes, row_sf, col_codes, col_sf = (
         triton_group_row_rht_col_rht_quantize_ms_eden(
             dy, ar, ac, d, w, offs, E, M, N, VARYING_FIRST_DIM, rng, offs[-1:]
         )
     )
-    ref_col_codes, ref_col_scale, ref_row_codes, ref_row_scale = (
+    ref_row_codes, ref_row_scale, ref_col_codes, ref_col_scale = (
         reference_group_row_rht_col_rht_quantize_ms_eden(dy, ar, ac, d, w, offs, E)
     )
 
@@ -501,12 +502,12 @@ def test_register_fake_shapes_and_return_order():
         out = triton_group_row_rht_col_rht_quantize_ms_eden(
             dy, amax, amax, sv, sv, offs, E, M, N, VARYING_FIRST_DIM, rng, None
         )
-    # Columnwise pair first.
+    # Rowwise pair first.
     assert [tuple(t.shape) for t in out] == [
-        (N, M // 2),
-        (N, M // 16),
         (M, N // 2),
         (M, N // 16),
+        (N, M // 2),
+        (N, M // 16),
     ]
 
 

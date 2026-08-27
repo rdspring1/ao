@@ -899,9 +899,9 @@ def reference_group_row_rht_col_rht_quantize_ms_eden(
     offsets: torch.Tensor,
     num_tensors: int,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """§11.3 per group -> ``(col_codes, col_scale, row_codes, row_scale)``.
+    """§11.3 per group -> ``(row_codes, row_scale, col_codes, col_scale)``.
 
-    Columnwise first, matching the op. The codes are assembled into the kernel's
+    Rowwise first, matching the op. The codes are assembled into the kernel's
     whole-buffer shapes and are exact; the scales are the *unrounded corrected*
     fp32 scales in plain layout, since the kernel's bytes are one stochastic draw
     away and can only be bounded, not matched. Compare them after unswizzling --
@@ -932,4 +932,4 @@ def reference_group_row_rht_col_rht_quantize_ms_eden(
         col_scale[:, start // 16 : end // 16] = col.corrected_scale
         start += size
 
-    return col_codes, col_scale, row_codes, row_scale
+    return row_codes, row_scale, col_codes, col_scale

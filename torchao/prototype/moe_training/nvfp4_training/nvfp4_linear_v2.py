@@ -337,10 +337,10 @@ class _NVFP4LinearV2(torch.autograd.Function):
             dy_2d, dgrad_rht, wgrad_rht, offsets, 1, M, N, VARYING_FIRST_DIM, offsets
         )
         (
-            col_fp4_rht_dy_t,
-            col_sf_rht_dy_t,
             row_fp4_rht_dy,
             row_sf_rht_dy,
+            col_fp4_rht_dy_t,
+            col_sf_rht_dy_t,
         ) = triton_group_row_rht_col_rht_quantize_ms_eden(
             dy_2d,
             amax_rht_dy,

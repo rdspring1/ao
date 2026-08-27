@@ -366,10 +366,10 @@ class _NVFP4GroupedMMV2(torch.autograd.Function):
             logical_packed_length,
         )
         (
-            col_fp4_rht_dy_t,
-            col_sf_rht_dy_t,
             row_fp4_rht_dy,
             row_sf_rht_dy,
+            col_fp4_rht_dy_t,
+            col_sf_rht_dy_t,
         ) = triton_group_row_rht_col_rht_quantize_ms_eden(
             grad_output,
             amax_rht_dy,

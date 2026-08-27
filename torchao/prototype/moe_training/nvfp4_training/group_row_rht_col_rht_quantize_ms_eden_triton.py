@@ -20,14 +20,16 @@ leaves the forward correct and fails backward by roughly 40%.
 
 .. warning::
 
-   **Return order is columnwise first**, matching design doc §6/§11.3:
-   ``(col_fp4_rht_dy_t, col_sf_rht_dy_t, row_fp4_rht_dy, row_sf_rht_dy)``.
+   **Return order is rowwise first**, matching every sibling grouped quantize op in
+   this directory: ``(row_fp4_rht_dy, row_sf_rht_dy, col_fp4_rht_dy_t,
+   col_sf_rht_dy_t)``, the same shape as ``triton_group_rht_quantize_row_col``.
 
-   This is the opposite of every sibling grouped quantize op in this directory --
-   ``triton_group_rht_quantize_row_col`` returns rowwise first. The order here follows
-   the design doc because that is the contract the recipe is checked against. A swapped
-   unpack is only caught by a shape error when ``M != N``; on a square layer it corrupts
-   silently.
+   This **diverges from design doc §6/§11.3**, which spells the pair columnwise
+   first. The divergence is deliberate: one order across the whole directory is worth
+   more than matching the doc, because a swapped unpack is only caught by a shape
+   error when ``M != N`` -- on a square layer it corrupts silently, and the op that
+   reads differently from all its neighbours is the one that gets unpacked wrong.
+   The doc should be updated to match; until then this file is the authority.
 
 Device helpers this kernel needs but torchao does not yet have -- port them from
 ``cutile/nvfp4_v2_triton/kernels/hadamard_utils.py`` in the monorepo:
@@ -120,17 +122,17 @@ if torch_version_at_least("2.10.0") and has_triton():
                 group_idx = _get_group_idx_binary(token_offset, offsets_ptr, num_tensors)
                 a = <load (BLOCK_M, BLOCK_N) tile>
 
-                # --- columnwise / wgrad, stored first per the return contract ---
-                a_t_rht = tl.dot(<reshaped trans(a)>, <col_rht>)          # R_m
-                col_sf, col_scaled = _quantize_ms_eden(
-                    a_t_rht, tl.load(amax_col_rht_ptr + group_idx),
-                    BLOCK_N, BLOCK_M, col_seed_base_ptr, col_offset_base_ptr, tile_idx)
-                ...
-                # --- rowwise / dgrad ---
+                # --- rowwise / dgrad, returned first per the return contract ---
                 a_rht = tl.dot(<reshaped a>, <row_rht>)                   # R_n
                 row_sf, row_scaled = _quantize_ms_eden(
                     a_rht, tl.load(amax_row_rht_ptr + group_idx),
                     BLOCK_M, BLOCK_N, row_seed_base_ptr, row_offset_base_ptr, tile_idx)
+                ...
+                # --- columnwise / wgrad ---
+                a_t_rht = tl.dot(<reshaped trans(a)>, <col_rht>)          # R_m
+                col_sf, col_scaled = _quantize_ms_eden(
+                    a_t_rht, tl.load(amax_col_rht_ptr + group_idx),
+                    BLOCK_N, BLOCK_M, col_seed_base_ptr, col_offset_base_ptr, tile_idx)
 
         MS-EDEN specifics the body must honor:
 
@@ -194,12 +196,13 @@ if torch_version_at_least("2.10.0") and has_triton():
             logical_packed_length: one-element int32 CUDA tensor, ``offsets[-1]``.
 
         Returns:
-            ``(col_fp4_rht_dy_t, col_sf_rht_dy_t, row_fp4_rht_dy, row_sf_rht_dy)`` --
-            **columnwise first**; see the module docstring warning.
-              - ``(N, sum_M//2)`` uint8 columnwise transposed codes.
-              - ``(N, sum_M//16)`` float8_e4m3fn columnwise scales.
+            ``(row_fp4_rht_dy, row_sf_rht_dy, col_fp4_rht_dy_t, col_sf_rht_dy_t)`` --
+            **rowwise first**, like every sibling grouped op; see the module
+            docstring warning for why this now diverges from design doc §6/§11.3.
               - ``(sum_M, N//2)`` uint8 rowwise codes.
               - ``(sum_M, N//16)`` float8_e4m3fn rowwise scales.
+              - ``(N, sum_M//2)`` uint8 columnwise transposed codes.
+              - ``(N, sum_M//16)`` float8_e4m3fn columnwise scales.
 
             Decode both with ``EDEN_NUMERATOR`` (1536), never 2688.
         """
@@ -284,8 +287,8 @@ if torch_version_at_least("2.10.0") and has_triton():
             RHT_SIZE=RHT_SIZE,
             logical_packed_length_ptr=logical_packed_length,
         )
-        # Columnwise pair first, per design doc §6/§11.3.
-        return qd, sfd_return, qa_base, sfa_return
+        # Rowwise pair first, matching every sibling quantize op.
+        return qa_base, sfa_return, qd, sfd_return
 
     @triton_group_row_rht_col_rht_quantize_ms_eden.register_fake
     def _(
@@ -312,7 +315,7 @@ if torch_version_at_least("2.10.0") and has_triton():
         sfa = dy.new_empty(
             (packed_sequence_length, hidden_size // 16), dtype=torch.float8_e4m3fn
         )
-        return qd, sfd, qa_base, sfa
+        return qa_base, sfa, qd, sfd
 
 else:
 
