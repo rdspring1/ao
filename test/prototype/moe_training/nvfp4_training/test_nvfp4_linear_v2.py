@@ -131,39 +131,57 @@ def test_every_quantize_op_it_imports_is_grouped():
 
 
 @maybe_sm100
-def test_degenerate_group_offsets_are_cached_not_reallocated():
-    """A fresh scalar tensor per forward is what makes torch.compile recompile every
-    step, and under CUDA-graph capture it allocates into the graph pool."""
+def test_degenerate_group_offsets_reuse_one_buffer_across_row_counts():
+    """The CUDA-graph invariant: one address, whatever the row count.
+
+    A fresh scalar per forward allocates into the graph pool. A cache keyed on the
+    row count is no better -- it hands out a different address per value, so a count
+    first seen during capture allocates into the pool too. Only a buffer that is
+    overwritten has an address stable enough to replay, which is why this asserts
+    identity across DIFFERENT row counts rather than the same one.
+    """
+    v2_mod._DEGENERATE_OFFSETS.clear()
     a = v2_mod._degenerate_group_args(_M, "cuda:0")
     b = v2_mod._degenerate_group_args(_M, "cuda:0")
-    assert a is b
+    c = v2_mod._degenerate_group_args(2 * _M, "cuda:0")
+    assert a is b is c, "row count changed the buffer's identity"
+    assert a.data_ptr() == c.data_ptr()
+    assert c.tolist() == [2 * _M] and c.dtype == torch.int32
+    assert len(v2_mod._DEGENERATE_OFFSETS) == 1
+
+
+@maybe_sm100
+def test_degenerate_group_offsets_do_not_populate_the_buffer_while_tracing():
+    """An unwarmed first call under tracing must not reach process-wide state.
+
+    torch.empty under a FakeTensorMode returns a FakeTensor bound to that mode;
+    storing it hands the same object to every later mode, which asserts
+    "Mixing fake modes NYI". That is how the lru_cache version failed -- on every
+    rank, under full activation checkpointing, at moe.shared_experts.w1.
+
+    is_compiling() is monkeypatched rather than driven through torch.compile because
+    the contract under test is the guard itself.
+    """
+    v2_mod._DEGENERATE_OFFSETS.clear()
+    with mock.patch.object(torch.compiler, "is_compiling", lambda: True):
+        a = v2_mod._degenerate_group_args(_M, "cuda:0")
+        b = v2_mod._degenerate_group_args(_M, "cuda:0")
+    assert a is not b, "an unwarmed traced call was served from the buffer"
+    assert not v2_mod._DEGENERATE_OFFSETS, "a traced call populated the buffer"
     assert a.tolist() == [_M] and a.dtype == torch.int32
 
 
 @maybe_sm100
-def test_degenerate_group_offsets_are_not_cached_while_tracing():
-    """The other half: a call made under tracing must NOT reach the cache.
-
-    Under a FakeTensorMode this function returns a FakeTensor bound to that mode.
-    Caching it makes lru_cache hand the same object to every later mode, which
-    asserts "Mixing fake modes NYI" -- and full activation checkpointing retraces
-    the checkpointed region under a second mode, so two modes see this function
-    within one step. That is a compile-time crash no eager test can reach, and the
-    test above passes either way, so it needs its own guard.
-
-    is_compiling() is monkeypatched rather than driven through torch.compile because
-    the contract under test is the guard itself; the real path is covered by the
-    671B run.
-    """
-    v2_mod._degenerate_group_args_cached.cache_clear()
+def test_prewarmed_buffer_is_used_while_tracing():
+    """Once prewarmed the buffer is real, so tracing must use it -- that IS the
+    capture path. A guard that always bypassed while compiling would defeat the
+    stable address it exists to protect."""
+    v2_mod._DEGENERATE_OFFSETS.clear()
+    warm = v2_mod.prewarm_degenerate_group_args("cuda:0")
     with mock.patch.object(torch.compiler, "is_compiling", lambda: True):
-        a = v2_mod._degenerate_group_args(_M, "cuda:0")
-        b = v2_mod._degenerate_group_args(_M, "cuda:0")
-    assert a is not b, "cache was consulted while tracing"
-    assert v2_mod._degenerate_group_args_cached.cache_info().currsize == 0, (
-        "a traced call populated the cache"
-    )
-    assert a.tolist() == [_M] and a.dtype == torch.int32
+        got = v2_mod._degenerate_group_args(_M, "cuda:0")
+    assert got is warm
+    assert v2_mod.prewarm_degenerate_group_args("cuda:0") is warm, "not idempotent"
 
 
 @maybe_sm100

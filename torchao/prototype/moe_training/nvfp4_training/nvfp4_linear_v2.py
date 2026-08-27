@@ -30,7 +30,6 @@ What the two recipes share and where they diverge:
   ``w.t()`` rotated by ``R_n``.
 """
 
-import functools
 from typing import Optional
 
 import torch
@@ -76,42 +75,70 @@ _SCALE_RECIPE = [F.ScalingType.BlockWise1x16, F.ScalingType.TensorWise]
 _SWIZZLE = [F.SwizzleType.SWIZZLE_32_4_4, F.SwizzleType.NO_SWIZZLE]
 
 
-@functools.lru_cache(maxsize=None)
-def _degenerate_group_args_cached(num_rows: int, device_key: str) -> torch.Tensor:
-    return torch.tensor([num_rows], dtype=torch.int32, device=device_key)
+# One int32 scalar per device, shared by every NVFP4 linear on it. See
+# _degenerate_group_args.
+_DEGENERATE_OFFSETS: dict[str, torch.Tensor] = {}
 
 
 def _degenerate_group_args(num_rows: int, device_key: str) -> torch.Tensor:
     """The one-element ``offsets`` tensor describing a dense tensor as a single group.
 
-    Cached rather than allocated per call, and this is load-bearing rather than a
-    micro-optimization: a fresh scalar tensor on every forward is what makes
-    ``torch.compile`` recompile every step, and under CUDA-graph capture it allocates
-    into the graph pool and is recycled out from under the replay.
+    A persistent buffer that is overwritten, not a fresh allocation and not a
+    value-keyed cache. Both alternatives break under CUDA-graph capture, which is
+    where this recipe is headed:
+
+    * A fresh scalar per forward allocates into the graph pool and is recycled out
+      from under the replay.
+    * A cache keyed on ``num_rows`` hands out a DIFFERENT ADDRESS per row count, so
+      a row count first seen during capture allocates into the pool exactly as a
+      fresh tensor would. It only avoids that for values resident before capture --
+      and its key is the token count, so it cannot be prewarmed. It provided the
+      guarantee only when the guarantee was not needed.
+
+    A buffer has no ``num_rows`` in its identity, so ``prepare_for_cuda_graph`` can
+    prewarm it like the TMA workspace, and the address is stable for the life of the
+    process. That is what replay requires.
 
     ``logical_packed_length`` is the same tensor -- for one group, ``offsets[-1:]``
-    *is* the logical length -- so a single allocation serves both arguments.
+    *is* the logical length -- so one buffer serves both arguments.
 
-    The cache is BYPASSED while tracing. A call made under a ``FakeTensorMode``
-    returns a FakeTensor bound to that mode, and ``lru_cache`` then hands the same
-    object to every later mode, which asserts ``Mixing fake modes NYI``. Full
-    activation checkpointing makes that near-certain rather than unlucky: the
-    checkpointed region is retraced under its own mode, so two modes see this
-    function within a single step.
+    INVARIANT: every NVFP4 linear on a device shares this buffer, so they must agree
+    on ``num_rows``. They do. The converter reaches ``feed_forward.`` and
+    ``moe.shared_experts.``, and both see the full unrouted token stream -- shared
+    experts take ``x_BLD`` by definition -- so ``num_rows`` is
+    ``local_batch_size * seq_len``, fixed for the run. The routed experts are the
+    ones the capacity factor bounds, and they never call this: they carry real
+    per-expert offsets. If a caller ever appears whose row count differs, this must
+    become per-module state.
 
-    ``get_rht_matrix`` in ``hadamard_utils`` caches tensors too and is safe only
-    because ``prepare_for_cuda_graph`` prewarms it with real tensors before compile.
-    That defence is unavailable here -- the cache key is the token count, which is
-    not known ahead of time -- so the guard is on the read instead.
+    OPEN, for whoever re-enables ``cudagraph_pass``: this fills at the call site, so
+    under capture the value is baked at capture time. Correct while ``num_rows`` is
+    static, which is the only regime that exists today. A varying row count would
+    need the write hoisted outside the captured region.
 
-    Bypassing costs nothing on the traced path: a ``torch.tensor`` literal inside the
-    traced region is folded into the graph, so there is no per-step allocation and
-    nothing enters the CUDA-graph pool. The eager and capture paths still hit the
-    cache and are unchanged.
+    The dict is not populated while tracing. A ``torch.empty`` under a
+    ``FakeTensorMode`` returns a FakeTensor bound to that mode, and handing it to a
+    later mode asserts ``Mixing fake modes NYI`` -- which is exactly how the
+    lru_cache version failed, on every rank, under full activation checkpointing.
+    Once prewarmed the buffer is real and tracing uses it, which is the capture path;
+    unwarmed, tracing gets a throwaway and the process-wide state stays clean.
     """
-    if torch.compiler.is_compiling():
-        return torch.tensor([num_rows], dtype=torch.int32, device=device_key)
-    return _degenerate_group_args_cached(num_rows, device_key)
+    buf = _DEGENERATE_OFFSETS.get(device_key)
+    if buf is None:
+        if torch.compiler.is_compiling():
+            return torch.tensor([num_rows], dtype=torch.int32, device=device_key)
+        buf = torch.empty(1, dtype=torch.int32, device=device_key)
+        _DEGENERATE_OFFSETS[device_key] = buf
+    return buf.fill_(num_rows)
+
+
+def prewarm_degenerate_group_args(device_key: str) -> torch.Tensor:
+    """Allocate the offsets buffer outside the graph pool. Idempotent."""
+    if device_key not in _DEGENERATE_OFFSETS:
+        _DEGENERATE_OFFSETS[device_key] = torch.empty(
+            1, dtype=torch.int32, device=device_key
+        )
+    return _DEGENERATE_OFFSETS[device_key]
 
 
 def _nvfp4_fp4_matmul(
