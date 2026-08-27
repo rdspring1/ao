@@ -42,12 +42,6 @@ from torchao.prototype.moe_training.nvfp4_training.group_hadamard_utils import (
 from torchao.prototype.moe_training.nvfp4_training.group_rht_quantize_row_col_triton import (
     triton_group_rht_quantize_row_col,
 )
-from torchao.prototype.moe_training.nvfp4_training.group_row_cast_col_rht_amax_triton import (
-    triton_group_row_cast_col_rht_amax,
-)
-from torchao.prototype.moe_training.nvfp4_training.group_row_cast_col_rht_quantize_triton import (
-    triton_group_row_cast_col_rht_quantize,
-)
 from torchao.prototype.moe_training.nvfp4_training.group_row_cast_quantize_triton import (
     triton_group_row_cast_quantize,
 )
@@ -257,24 +251,30 @@ class _NVFP4GroupedMMV2(torch.autograd.Function):
         packed_sequence_length = input_act.shape[0]
         logical_packed_length = padded_group_end_offsets[-1:]
 
-        amax_rht_x_t, amax_x = triton_group_row_cast_col_rht_amax(
+        # §11.8 then §11.9, on the same ops V1_REQUANT uses: dynamic_rht switches
+        # them from the memoized RHT-16 tuple to the resampled RHT-128 buffer.
+        # rng_state/enable_stochastic_rounding are (None, False) -- V2's forward is
+        # RTNE and its stochastic rounding lives in MS-EDEN.
+        amax_rht_x_t, amax_x = triton_group_rht_amax(
             input_act,
-            wgrad_rht,
+            [],
             padded_group_end_offsets,
             num_experts,
             packed_sequence_length,
             K,
             VARYING_FIRST_DIM,
-            logical_packed_length,
+            logical_packed_length=logical_packed_length,
+            sign_tensor=wgrad_rht,
+            dynamic_rht=True,
         )
         (
             row_fp4_x,
             row_sf_x,
             col_fp4_rht_x_t,
             col_sf_rht_x_t,
-        ) = triton_group_row_cast_col_rht_quantize(
+        ) = triton_group_rht_quantize_row_col(
             input_act,
-            wgrad_rht,
+            [],
             padded_group_end_offsets,
             num_experts,
             packed_sequence_length,
@@ -282,8 +282,12 @@ class _NVFP4GroupedMMV2(torch.autograd.Function):
             VARYING_FIRST_DIM,
             amax_x,
             amax_rht_x_t,
+            None,
+            False,
             logical_packed_length,
             use_fast_math,
+            sign_tensor=wgrad_rht,
+            dynamic_rht=True,
         )
 
         row_fp4_w, row_sf_w, weight_amax = _quantize_weight_rowwise(weight, num_experts)

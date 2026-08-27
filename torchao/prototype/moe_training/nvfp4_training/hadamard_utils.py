@@ -37,7 +37,7 @@ def _prewarm_rht_matrix(
     sign_vector: tuple[int, ...],
     device: torch.device,
 ) -> None:
-    get_rht_matrix(sign_vector, _device_key(device), torch.bfloat16, 16)
+    get_rht_matrix(sign_vector, _device_key(device), torch.bfloat16, len(sign_vector))
 
 
 def prepare_for_cuda_graph(

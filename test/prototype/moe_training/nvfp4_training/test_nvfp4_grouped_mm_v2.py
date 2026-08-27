@@ -177,7 +177,13 @@ def test_full_ffn_forward_and_backward():
 
 @_needs_v2
 def test_recipe_routing_reaches_only_its_own_kernels():
-    """§17 smoke test 4: FC1 calls no MS-EDEN op; FC2 calls no SR-cast op."""
+    """§17 smoke test 4: FC1 calls no MS-EDEN op; FC2 requantizes with a rotation.
+
+    Both recipes share the forward activation quantizer (``_SR_CAST_OP``) -- V2 drives
+    it at RHT-128 with ``dynamic_rht`` -- so the discriminating ops are the backward
+    ones: MS-EDEN and the rotated requant belong to V2, the plain requant to
+    V1_REQUANT.
+    """
     sizes = [128, 128]
     x, w1, w2, w3, offs = _moe_inputs(sizes, 256, 512)
     state = _state()
@@ -189,6 +195,7 @@ def test_recipe_routing_reaches_only_its_own_kernels():
     assert _MS_EDEN_OP not in fc1.names, "V1_REQUANT must not reach MS-EDEN"
     assert _ROTATED_REQUANT_OP not in fc1.names, "V1_REQUANT applies no dgrad rotation"
     assert _PLAIN_REQUANT_OP in fc1.names
+    assert _SR_CAST_OP in fc1.names
 
     h = torch.randn(
         sum(sizes), 512, device="cuda", dtype=torch.bfloat16, requires_grad=True
@@ -202,9 +209,9 @@ def test_recipe_routing_reaches_only_its_own_kernels():
             sr_seed=state["fc2_seed"],
             offs=offs,
         ).sum().backward()
-    assert _SR_CAST_OP not in fc2.names, "V2 must not reach the SR cast quantizer"
     assert _PLAIN_REQUANT_OP not in fc2.names, "V2 requantizes with a rotation"
     assert _MS_EDEN_OP in fc2.names and _ROTATED_REQUANT_OP in fc2.names
+    assert _SR_CAST_OP in fc2.names, "V2 shares the forward activation quantizer"
 
 
 @_needs_v2

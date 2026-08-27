@@ -53,12 +53,6 @@ from torchao.prototype.moe_training.nvfp4_training.group_hadamard_utils import (
 from torchao.prototype.moe_training.nvfp4_training.group_rht_quantize_row_col_triton import (
     triton_group_rht_quantize_row_col,
 )
-from torchao.prototype.moe_training.nvfp4_training.group_row_cast_col_rht_amax_triton import (
-    triton_group_row_cast_col_rht_amax,
-)
-from torchao.prototype.moe_training.nvfp4_training.group_row_cast_col_rht_quantize_triton import (
-    triton_group_row_cast_col_rht_quantize,
-)
 from torchao.prototype.moe_training.nvfp4_training.group_row_cast_quantize_triton import (
     triton_group_row_cast_quantize,
 )
@@ -196,17 +190,30 @@ class _NVFP4LinearV2(torch.autograd.Function):
         offsets = _degenerate_group_args(M, str(input_2d.device))
 
         # §11.8 then §11.9: amax first so the columnwise bound is taken post-RHT.
-        amax_rht_x_t, amax_x = triton_group_row_cast_col_rht_amax(
-            input_2d, wgrad_rht, offsets, 1, M, K, VARYING_FIRST_DIM, offsets
+        # Same ops as V1_REQUANT below, driven at RHT-128 with a resampled sign
+        # buffer instead of RHT-16 with a static tuple -- hence dynamic_rht, which
+        # keeps the per-launch product out of get_rht_matrix's by-value cache.
+        # Both operands are RTNE here: V2's stochastic rounding lives in MS-EDEN.
+        amax_rht_x_t, amax_x = triton_group_rht_amax(
+            input_2d,
+            [],
+            offsets,
+            1,
+            M,
+            K,
+            VARYING_FIRST_DIM,
+            logical_packed_length=offsets,
+            sign_tensor=wgrad_rht,
+            dynamic_rht=True,
         )
         (
             row_fp4_x,
             row_sf_x,
             col_fp4_rht_x_t,
             col_sf_rht_x_t,
-        ) = triton_group_row_cast_col_rht_quantize(
+        ) = triton_group_rht_quantize_row_col(
             input_2d,
-            wgrad_rht,
+            [],
             offsets,
             1,
             M,
@@ -214,8 +221,12 @@ class _NVFP4LinearV2(torch.autograd.Function):
             VARYING_FIRST_DIM,
             amax_x,
             amax_rht_x_t,
+            None,
+            False,
             offsets,
             use_fast_math,
+            sign_tensor=wgrad_rht,
+            dynamic_rht=True,
         )
 
         row_fp4_w, row_sf_w, amax_w = _quantize_weight_rowwise(weight_hp)

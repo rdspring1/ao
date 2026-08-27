@@ -36,16 +36,15 @@ if torch_version_at_least("2.10.0") and has_triton():
         BLOCK_M,
         BLOCK_N,
         _get_group_idx_binary,
+        _rht_matrix,
         _validate_grouped_hadamard_inputs,
     )
     from torchao.prototype.moe_training.nvfp4_training.hadamard_utils import (
-        _device_key,
         _nvfp4_quantize,
         _pack_fp4,
         _store_grouped_scales_swizzle,
         _store_scales_swizzle,
         _swizzle_scales,
-        get_rht_matrix,
     )
 
     # BLOCK_M/BLOCK_N are held at 128 (group offsets are only 128-aligned, so a
@@ -93,6 +92,7 @@ if torch_version_at_least("2.10.0") and has_triton():
         SHAPE_REP: tl.constexpr,
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
+        RHT_SIZE: tl.constexpr,
         logical_packed_length_ptr,
     ):
         """Grouped fused RHT columnwise and direct rowwise NVFP4 quantization."""
@@ -123,12 +123,15 @@ if torch_version_at_least("2.10.0") and has_triton():
             offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
             a = tl.load(a_ptr + offs_m[:, None] * N + offs_n[None, :])
 
-            rht_offsets = tl.arange(0, 16)[:, None] * 16 + tl.arange(0, 16)[None, :]
+            rht_offsets = (
+                tl.arange(0, RHT_SIZE)[:, None] * RHT_SIZE
+                + tl.arange(0, RHT_SIZE)[None, :]
+            )
             hadamard = tl.load(b_ptr + rht_offsets)
 
             colwise_global_amax = tl.load(global_amax_col_ptr + group_idx)
             a_t = tl.trans(a)
-            a_t_reshape = tl.reshape(a_t, [BLOCK_N * BLOCK_M // 16, 16])
+            a_t_reshape = tl.reshape(a_t, [BLOCK_N * BLOCK_M // RHT_SIZE, RHT_SIZE])
             a_t_rht = tl.dot(a_t_reshape, hadamard)
             # TE's fast math consumes the fp32 accumulator directly, so the bfloat16
             # round-through is exact-mode only.
@@ -215,6 +218,8 @@ if torch_version_at_least("2.10.0") and has_triton():
         enable_stochastic_rounding: bool,
         logical_packed_length: Optional[torch.Tensor] = None,
         use_fast_math: bool = False,
+        sign_tensor: Optional[torch.Tensor] = None,
+        dynamic_rht: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Grouped fused RHT columnwise + direct rowwise NVFP4 E2M1 quantization.
 
@@ -222,8 +227,12 @@ if torch_version_at_least("2.10.0") and has_triton():
         tensor of cumulative row-end offsets, one per group. ``logical_packed_length``
         is the valid padded row count and equals ``offsets[-1]``. Rows after it
         are untouched allocation capacity and must not be consumed. ``sign_vector``
-        selects the cached 16x16 RHT matrix used by the Triton kernel. Zero-valued
+        selects the cached RHT matrix used by the Triton kernel. Zero-valued
         per-group padding before the final offset is processed normally.
+
+        Set ``dynamic_rht`` with a ``(rht_size,)`` device ``sign_tensor`` for recipes
+        that resample their signs: the RHT matrix is then formed per launch instead of
+        memoized by sign value, and ``sign_vector`` is ignored (pass ``[]``).
 
         Returns ``(qa_base, sfa, qd, sfd)``. Both scale tensors carry swizzled bytes
         reinterpreted to their logical 2D shapes.
@@ -232,9 +241,7 @@ if torch_version_at_least("2.10.0") and has_triton():
         ``[col_seed, col_offset, row_seed, row_offset]`` whose advancement the caller owns;
         the op only forwards single-element views, performing no host RNG.
         """
-        B = get_rht_matrix(
-            tuple(sign_vector), _device_key(A.device), torch.bfloat16, 16
-        )
+        B = _rht_matrix(sign_vector, sign_tensor, dynamic_rht, A.device)
         _validate_grouped_hadamard_inputs(
             A,
             B,
@@ -244,6 +251,7 @@ if torch_version_at_least("2.10.0") and has_triton():
             hidden_size,
             shape_rep,
             logical_packed_length,
+            rht_size=B.shape[0],
         )
         rng_state = _validate_rng_state(rng_state, A.device, enable_stochastic_rounding)
 
@@ -289,6 +297,7 @@ if torch_version_at_least("2.10.0") and has_triton():
             row_offset_base = 0
 
         m, n = A.shape
+        rht_size = B.shape[0]
         if logical_packed_length is None:
             logical_packed_length = offsets[-1:]
         grid = (triton.cdiv(m, BLOCK_M) * triton.cdiv(n, BLOCK_N),)
@@ -314,6 +323,7 @@ if torch_version_at_least("2.10.0") and has_triton():
             SHAPE_REP=shape_rep,
             BLOCK_M=BLOCK_M,
             BLOCK_N=BLOCK_N,
+            RHT_SIZE=rht_size,
             logical_packed_length_ptr=logical_packed_length,
         )
         return qa_base, sfa_return, qd, sfd_return
@@ -333,6 +343,8 @@ if torch_version_at_least("2.10.0") and has_triton():
         enable_stochastic_rounding,
         logical_packed_length=None,
         use_fast_math=False,
+        sign_tensor=None,
+        dynamic_rht=False,
     ):
         qa_base = A.new_empty(
             (packed_sequence_length, hidden_size // 2), dtype=torch.uint8
@@ -363,6 +375,8 @@ else:
         enable_stochastic_rounding: bool,
         logical_packed_length: Optional[torch.Tensor] = None,
         use_fast_math: bool = False,
+        sign_tensor: Optional[torch.Tensor] = None,
+        dynamic_rht: bool = False,
     ):
         raise NotImplementedError(
             "triton_group_rht_quantize_row_col requires torch 2.10.0+ and triton installed"

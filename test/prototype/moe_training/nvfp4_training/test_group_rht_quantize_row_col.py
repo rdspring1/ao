@@ -46,6 +46,7 @@ from test.prototype.moe_training.nvfp4_training._assertions import (
 from test.prototype.moe_training.nvfp4_training.nvfp4_reference import (
     from_blocked_grouped,
     reference_group_rht_quantize_row_col,
+    reference_group_row_cast_col_rht_quantize,
     to_blocked_grouped,
 )
 from torchao.float8.float8_utils import compute_error
@@ -936,3 +937,97 @@ def test_group_rht_amax_storage_validation(graph_case, invalid_amax, error, kern
             None,
             False,
         )
+
+
+# --- dynamic_rht: RHT-128 with a resampled sign buffer ----------------------
+
+
+def _dynamic_signs(seed, n=128):
+    generator = torch.Generator().manual_seed(seed)
+    bits = torch.randint(0, 2, (n,), generator=generator, dtype=torch.int8)
+    return (bits * 2 - 1).cuda()
+
+
+def _dynamic_quantize(A, signs, offsets, num_groups):
+    """Run the amax then the quantize op over ``A`` on the dynamic RHT-128 path."""
+    psl, hidden = A.shape
+    col_amax, row_amax = triton_group_rht_amax(
+        A,
+        [],
+        offsets,
+        num_groups,
+        psl,
+        hidden,
+        1,
+        sign_tensor=signs,
+        dynamic_rht=True,
+    )
+    return row_amax, col_amax, triton_group_rht_quantize_row_col(
+        A,
+        [],
+        offsets,
+        num_groups,
+        psl,
+        hidden,
+        1,
+        row_amax,
+        col_amax,
+        None,
+        False,
+        sign_tensor=signs,
+        dynamic_rht=True,
+    )
+
+
+@_maybe_sm100
+@pytest.mark.parametrize("group_sizes", [[256], [128, 128], [256, 128, 384]])
+@torch.no_grad()
+def test_group_rht_quantize_dynamic_matches_the_reference(group_sizes):
+    device = torch.device("cuda", 0)
+    hidden = 512
+    torch.manual_seed(97)
+    A = torch.randn((sum(group_sizes), hidden), dtype=torch.bfloat16, device=device)
+    offsets = torch.cumsum(
+        torch.tensor(group_sizes, dtype=torch.int32, device=device),
+        0,
+        dtype=torch.int32,
+    )
+    signs = _dynamic_signs(0)
+
+    row_amax, col_amax, (qa, sfa, qd, sfd) = _dynamic_quantize(
+        A, signs, offsets, len(group_sizes)
+    )
+    ref_qa, ref_sfa, ref_qd, ref_sfd = reference_group_row_cast_col_rht_quantize(
+        A, row_amax, col_amax, signs, offsets, len(group_sizes)
+    )
+    assert_codes_bitwise(qa, ref_qa, "row codes")
+    assert_scales_bitwise(sfa, ref_sfa, "row sf")
+    assert_codes_bitwise(qd, ref_qd, "col codes")
+    # The columnwise scales are what this test exists for: their swizzle tiling
+    # restarts at every group boundary, so a whole-extent blocking puts every group
+    # but the first at the wrong offset, which the GEMM reads without complaint.
+    assert_scales_bitwise(sfd, ref_sfd, "col sf")
+
+
+@_maybe_sm100
+@torch.no_grad()
+def test_group_rht_quantize_dynamic_follows_an_in_place_resample():
+    """Only the columnwise operand is rotated, and it must track the live buffer.
+
+    The cadence manager resamples with ``copy_`` so the buffer's address (and id)
+    never changes -- the case a by-value cache would silently serve stale.
+    """
+    device = torch.device("cuda", 0)
+    torch.manual_seed(31)
+    A = torch.randn((256, 512), dtype=torch.bfloat16, device=device)
+    offsets = torch.tensor([256], dtype=torch.int32, device=device)
+    signs = _dynamic_signs(0)
+
+    _, _, before = _dynamic_quantize(A, signs, offsets, 1)
+    before = [t.clone() for t in before]
+    signs.copy_(_dynamic_signs(1))
+    _, _, after = _dynamic_quantize(A, signs, offsets, 1)
+
+    assert_codes_bitwise(after[0], before[0], "row codes")
+    assert_scales_bitwise(after[1], before[1], "row sf")
+    assert not torch.equal(after[2], before[2]), "columnwise codes ignored the resample"

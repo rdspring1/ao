@@ -24,11 +24,10 @@ leaves the forward correct and fails backward by roughly 40%.
    ``(col_fp4_rht_dy_t, col_sf_rht_dy_t, row_fp4_rht_dy, row_sf_rht_dy)``.
 
    This is the opposite of every sibling grouped quantize op in this directory --
-   ``triton_group_rht_quantize_row_col`` and
-   ``triton_group_row_cast_col_rht_quantize`` both return rowwise first. The order
-   here follows the design doc because that is the contract the recipe is checked
-   against. A swapped unpack is only caught by a shape error when ``M != N``; on a
-   square layer it corrupts silently.
+   ``triton_group_rht_quantize_row_col`` returns rowwise first. The order here follows
+   the design doc because that is the contract the recipe is checked against. A swapped
+   unpack is only caught by a shape error when ``M != N``; on a square layer it corrupts
+   silently.
 
 Device helpers this kernel needs but torchao does not yet have -- port them from
 ``cutile/nvfp4_v2_triton/kernels/hadamard_utils.py`` in the monorepo:

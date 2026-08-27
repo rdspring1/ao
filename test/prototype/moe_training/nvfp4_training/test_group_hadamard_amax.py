@@ -24,6 +24,7 @@ from benchmarks.prototype.nvfp4_training.deepseek_v3_shapes import (
 )
 from test.prototype.moe_training.nvfp4_training.nvfp4_reference import (
     reference_group_rht_amax,
+    reference_group_row_cast_col_rht_amax,
 )
 from torchao.prototype.moe_training.nvfp4_training.hadamard_cutedsl_utils import (
     cutedsl_nvfp4_kernels_available,
@@ -311,3 +312,108 @@ def test_group_rht_amax_rejects_non_tensorwise_scaling():
             1,
             int(F.ScalingType.RowWise),
         )
+
+
+# --- dynamic_rht: RHT-128 with a resampled sign buffer ----------------------
+#
+# Same op, same kernel; only the RHT matrix source differs. These cover what the
+# static path cannot: a 128-wide transform, and a sign vector that must not be
+# memoized by value.
+
+
+def _dynamic_signs(seed, n=128):
+    generator = torch.Generator().manual_seed(seed)
+    bits = torch.randint(0, 2, (n,), generator=generator, dtype=torch.int8)
+    return (bits * 2 - 1).cuda()
+
+
+@_maybe_sm100
+@pytest.mark.parametrize("groups", [(256,), (128, 128), (256, 128, 384, 128)])
+@torch.no_grad()
+def test_group_rht_amax_dynamic_matches_the_reference(groups):
+    device = torch.device("cuda", 0)
+    hidden_size = 512
+    A, offsets, _ = _build_packed(groups, hidden_size, device, seed=223)
+    signs = _dynamic_signs(0)
+
+    col, row = triton_group_rht_amax(
+        A,
+        [],
+        offsets,
+        len(groups),
+        A.shape[0],
+        hidden_size,
+        1,
+        sign_tensor=signs,
+        dynamic_rht=True,
+    )
+    ref_col, ref_row = reference_group_row_cast_col_rht_amax(
+        A, signs, offsets, len(groups)
+    )
+    torch.testing.assert_close(col, ref_col, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(row, ref_row, atol=0, rtol=0)
+
+
+@_maybe_sm100
+@torch.no_grad()
+def test_group_rht_amax_dynamic_follows_an_in_place_resample():
+    """The failure mode dynamic_rht exists to prevent.
+
+    The cadence manager updates the sign buffer with ``copy_`` so its address survives
+    graph capture -- which also means its ``id()`` never changes. A path that memoized
+    on the buffer would keep returning the matrix built from the first contents, and
+    the transform would stop cancelling with no error anywhere.
+    """
+    device = torch.device("cuda", 0)
+    groups = (256,)
+    A, offsets, _ = _build_packed(groups, 512, device, seed=11)
+    signs = _dynamic_signs(0)
+
+    def run():
+        return triton_group_rht_amax(
+            A, [], offsets, 1, A.shape[0], 512, 1, sign_tensor=signs, dynamic_rht=True
+        )
+
+    before_col, before_row = run()
+    signs.copy_(_dynamic_signs(1))
+    after_col, after_row = run()
+
+    assert before_col.item() != after_col.item(), "columnwise amax ignored the resample"
+    assert before_row.item() == after_row.item(), "rowwise amax is not transformed"
+
+
+@_maybe_sm100
+@torch.no_grad()
+def test_group_rht_amax_dynamic_excludes_padded_rows():
+    """Rows past logical_packed_length are uninitialized capacity, never data."""
+    device = torch.device("cuda", 0)
+    groups = (128, 128)
+    A, offsets, _ = _build_packed(groups, 512, device, seed=3)
+    capacity = torch.full((512, 512), float("inf"), device=device, dtype=torch.bfloat16)
+    capacity[:256] = A
+
+    got = triton_group_rht_amax(
+        capacity,
+        [],
+        offsets,
+        2,
+        512,
+        512,
+        1,
+        logical_packed_length=offsets[-1:],
+        sign_tensor=_dynamic_signs(0),
+        dynamic_rht=True,
+    )
+    assert torch.isfinite(torch.stack(got)).all(), "spare capacity leaked into an amax"
+
+
+@_maybe_sm100
+@torch.no_grad()
+def test_group_rht_amax_rejects_an_inconsistent_sign_pair():
+    device = torch.device("cuda", 0)
+    A, offsets, _ = _build_packed((128,), 256, device, seed=7)
+    args = (A, list(_HARDCODED_SIGN_VECTOR), offsets, 1, A.shape[0], 256, 1)
+    with pytest.raises(ValueError, match="dynamic_rht=True requires a sign_tensor"):
+        triton_group_rht_amax(*args, dynamic_rht=True)
+    with pytest.raises(ValueError, match="only used when dynamic_rht=True"):
+        triton_group_rht_amax(*args, sign_tensor=_dynamic_signs(0))

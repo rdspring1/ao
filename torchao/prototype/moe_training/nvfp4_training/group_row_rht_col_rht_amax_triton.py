@@ -142,9 +142,9 @@ if torch_version_at_least("2.10.0") and has_triton():
               - ``amax_rht_dy[g]   = amax(abs(dy_g @ R_n))``     (dgrad operand)
               - ``amax_rht_dy_t[g] = amax(abs(dy_g.t() @ R_m))`` (wgrad operand)
 
-            Note this differs from ``triton_group_row_cast_col_rht_amax``, which
-            returns the transformed columnwise amax first because its rowwise value
-            is an untransformed plain amax. Here both are transformed.
+            Note this differs from ``triton_group_rht_amax``, which returns the
+            transformed columnwise amax first because its rowwise value is an
+            untransformed plain amax. Here both are transformed.
         """
         for name, sv in (("dgrad_rht", dgrad_rht), ("wgrad_rht", wgrad_rht)):
             if sv.ndim != 1 or sv.numel() != RHT_SIZE:

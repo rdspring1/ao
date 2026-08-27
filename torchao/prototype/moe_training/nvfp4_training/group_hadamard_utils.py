@@ -10,6 +10,11 @@ from typing import Optional
 import torch
 from torch.utils._triton import has_triton
 
+from torchao.prototype.moe_training.nvfp4_training.hadamard_utils import (
+    _device_key,
+    get_dynamic_rht_matrix,
+    get_rht_matrix,
+)
 from torchao.utils import is_sm_at_least_100, torch_version_at_least
 
 BLOCK_M = 128
@@ -49,6 +54,32 @@ if torch_version_at_least("2.10.0") and has_triton():
             else:
                 end = mid
         return start
+
+
+def _rht_matrix(
+    sign_vector,
+    sign_tensor: Optional[torch.Tensor],
+    dynamic_rht: bool,
+    device: torch.device,
+) -> torch.Tensor:
+    """Resolve the RHT matrix for a grouped op from its two mutually exclusive inputs.
+
+    ``dynamic_rht`` is an explicit flag rather than ``sign_tensor is not None`` so a
+    caller that means to resample cannot silently fall back to the memoized path if it
+    forgets the tensor -- ``get_rht_matrix`` caches by value with ``maxsize=None``, and
+    keyed on a resampled vector it would grow one entry per step for the run's lifetime.
+    ``get_dynamic_rht_matrix`` memoizes only the fixed Hadamard and forms the product
+    per launch.
+    """
+    if dynamic_rht:
+        if sign_tensor is None:
+            raise ValueError("dynamic_rht=True requires a sign_tensor")
+        return get_dynamic_rht_matrix(sign_tensor, torch.bfloat16)
+    if sign_tensor is not None:
+        raise ValueError("sign_tensor is only used when dynamic_rht=True")
+    return get_rht_matrix(
+        tuple(sign_vector), _device_key(device), torch.bfloat16, len(sign_vector)
+    )
 
 
 def _validate_grouped_hadamard_inputs(

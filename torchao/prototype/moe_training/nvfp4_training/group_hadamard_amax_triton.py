@@ -30,12 +30,11 @@ if torch_version_at_least("2.10.0") and has_triton():
         BLOCK_M,
         BLOCK_N,
         _get_group_idx_binary,
+        _rht_matrix,
         _validate_grouped_hadamard_inputs,
     )
     from torchao.prototype.moe_training.nvfp4_training.hadamard_utils import (
         _compute_pid,
-        _device_key,
-        get_rht_matrix,
         prepare_for_cuda_graph,
     )
 
@@ -233,6 +232,8 @@ if torch_version_at_least("2.10.0") and has_triton():
         shape_rep: int,
         scaling_type: int = int(F.ScalingType.TensorWise),
         logical_packed_length: torch.Tensor | None = None,
+        sign_tensor: torch.Tensor | None = None,
+        dynamic_rht: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Per-group RHT columnwise amax and raw rowwise amax (grouped, graph-safe).
 
@@ -240,7 +241,8 @@ if torch_version_at_least("2.10.0") and has_triton():
             A: packed (sum_M, N) bfloat16 tensor, row-major. Groups are concatenated
                 along the row dimension; each group's M must be divisible by 16 and
                 N divisible by 128.
-            sign_vector: Sign vector used to construct the cached 16x16 RHT matrix.
+            sign_vector: Sign vector used to construct the cached RHT matrix. Ignored
+                when ``dynamic_rht`` is set; pass ``[]`` there.
             offsets: int32 cumulative row-end offsets, one per group.
             num_tensors: number of expert groups.
             packed_sequence_length: allocated row capacity of A.
@@ -251,15 +253,19 @@ if torch_version_at_least("2.10.0") and has_triton():
                 valid padded row count, equal to ``offsets[-1]``. Rows beyond it
                 are untouched allocation capacity and must not be consumed; zero-valued
                 per-group padding before it is processed normally.
+            sign_tensor: ``(rht_size,)`` {-1, +1} device tensor, required when
+                ``dynamic_rht`` is set.
+            dynamic_rht: build ``diag(signs) @ H`` per launch from ``sign_tensor``
+                instead of memoizing it by sign value. Recipes that resample their
+                signs must set this: ``get_rht_matrix``'s ``lru_cache(maxsize=None)``
+                is keyed by value and would grow one entry per resample.
 
         Returns:
             Tuple of (col_amax, row_amax), each (num_tensors,) float32:
               - col_amax[g] = max(abs(RHT(A_g.T))).
               - row_amax[g] = max(abs(A_g)).
         """
-        B = get_rht_matrix(
-            tuple(sign_vector), _device_key(A.device), torch.bfloat16, 16
-        )
+        B = _rht_matrix(sign_vector, sign_tensor, dynamic_rht, A.device)
         _validate_grouped_hadamard_inputs(
             A,
             B,
@@ -269,6 +275,7 @@ if torch_version_at_least("2.10.0") and has_triton():
             hidden_size,
             shape_rep,
             logical_packed_length,
+            rht_size=B.shape[0],
         )
         if scaling_type != int(F.ScalingType.TensorWise):
             raise ValueError(
@@ -296,8 +303,19 @@ if torch_version_at_least("2.10.0") and has_triton():
         # it needs at least one CTA per group; below _PERSISTENT_MIN_AVG_ROWS the
         # tiled kernel wins. Group membership is read from offsets, valid for both
         # shape_reps.
+        # The persistent kernel autotunes BLOCK_M over {64, 128}, but its
+        # reshape to [BLOCK_N * BLOCK_M // RHT_SIZE, RHT_SIZE] is only correct when
+        # BLOCK_M % RHT_SIZE == 0 -- at BLOCK_M=64 an RHT-128 block would straddle two
+        # hidden columns and silently corrupt the columnwise amax. Dynamic-sign recipes
+        # are the RHT-128 ones, so gate on the flag and let them take the tiled kernel,
+        # whose BLOCK_M is the module constant 128. It is also the flag that keeps the
+        # empty `sign_vector` out of prepare_for_cuda_graph's pre-warm below.
         num_sms = torch.cuda.get_device_properties(A.device).multi_processor_count
-        if num_tensors <= num_sms and (m // num_tensors) >= _PERSISTENT_MIN_AVG_ROWS:
+        if (
+            not dynamic_rht
+            and num_tensors <= num_sms
+            and (m // num_tensors) >= _PERSISTENT_MIN_AVG_ROWS
+        ):
             ctas_per_group = num_sms // num_tensors
             workspace = prepare_for_cuda_graph(
                 A.device, sign_vectors=(tuple(sign_vector),)
@@ -351,6 +369,8 @@ if torch_version_at_least("2.10.0") and has_triton():
         shape_rep,
         scaling_type=int(F.ScalingType.TensorWise),
         logical_packed_length=None,
+        sign_tensor=None,
+        dynamic_rht=False,
     ):
         col_amax = A.new_empty((num_tensors,), dtype=torch.float32)
         row_amax = A.new_empty((num_tensors,), dtype=torch.float32)
@@ -368,6 +388,8 @@ else:
         shape_rep: int,
         scaling_type: int = _DEFAULT_SCALING_TYPE,
         logical_packed_length: torch.Tensor | None = None,
+        sign_tensor: torch.Tensor | None = None,
+        dynamic_rht: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         raise NotImplementedError(
             "triton_group_rht_amax requires torch 2.10.0+ and triton installed"
