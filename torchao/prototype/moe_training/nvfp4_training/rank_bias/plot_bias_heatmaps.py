@@ -157,6 +157,26 @@ def load_metric(
     return out, n_by
 
 
+def cell_text(v: float) -> str:
+    """Slope as a bare two-digit magnitude: -0.39 -> "39", -1.00 -> "1".
+
+    Every slope here lies in [-1, 0] up to fitting noise, so the sign and the
+    leading "0." are four characters of pure constant in every one of the 208
+    cells. At 16 columns that is what runs adjacent labels together and makes the
+    grid unreadable; the magnitude alone fits. The colorbar carries the sign, and
+    -1.00 collapses to a single "1" so the ideal case reads at a glance.
+
+    A positive slope would be fitting noise on an all-but-flat bucket, but it is
+    signed explicitly rather than silently shown as its magnitude.
+    """
+    if v > 0:
+        return "+" + f"{v:.2f}"[2:]
+    m = abs(v)
+    if m >= 0.995:
+        return "1"
+    return f"{m:.2f}"[2:]
+
+
 def plot_row(
     axes,
     data: Dict[Tuple[str, str, int], List[float]],
@@ -168,7 +188,7 @@ def plot_row(
     vmin: float,
     vmax: float,
     cmap,
-    fmt: str,
+    fmt,
     center_white: Optional[float] = None,
     rows: Sequence[Tuple[str, str]],
 ):
@@ -183,7 +203,9 @@ def plot_row(
                 mat[i, j] = float(np.median(values)) if values else float("nan")
         im = ax.imshow(mat, aspect="auto", cmap=cmap, vmin=vmin, vmax=vmax)
         ax.set_xticks(range(len(ranks)))
-        ax.set_xticklabels(col_labels)
+        # Rotated: "amax" is wider than its column, so at 16 ranks the horizontal
+        # labels collide ("amaxr2", "r10r11r12") and the axis is unreadable.
+        ax.set_xticklabels(col_labels, rotation=90, fontsize=8)
         ax.set_yticks(range(len(rows)))
         ax.set_yticklabels(row_labels)
         ax.set_title(
@@ -202,10 +224,10 @@ def plot_row(
                 ax.text(
                     j,
                     i,
-                    fmt.format(v),
+                    fmt(v),
                     ha="center",
                     va="center",
-                    fontsize=7,
+                    fontsize=8,
                     color=text_color,
                 )
     axes[0].set_ylabel("block type")
@@ -241,7 +263,7 @@ def make_summary_heatmap(
         vmin=-1.05,
         vmax=0.05,
         cmap=plt.get_cmap("magma_r"),
-        fmt="{:.2f}",
+        fmt=cell_text,
         rows=rows,
     )
     for ax in axes:
@@ -254,8 +276,9 @@ def make_summary_heatmap(
     fig.text(
         0.5,
         1.02,
-        "How close the trial-mean error is to decaying as 1/sqrt(T) "
-        "(ideal -1 on MSE; 0 = bias that won't average out).",
+        "How close the trial-mean MSE is to decaying as 1/T "
+        "(ideal -1; 0 = bias that won't average out). "
+        "Cells are |slope| without the leading 0.: 39 is -0.39, 1 is -1.00.",
         ha="center",
         style="italic",
         fontsize=10,
