@@ -255,14 +255,40 @@ def sweep_recipe(
     base_seed: int,
     use_rht: bool,
     vary_rht_sign: bool,
+    signed_out: Optional[Dict[int, Dict[int, Tuple[float, float]]]] = None,
 ) -> Dict[int, Dict[int, float]]:
-    """Return checkpoint -> bucket -> MSE of trial-mean reconstruction."""
+    """Return checkpoint -> bucket -> MSE of trial-mean reconstruction.
+
+    ``signed_out``, when given, is filled with checkpoint -> bucket ->
+    ``(signed_mean, abs_shrink)``. MSE is a squared quantity and therefore cannot
+    say whether a bucket's residual error points the SAME WAY on every element.
+    That distinction decides whether a bias survives into a parameter update or
+    cancels: a per-element error with a random sign averages out across a tensor
+    even though it never averages across trials, and only a coherent one can move
+    a converged loss.
+
+    ``signed_mean`` is the bucket mean of ``recon_mean - x``; ``abs_shrink`` is the
+    bucket mean of ``|recon_mean| - |x|``. The second is the one that tests the
+    saturation hypothesis directly: a block scale that rounds DOWN makes
+    ``amax / block_scale > 6``, so the amax saturates and comes back strictly
+    smaller in magnitude, while a scale that rounds up leaves the amax below the
+    E2M1 ceiling with rounding freedom SR can use. If that is the mechanism,
+    ``abs_shrink`` is systematically negative for the amax bucket and ~0 elsewhere.
+
+    An out-parameter rather than a second return value: two call sites already
+    unpack the MSE dict, and both would otherwise have to change for a statistic
+    only one of them reports.
+    """
     target = tensor.float()
     labels_flat = labels.reshape(-1).long()
     n_buckets = int(counts.numel())
     checkpoint_set = set(checkpoints)
     max_trials = checkpoints[-1]
     accum: Dict[int, Dict[int, List[float]]] = defaultdict(lambda: defaultdict(list))
+    signed_accum: Dict[str, Dict[int, List[torch.Tensor]]] = {
+        "s": defaultdict(list),
+        "a": defaultdict(list),
+    }
 
     frozen = rht_matrices(tensor.device, None) if use_rht else None
 
@@ -286,7 +312,8 @@ def sweep_recipe(
             running_sum.add_(recon.float())
 
             if trial in checkpoint_set:
-                sqerr = (running_sum / trial - target).square().reshape(-1)
+                residual = running_sum / trial - target
+                sqerr = residual.square().reshape(-1)
                 sums = torch.zeros(n_buckets, dtype=torch.float64, device=tensor.device)
                 sums.scatter_add_(0, labels_flat, sqerr.double())
                 mse_by_bucket = sums / counts
@@ -295,8 +322,31 @@ def sweep_recipe(
                         accum[trial][bucket].append(float(mse_by_bucket[bucket].item()))
                 del sqerr, sums, mse_by_bucket
 
+                if signed_out is not None:
+                    shrink = (
+                        (running_sum / trial).abs() - target.abs()
+                    ).reshape(-1)
+                    for name, flat in (("s", residual.reshape(-1)), ("a", shrink)):
+                        acc = torch.zeros(
+                            n_buckets, dtype=torch.float64, device=tensor.device
+                        )
+                        acc.scatter_add_(0, labels_flat, flat.double())
+                        signed_accum[name][trial].append((acc / counts).cpu())
+                    del shrink, acc
+                del residual
+
             del recon
         print(f"  replica {replica + 1}/{replicas} complete")
+
+    if signed_out is not None:
+        for trial in signed_accum["s"]:
+            s_mean = torch.stack(signed_accum["s"][trial]).mean(0)
+            a_mean = torch.stack(signed_accum["a"][trial]).mean(0)
+            signed_out[trial] = {
+                bucket: (float(s_mean[bucket]), float(a_mean[bucket]))
+                for bucket in range(n_buckets)
+                if counts[bucket] > 0
+            }
 
     return {
         trial: {
@@ -359,6 +409,43 @@ def report_metrics(recipe_id, per_trial, checkpoints, occupied, names) -> None:
     print(f"rank_bias_{recipe_id}_worst_slope: {finite[worst]:.6f}")
     print(f"rank_bias_{recipe_id}_worst_bucket: {worst}")
     print(f"rank_bias_{recipe_id}_median_slope: {median:.6f}")
+
+
+def report_signed_bias(
+    recipe_id: str,
+    signed: Dict[int, Dict[int, Tuple[float, float]]],
+    checkpoints: List[int],
+    occupied: List[int],
+    names: Dict[int, str],
+    rms_by_bucket: Dict[int, float],
+) -> None:
+    """Print the signed residual and the magnitude shrink at the largest T.
+
+    A bucket's MSE says how much error there is; these say whether it points one
+    way. ``coherence`` is |signed mean| / RMS residual: 1.0 means every element of
+    the bucket errs in the same direction and the whole residual survives into a
+    parameter update, ~0 means the signs cancel and it does not, whatever the MSE.
+    """
+    t = checkpoints[-1]
+    per_bucket = signed.get(t, {})
+    if not per_bucket:
+        return
+    ranked = [b for b in occupied if b != 0]
+
+    print(f"\nrecipe {recipe_id}: signed bias at T={t} (MSE cannot see this)")
+    print(f"  {'bucket':>10} {'signed mean':>13} {'|q|-|x| mean':>14} {'coherence':>10}")
+    for b in ranked:
+        s_mean, a_mean = per_bucket[b]
+        rms = rms_by_bucket.get(b, 0.0)
+        coh = abs(s_mean) / rms if rms > 0 else float("nan")
+        print(f"  {names[b]:>10} {s_mean:13.4e} {a_mean:14.4e} {coh:10.4f}")
+
+    amax_s, amax_a = per_bucket[ranked[0]]
+    rms = rms_by_bucket.get(ranked[0], 0.0)
+    print(f"rank_bias_{recipe_id}_amax_signed_mean: {amax_s:.6e}")
+    print(f"rank_bias_{recipe_id}_amax_abs_shrink: {amax_a:.6e}")
+    if rms > 0:
+        print(f"rank_bias_{recipe_id}_amax_coherence: {abs(amax_s) / rms:.6f}")
 
 
 def export_csv(
@@ -654,10 +741,12 @@ def main() -> None:
     labels = labels_cpu.cuda()
     counts = counts_cpu.cuda().double()
     results = {}
+    signed: Dict[str, Dict[int, Dict[int, Tuple[float, float]]]] = {}
     for recipe_id, (use_sr, use_rht) in settings.items():
         sign = "varying" if args.vary_rht_sign else "fixed"
         rht_note = f", RHT-16 (sign {sign})" if use_rht else ""
         print(f"recipe {recipe_id}: use_sr={use_sr}{rht_note}")
+        signed[recipe_id] = {}
         results[recipe_id] = sweep_recipe(
             tensor,
             labels,
@@ -670,11 +759,19 @@ def main() -> None:
             args.seed,
             use_rht,
             args.vary_rht_sign,
+            signed_out=signed[recipe_id],
         )
         torch.cuda.empty_cache()
 
     for recipe_id, per_trial in results.items():
         report_metrics(recipe_id, per_trial, checkpoints, occupied, names)
+        rms = {
+            b: math.sqrt(per_trial[checkpoints[-1]][b])
+            for b in per_trial[checkpoints[-1]]
+        }
+        report_signed_bias(
+            recipe_id, signed[recipe_id], checkpoints, occupied, names, rms
+        )
 
     os.makedirs(args.save_plot_dir, exist_ok=True)
     if args.tensor_path:
