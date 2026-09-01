@@ -695,6 +695,20 @@ def main() -> None:
             args.recipes = DEFAULT_RECIPES
 
     recipe_labels = parse_recipe_labels(args.recipe_label)
+    # A recipe's label is not lane-aware, but 9004's RHT is: it rotates only the
+    # TRANSPOSE lane of X and G, never an identity lane and never W. Titling an
+    # identity-lane heatmap "RHT-16 (wgrad)" claims a transform that was not
+    # applied, which is exactly the class of error this whole analysis has
+    # already been burned by once. Strike it when the lane under test is not
+    # rotated.
+    _, _transpose = VARIANTS[args.variant]
+    for _rid in list(recipe_labels):
+        _base = RECIPE_ALIASES.get(_rid, _rid)
+        _rotates = _base in RECIPES and bool(RECIPES[_base].rht_transpose)
+        if _rotates and not _transpose:
+            recipe_labels[_rid] = recipe_labels[_rid].replace(
+                "RHT-16 (wgrad), ", ""
+            ) + " (identity lane: no RHT)"
     make_summary_heatmap(
         slope_csv,
         args.out_dir,
