@@ -158,23 +158,22 @@ def load_metric(
 
 
 def cell_text(v: float) -> str:
-    """Slope as a bare two-digit magnitude: -0.39 -> "39", -1.00 -> "1".
+    """Slope as |slope| x 100, zero-padded to two digits: -0.39 -> "39",
+    -1.00 -> "100", -0.07 -> "07".
 
     Every slope here lies in [-1, 0] up to fitting noise, so the sign and the
     leading "0." are four characters of pure constant in every one of the 208
     cells. At 16 columns that is what runs adjacent labels together and makes the
-    grid unreadable; the magnitude alone fits. The colorbar carries the sign, and
-    -1.00 collapses to a single "1" so the ideal case reads at a glance.
+    grid unreadable; the magnitude alone fits. The colorbar carries the sign.
+
+    Padding to two digits matters next to a neighbour reading "95": a bare "7"
+    invites reading 0.7 rather than 0.07, and "07" does not.
 
     A positive slope would be fitting noise on an all-but-flat bucket, but it is
     signed explicitly rather than silently shown as its magnitude.
     """
-    if v > 0:
-        return "+" + f"{v:.2f}"[2:]
-    m = abs(v)
-    if m >= 0.995:
-        return "1"
-    return f"{m:.2f}"[2:]
+    scaled = abs(v) * 100.0
+    return ("+" if v > 0 else "") + f"{scaled:02.0f}"
 
 
 def plot_row(
@@ -249,8 +248,12 @@ def make_summary_heatmap(
     height = 4.8 + 0.35 * max(0, len(rows) - 6)
 
     slope_data, n_slope = load_metric(slope_csv, "slope", recipes, rows)
+    # 0.45in per rank column: the widest cell label is 3 characters ("100"), and
+    # at the previous fixed 4.85in the 16 columns were narrower than their own
+    # text, so a row of ideal slopes rendered as "100100100100".
+    panel_w = max(4.85, 0.45 * len(ranks))
     fig, axes = plt.subplots(
-        1, len(recipes), figsize=(4.85 * len(recipes), height), sharey=True
+        1, len(recipes), figsize=(panel_w * len(recipes), height), sharey=True
     )
     axes = np.atleast_1d(axes)
     im = plot_row(
@@ -278,7 +281,7 @@ def make_summary_heatmap(
         1.02,
         "How close the trial-mean MSE is to decaying as 1/T "
         "(ideal -1; 0 = bias that won't average out). "
-        "Cells are |slope| without the leading 0.: 39 is -0.39, 1 is -1.00.",
+        "Cells are |slope| x 100: 39 is -0.39, 100 is -1.00.",
         ha="center",
         style="italic",
         fontsize=10,
