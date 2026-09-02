@@ -82,12 +82,16 @@ def _e4m3_rne(v: _F32) -> _F32:
 
 
 @cute.jit
-def _philox4(seed: _U64, ctr: _U64) -> Tuple[_U32, _U32, _U32, _U32]:
-    """Philox-4x32-10 with counter ``(ctr_lo, ctr_hi, 0, 0)`` and key ``seed``."""
-    c0 = _U32(ctr & _U64(0xFFFFFFFF))
-    c1 = _U32((ctr >> _U64(32)) & _U64(0xFFFFFFFF))
-    c2 = _U32(0)
-    c3 = _U32(0)
+def _philox4_counter(
+    seed: _U64, c0: _U32, c1: _U32, c2: _U32, c3: _U32
+) -> Tuple[_U32, _U32, _U32, _U32]:
+    """Philox-4x32-10 bijection over an explicit counter, keyed by ``seed``.
+
+    The two callers disagree only on how the counter is filled: this module's
+    FP4 stochastic rounding keys on a flat element index (words 0/1), while
+    kitchen's Eden kernel keys on ``(offset, subsequence)`` (words 0/1 and 2/3 --
+    see ``eden_cutedsl``). Sharing the round function keeps them from drifting.
+    """
     k0 = _U32(seed & _U64(0xFFFFFFFF))
     k1 = _U32((seed >> _U64(32)) & _U64(0xFFFFFFFF))
     for _ in cutlass.range_constexpr(10):
@@ -101,6 +105,18 @@ def _philox4(seed: _U64, ctr: _U64) -> Tuple[_U32, _U32, _U32, _U32]:
         k0 = k0 + _U32(PHILOX_W0)
         k1 = k1 + _U32(PHILOX_W1)
     return c0, c1, c2, c3
+
+
+@cute.jit
+def _philox4(seed: _U64, ctr: _U64) -> Tuple[_U32, _U32, _U32, _U32]:
+    """Philox-4x32-10 with counter ``(ctr_lo, ctr_hi, 0, 0)`` and key ``seed``."""
+    return _philox4_counter(
+        seed,
+        _U32(ctr & _U64(0xFFFFFFFF)),
+        _U32((ctr >> _U64(32)) & _U64(0xFFFFFFFF)),
+        _U32(0),
+        _U32(0),
+    )
 
 
 @cute.jit

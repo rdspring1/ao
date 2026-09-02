@@ -58,6 +58,8 @@ from matplotlib.lines import Line2D
 from matplotlib.ticker import ScalarFormatter
 import torch
 
+from . import eden_cutedsl
+from . import eden_reference
 from . import nvfp4_cutedsl
 from . import nvfp4_reference
 from . import rht
@@ -65,7 +67,12 @@ from . import rht
 COLORS = plt.get_cmap("tab10").colors  # type: ignore[attr-defined]
 MARKERS = ["o", "s", "^", "D", "v", "P", "X", "*", "<", ">"]
 
-BACKENDS = {"cutedsl": nvfp4_cutedsl, "torch": nvfp4_reference}
+# backend -> quantizer -> module. A recipe picks the quantizer per tensor type
+# (kitchen's QuantizeOpCustomizeTensors); the CLI picks the backend.
+BACKENDS = {
+    "cutedsl": {"nvfp4": nvfp4_cutedsl, "eden": eden_cutedsl},
+    "torch": {"nvfp4": nvfp4_reference, "eden": eden_reference},
+}
 
 # variant -> (tensor type, transpose path)
 VARIANTS = {
@@ -77,10 +84,30 @@ VARIANTS = {
     "G.T": ("G", True),
 }
 
+# (tensor type, transpose lane) -> GEMM the lane feeds, i.e. which
+# perform_hadamard_transform_* flag and which sign vector apply. This is
+# kitchen's get_gemm_types_for_tensor.
+GEMM_TYPES = {
+    ("X", False): "fprop",
+    ("X", True): "wgrad",
+    ("W", False): "fprop",
+    ("W", True): "dgrad",
+    ("G", False): "dgrad",
+    ("G", True): "wgrad",
+}
+
 _W_2D_TILES = (
     "recipe 9004 quantizes W with 16x16 PER_2D_BLOCK tiles, which this port does "
     "not implement (only the 1x16 path is). Use --variant G / G.T / X / X.T, or "
     "run W under 6302"
+)
+
+_V2_G_ONLY = (
+    "recipe 100483 is modelled for the gradient lanes only. G / G.T are the "
+    "MS-EDEN operands and the reason the recipe exists; X, X.T and W.T would "
+    "additionally need the psx 1x16 cast under RHT-128 (X.T) and the lazy "
+    "col_rht_requantize path (W.T), neither of which is implemented here. Use "
+    "--variant G / G.T"
 )
 
 
@@ -88,29 +115,68 @@ _W_2D_TILES = (
 class Recipe:
     """The axes of a kitchen recipe this port can express.
 
-    ``use_sr``: tensor type -> stochastic rounding (kitchen's ``use_sr``, which
-    applies to both the identity and transpose lane of that tensor).
-    ``rht_transpose``: tensor types whose *transpose* lane is rotated by the
-    wgrad RHT. Kitchen never rotates an identity lane in these recipes and never
-    rotates W at all.
+    ``use_sr``: tensor type -> stochastic rounding, applied to both lanes of that
+    tensor (kitchen's ``use_sr``). Under an EDEN quantizer this names the
+    rounding of the *block scale*, not of the data, which is always RNE there.
+    ``quantizer``: tensor type -> leaf quantizer, mirroring kitchen's
+    ``QuantizeOpCustomizeTensors``.
+    ``rht_gemms``: the GEMMs the recipe rotates, i.e. which
+    ``perform_hadamard_transform_{fprop,wgrad,dgrad}`` flags are set. A lane
+    rotates when ``GEMM_TYPES[(tensor_type, transpose)]`` is in this set, which
+    is how kitchen decides it (``get_rht_settings_for_tensor``), and the sign
+    vector is the one checked in for that GEMM.
+    ``dynamic_signs``: kitchen's ``enable_online_randomization``. 9004 leaves it
+    off, so its sign vector is fixed for the whole run and the checked-in vector
+    reproduces it bitwise. 100483 turns it on, so a real run re-draws the vector
+    every iteration -- and because that is what makes the estimator unbiased, a
+    9004-style frozen vector does not merely approximate 100483, it changes the
+    answer (the MSE-vs-trials slope goes from -1.0 to -0.02). Sweeping both
+    recipes in one run therefore has to vary the sign for one and freeze it for
+    the other, which is why this is a recipe property and not just a CLI flag.
     ``unsupported``: variant -> why this recipe cannot be swept for it.
     """
 
     use_sr: Dict[str, bool]
-    rht_transpose: FrozenSet[str] = frozenset()
+    quantizer: Dict[str, str] = dataclasses.field(
+        default_factory=lambda: {"X": "nvfp4", "W": "nvfp4", "G": "nvfp4"}
+    )
+    rht_dim: int = 16
+    rht_gemms: FrozenSet[str] = frozenset()
+    dynamic_signs: bool = False
     unsupported: Dict[str, str] = dataclasses.field(default_factory=dict)
 
 
 # 6302 is kitchen's ``QuantizeRecipe.NVFP4_EMULATION`` with ``use_sr`` on
 # ``g_params``; 9004 is 6302 plus 16x16 W tiles and the wgrad RHT; ``nvfp4`` is
-# the base recipe untouched, i.e. RNE everywhere. EDEN, UE5M3 scales, 1x32 tiles
-# and 2-level subchannel scaling are not modelled -- see README.md.
+# the base recipe untouched, i.e. RNE everywhere. 100483 replaces the gradient
+# quantizer with MS-EDEN and rotates at dim 128 on *both* backward GEMMs.
+# Subchannel scaling, UE5M3 scales, 1x32 tiles and the 2D-block tile shapes are
+# still not modelled -- see README.md.
 RECIPES: Dict[str, Recipe] = {
     "6302": Recipe(use_sr={"X": False, "W": False, "G": True}),
     "9004": Recipe(
         use_sr={"X": False, "W": False, "G": True},
-        rht_transpose=frozenset({"X", "G"}),
+        rht_dim=16,
+        rht_gemms=frozenset({"wgrad"}),
+        dynamic_signs=False,  # enable_online_randomization off
         unsupported={"W": _W_2D_TILES, "W.T": _W_2D_TILES},
+    ),
+    "100483": Recipe(
+        # QuantizeOpEdenFP4Emulation(stochastic_round_scale=True) on G only; X
+        # and W keep the psx NVFP4 quantizer.
+        use_sr={"X": False, "W": False, "G": True},
+        quantizer={"X": "nvfp4", "W": "nvfp4", "G": "eden"},
+        rht_dim=128,
+        # _create_rht_technique_recipe(rht_size=128, all_backward=False): wgrad
+        # and dgrad both on, fprop off.
+        rht_gemms=frozenset({"wgrad", "dgrad"}),
+        dynamic_signs=True,  # enable_online_randomization on
+        unsupported={
+            "X": _V2_G_ONLY,
+            "X.T": _V2_G_ONLY,
+            "W": _V2_G_ONLY,
+            "W.T": _V2_G_ONLY,
+        },
     ),
     "nvfp4": Recipe(use_sr={"X": False, "W": False, "G": False}),
 }
@@ -197,9 +263,14 @@ def trial_seed(base_seed: int, replica: int, trial: int, max_trials: int) -> int
 RHTMatrices = Tuple[torch.Tensor, torch.Tensor]
 
 
-def rht_matrices(device: torch.device, sign_seed: Optional[int]) -> RHTMatrices:
-    """Forward and inverse wgrad rotation; ``sign_seed=None`` is kitchen's fixed sign."""
-    return rht.transform_matrices(rht.sign_vector(device, seed=sign_seed))
+def rht_matrices(
+    device: torch.device, sign_seed: Optional[int], dim: int, gemm: str
+) -> RHTMatrices:
+    """Forward and inverse rotation for one lane; ``sign_seed=None`` is kitchen's
+    checked-in sign vector for that GEMM."""
+    return rht.transform_matrices(
+        rht.sign_vector(device, seed=sign_seed, dim=dim, lane=gemm)
+    )
 
 
 def leaf_qdq(
@@ -209,31 +280,46 @@ def leaf_qdq(
     transpose: bool,
     use_sr: bool,
     matrices: Optional[RHTMatrices],
+    rht_dim: int,
     seed: int,
 ) -> torch.Tensor:
-    """One trial's QDQ, rotated into the wgrad basis first when the recipe asks.
+    """One trial's QDQ, rotated into the lane's basis first when the recipe asks.
 
-    Kitchen rotates, quantizes, inverse-rotates and only then crops the RHT row
+    Kitchen rotates, quantizes, inverse-rotates and only then crops the RHT
     padding (``QuantizeOpFP8HadamardTransform.dequantize``); the order matters
-    because the inverse mixes the padded rows back in.
+    because the inverse mixes the padded elements back in.
+
+    The rotation runs along the lane's own contraction axis -- rows for a
+    transpose (wgrad) lane, columns for an identity (dgrad) lane -- which is the
+    axis the QDQ blocks along, so an RHT tile and a quantization block cover the
+    same elements.
     """
     if matrices is None:
         return backend.quant_dequant(
             tensor, transpose=transpose, use_sr=use_sr, seed=seed
         )
     forward, inverse = matrices
-    rotated = rht.transform(rht.pad_rows(tensor), forward)
-    dq = backend.quant_dequant(rotated, transpose=True, use_sr=use_sr, seed=seed)
-    return rht.transform(dq, inverse)[: tensor.shape[0]]
+    padded = (
+        rht.pad_rows(tensor, rht_dim) if transpose else rht.pad_cols(tensor, rht_dim)
+    )
+    rotated = rht.transform(padded, forward, transpose=transpose)
+    dq = backend.quant_dequant(rotated, transpose=transpose, use_sr=use_sr, seed=seed)
+    restored = rht.transform(dq, inverse, transpose=transpose)
+    return restored[: tensor.shape[0], : tensor.shape[1]]
 
 
 def assert_stochastic(
-    backend, use_sr: bool, transpose: bool, matrices: Optional[RHTMatrices]
+    backend,
+    use_sr: bool,
+    transpose: bool,
+    matrices: Optional[RHTMatrices],
+    rht_dim: int,
 ) -> None:
     """Two trials on the same tensor must differ, else trials aren't independent."""
     x = torch.randn(256, 256, device="cuda", dtype=torch.bfloat16)
-    a = leaf_qdq(backend, x, transpose=transpose, use_sr=use_sr, matrices=matrices, seed=1)
-    b = leaf_qdq(backend, x, transpose=transpose, use_sr=use_sr, matrices=matrices, seed=2)
+    kwargs = dict(transpose=transpose, use_sr=use_sr, matrices=matrices, rht_dim=rht_dim)
+    a = leaf_qdq(backend, x, seed=1, **kwargs)
+    b = leaf_qdq(backend, x, seed=2, **kwargs)
     if torch.equal(a.float(), b.float()):
         raise RuntimeError(
             "Recipe produced identical reconstructions on two trials; the "
@@ -255,6 +341,8 @@ def sweep_recipe(
     base_seed: int,
     use_rht: bool,
     vary_rht_sign: bool,
+    rht_dim: int,
+    rht_gemm: str,
     signed_out: Optional[Dict[int, Dict[int, Tuple[float, float]]]] = None,
 ) -> Dict[int, Dict[int, float]]:
     """Return checkpoint -> bucket -> MSE of trial-mean reconstruction.
@@ -290,14 +378,16 @@ def sweep_recipe(
         "a": defaultdict(list),
     }
 
-    frozen = rht_matrices(tensor.device, None) if use_rht else None
+    frozen = (
+        rht_matrices(tensor.device, None, rht_dim, rht_gemm) if use_rht else None
+    )
 
     for replica in range(replicas):
         running_sum = torch.zeros_like(target, dtype=torch.float32)
         for trial in range(1, max_trials + 1):
             seed = trial_seed(base_seed, replica, trial, max_trials)
             matrices = (
-                rht_matrices(tensor.device, seed)
+                rht_matrices(tensor.device, seed, rht_dim, rht_gemm)
                 if use_rht and vary_rht_sign
                 else frozen
             )
@@ -307,6 +397,7 @@ def sweep_recipe(
                 transpose=transpose,
                 use_sr=use_sr,
                 matrices=matrices,
+                rht_dim=rht_dim,
                 seed=seed,
             )
             running_sum.add_(recon.float())
@@ -354,61 +445,6 @@ def sweep_recipe(
         }
         for trial, per_bucket in accum.items()
     }
-
-
-def fit_slope(per_trial, checkpoints, bucket) -> float:
-    """Least-squares slope of log10(MSE) against log10(trials) for one bucket.
-
-    Unbiased SR averages as 1/T, so the MSE of the trial-mean falls as 1/T and
-    this slope is -1. A bucket carrying a systematic bias flattens toward 0,
-    because no number of trials averages a bias away. The slope is therefore the
-    single number the whole plot exists to produce.
-    """
-    pts = [
-        (math.log10(t), math.log10(per_trial[t][bucket]))
-        for t in checkpoints
-        if per_trial[t].get(bucket, 0.0) > 0.0
-    ]
-    if len(pts) < 2:
-        return float("nan")
-    n = len(pts)
-    mx = sum(x for x, _ in pts) / n
-    my = sum(y for _, y in pts) / n
-    den = sum((x - mx) ** 2 for x, _ in pts)
-    return sum((x - mx) * (y - my) for x, y in pts) / den
-
-
-def report_metrics(recipe_id, per_trial, checkpoints, occupied, names) -> None:
-    """Print per-bucket slopes, then three scalars for the CI metric scraper.
-
-    The worst (least negative) slope is the headline: it is the flattest bucket,
-    i.e. the one whose error a longer average does not remove. Zeros are excluded
-    -- an exactly-zero element quantizes to zero every trial, so its bucket has no
-    error to decay and its slope is meaningless.
-
-    The recipe id is IN the metric name rather than a separate line, because a
-    JET ``stdout_regex`` metric has no way to associate two lines with each other
-    and ``--recipes`` may sweep several in one run.
-    """
-    ranked = [b for b in occupied if b != 0]
-    slopes = {b: fit_slope(per_trial, checkpoints, b) for b in ranked}
-    finite = {b: v for b, v in slopes.items() if not math.isnan(v)}
-
-    print(f"\nrecipe {recipe_id}: slope of log(MSE) vs log(trials), "
-          "-1 = unbiased, 0 = bias floor:")
-    for b in ranked:
-        print(f"  {names[b]:>12}: {slopes[b]:+.4f}")
-
-    if not finite:
-        return
-    worst = max(finite, key=lambda b: finite[b])
-    ordered = sorted(finite.values())
-    mid = len(ordered) // 2
-    median = ordered[mid] if len(ordered) % 2 else (ordered[mid - 1] + ordered[mid]) / 2
-    # Flat, greppable lines: a stdout_regex metric cannot parse the table above.
-    print(f"rank_bias_{recipe_id}_worst_slope: {finite[worst]:.6f}")
-    print(f"rank_bias_{recipe_id}_worst_bucket: {worst}")
-    print(f"rank_bias_{recipe_id}_median_slope: {median:.6f}")
 
 
 def report_signed_bias(
@@ -582,9 +618,10 @@ def plot_results(
         bbox_to_anchor=(0.5, 0.985),
     )
     block_axis = f"{block_size}x1" if transpose else f"1x{block_size}"
-    rht_note = (
-        f" — RHT-16 (wgrad) for {', '.join(rht_recipes)}" if rht_recipes else ""
-    )
+    # rht_recipes entries are already "<id> RHT-<dim>/<gemm>": the dimension and
+    # the rotated GEMM both differ between 9004 and 100483, so neither can be
+    # hard-coded into this label.
+    rht_note = f" — {', '.join(rht_recipes)}" if rht_recipes else ""
     fig.suptitle(
         f"Trial-mean reconstruction MSE by within-block |x| rank\n"
         f"{tensor_name} — variant {variant} — {block_axis} QDQ blocks{rht_note}",
@@ -664,11 +701,15 @@ def main() -> None:
         "--vary-rht-sign",
         dest="vary_rht_sign",
         action="store_true",
-        default=False,
-        help="Re-draw the RHT sign vector every trial, for dumps whose sign "
-        "vector was randomized online. The default freezes it to kitchen's "
-        "checked-in wgrad vector, which is what recipe 9004 itself uses and the "
-        "only setting that reproduces a kitchen run bitwise.",
+        default=None,
+        help="Re-draw the RHT sign vector every trial. The default follows the "
+        "recipe: frozen for 9004 (enable_online_randomization off, so the "
+        "checked-in vector is what a run actually uses and the only setting "
+        "that reproduces it bitwise), re-drawn for 100483 (online "
+        "randomization on). Passing this flag, or --no-vary-rht-sign, forces "
+        "the same choice on every recipe in the run -- which is what you want "
+        "to isolate the effect of the sign lifetime, and not what you want for "
+        "a faithful 9004-vs-100483 comparison.",
     )
     parser.add_argument(
         "--no-vary-rht-sign", dest="vary_rht_sign", action="store_false"
@@ -692,8 +733,9 @@ def main() -> None:
             "up with the quantization blocks."
         )
 
-    backend = BACKENDS[args.backend]
+    backends = BACKENDS[args.backend]
     tensor_type, transpose = VARIANTS[args.variant]
+    gemm = GEMM_TYPES[(tensor_type, transpose)]
     recipe_ids = [RECIPE_ALIASES.get(r, r) for r in args.recipes]
     for recipe_id in recipe_ids:
         reason = RECIPES[recipe_id].unsupported.get(args.variant)
@@ -719,22 +761,36 @@ def main() -> None:
         + ", ".join(f"{names[b]}={int(counts_cpu[b].item()):,}" for b in occupied)
     )
 
-    # RHT only ever touches a transpose lane, and only for the tensor types the
-    # recipe rotates (never W).
+    # A lane rotates when the GEMM it feeds is one the recipe transforms, which
+    # is how kitchen decides it. 9004 sets wgrad only, so its identity lanes are
+    # all unrotated; 100483 sets wgrad and dgrad, so both G lanes rotate -- and
+    # they draw different sign vectors, because they are different GEMMs.
     settings = {
         recipe_id: (
             RECIPES[recipe_id].use_sr[tensor_type],
-            transpose and tensor_type in RECIPES[recipe_id].rht_transpose,
+            gemm in RECIPES[recipe_id].rht_gemms,
+            RECIPES[recipe_id].rht_dim,
+            backends[RECIPES[recipe_id].quantizer[tensor_type]],
+            (
+                RECIPES[recipe_id].dynamic_signs
+                if args.vary_rht_sign is None
+                else args.vary_rht_sign
+            ),
         )
         for recipe_id in recipe_ids
     }
     if not args.skip_stochastic_check:
-        for use_sr, use_rht in settings.values():
+        for use_sr, use_rht, rht_dim, backend, _ in settings.values():
             assert_stochastic(
                 backend,
                 use_sr,
                 transpose,
-                rht_matrices(torch.device("cuda"), None) if use_rht else None,
+                (
+                    rht_matrices(torch.device("cuda"), None, rht_dim, gemm)
+                    if use_rht
+                    else None
+                ),
+                rht_dim,
             )
 
     tensor = tensor_cpu.cuda()
@@ -742,10 +798,12 @@ def main() -> None:
     counts = counts_cpu.cuda().double()
     results = {}
     signed: Dict[str, Dict[int, Dict[int, Tuple[float, float]]]] = {}
-    for recipe_id, (use_sr, use_rht) in settings.items():
-        sign = "varying" if args.vary_rht_sign else "fixed"
-        rht_note = f", RHT-16 (sign {sign})" if use_rht else ""
-        print(f"recipe {recipe_id}: use_sr={use_sr}{rht_note}")
+    for recipe_id, (use_sr, use_rht, rht_dim, backend, vary) in settings.items():
+        sign = "varying" if vary else "fixed"
+        rht_note = f", RHT-{rht_dim} on {gemm} (sign {sign})" if use_rht else ""
+        quantizer = RECIPES[recipe_id].quantizer[tensor_type]
+        sr_note = "scale SR" if quantizer == "eden" else "use_sr"
+        print(f"recipe {recipe_id}: {quantizer}, {sr_note}={use_sr}{rht_note}")
         signed[recipe_id] = {}
         results[recipe_id] = sweep_recipe(
             tensor,
@@ -758,13 +816,14 @@ def main() -> None:
             backend,
             args.seed,
             use_rht,
-            args.vary_rht_sign,
+            vary,
+            rht_dim,
+            gemm,
             signed_out=signed[recipe_id],
         )
         torch.cuda.empty_cache()
 
     for recipe_id, per_trial in results.items():
-        report_metrics(recipe_id, per_trial, checkpoints, occupied, names)
         rms = {
             b: math.sqrt(per_trial[checkpoints[-1]][b])
             for b in per_trial[checkpoints[-1]]
@@ -802,7 +861,11 @@ def main() -> None:
         args.block_size,
         args.variant,
         transpose=transpose,
-        rht_recipes=[r for r, (_, use_rht) in settings.items() if use_rht],
+        rht_recipes=[
+            f"{r} RHT-{dim}/{gemm}"
+            for r, (_, use_rht, dim, _, _) in settings.items()
+            if use_rht
+        ],
     )
 
 

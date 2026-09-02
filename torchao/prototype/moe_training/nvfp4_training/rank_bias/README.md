@@ -7,10 +7,14 @@ quantize/dequantize path is reimplemented twice:
 | module | what it is |
 | --- | --- |
 | `nvfp4_reference.py` | PyTorch oracle, a transcription of kitchen's `nvfp_utils.to_nvfp_verbose` / `from_nvfp_verbose` / `cast_utils` |
-| `rht.py` | the wgrad Random Hadamard Transform recipe 9004 adds, a transcription of `perform_random_hadamard_transform_ref` |
+| `eden_reference.py` | PyTorch oracle for recipe 100483's MS-EDEN leaf, a transcription of `quantize_transpose_vector_blockwise_fp4_eden.cu` |
+| `rht.py` | the Random Hadamard Transform, dim 16 (9004) and dim 128 (100483), a transcription of `perform_random_hadamard_transform_ref` |
 | `nvfp4_cutedsl.py` | CuTe DSL kernels (`nvidia-cutlass-dsl`), **bitwise identical** to the oracle |
+| `eden_cutedsl.py` | the same for the MS-EDEN leaf |
 | `analyze_rank_bias.py` | the sweep, plots and CSV, driving either backend |
+| `analyze_sparsity.py` | exact-zero and FP4 flush-to-zero sparsity per tensor / module |
 | `test_nvfp4_qdq.py` | the equivalence tests |
+| `test_sparsity.py` | tests for the sparsity script |
 | `test_kitchen_equivalence.py` | optional cross-check against a *built* kitchen; skipped otherwise |
 | `test_psx_clippy_equivalence.py` | optional cross-check against the psx `clippy` CUDA kernels; needs only `psx_formats` |
 
@@ -19,29 +23,37 @@ monorepo. `pip install -r requirements.txt` on any CUDA box (Hopper or newer)
 and run.
 
 ```bash
-pip install -r requirements.txt
-pytest -q   # test_kitchen_equivalence.py skips unless kitchen is importable
+RB=torchao.prototype.moe_training.nvfp4_training.rank_bias
+pytest -q test/prototype/moe_training/nvfp4_training/rank_bias/
 
 # real dump
-python analyze_rank_bias.py --tensor-path G_rank0_layer0_fc1_step0.pt \
+python3 -m $RB --tensor-path G_rank0_layer0_fc1_step0.pt \
     --recipes 9004 --variant G.T --trials 2 4 8 16 32 64 128 --save-plot-dir ./plots
 
 # both recipes as two curves per bucket
-python analyze_rank_bias.py --random 4096x4096 --recipes 6302 9004 --variant G.T \
+python3 -m $RB --random 4096x4096 --recipes 6302 9004 --variant G.T \
     --trials 2 4 8 16 --save-plot-dir ./plots
+
+# V1 vs V2 head to head; each recipe uses its own sign lifetime by default
+python3 -m $RB --random 4096x4096 --recipes 9004 100483 --variant G.T \
+    --trials 2 4 8 16 32 64 --save-plot-dir ./plots
 ```
 
 ## What is modelled
 
-| `--recipes` | SR on G | W tiles | RHT | variants |
-| --- | --- | --- | --- | --- |
-| `6302` | yes | 1x16 | none | all six |
-| `9004` (alias `6304`) | yes | 16x16 2D | wgrad | X, X.T, G, G.T |
-| `nvfp4` | no | 1x16 | none | all six |
+| `--recipes` | G quantizer | randomness on G | W tiles | RHT | signs | variants |
+| --- | --- | --- | --- | --- | --- | --- |
+| `6302` | NVFP4 | SR on the FP4 data | 1x16 | none | — | all six |
+| `9004` (alias `6304`) | NVFP4 | SR on the FP4 data | 16x16 2D | wgrad, dim 16 | static | X, X.T, G, G.T |
+| `100483` | MS-EDEN | SR on the E4M3 **block scale**; data is RNE | 1x16 | wgrad **and dgrad**, dim 128 | dynamic | G, G.T |
+| `nvfp4` | NVFP4 | none (RNE) | 1x16 | none | — | all six |
 
 `--variant W` / `W.T` under 9004 is rejected rather than silently swept with the
 wrong tile shape: the 16x16 `PER_2D_BLOCK` path is not implemented. It is only
-W that needs it, so the G analysis is unaffected.
+W that needs it, so the G analysis is unaffected. `100483` likewise accepts only
+`G` / `G.T`; its X and W lanes keep the psx NVFP4 quantizer and would need the
+1x16 cast under RHT-128 (`X.T`) and the lazy `col_rht_requantize` path (`W.T`),
+neither of which is implemented here.
 
 Kitchen recipe **6302** = `QuantizeRecipe.NVFP4_EMULATION` with `use_sr=True` on
 `g_params`, i.e. for every tensor:
@@ -92,6 +104,148 @@ quantization errors, not the error of that element's own block. Kitchen's script
 labels the same way, so the curves are comparable — it is the interpretation, not
 the number, that changes.
 
+### Recipe 100483 (V2): MS-EDEN, RHT-128, dynamic signs
+
+100483 is not 9004 with a bigger Hadamard. Four things change together
+(`kitchen/config.py:10658`):
+
+| | 9004 (V1) | 100483 (V2) |
+| --- | --- | --- |
+| G data rounding | FP4 **stochastic** (psx `apply_rs`, in-kernel cuRAND) | FP4 **RNE** |
+| G block scale | E4M3 RNE | MS-EDEN corrected, then **E4M3 stochastic** |
+| decode numerator | `6*448 = 2688` | `6*256 = 1536` |
+| RHT | dim 16, **wgrad lane only** | dim 128, **wgrad *and* dgrad** |
+| sign vector | static | re-drawn per iteration |
+
+The MS-EDEN leaf, per 16-element block: quantize with the uncorrected E4M3 block
+scale, RNE; accumulate `sum_sq = Σ x_s²` and `sum_cross = Σ x_s · code` over the
+block with **sequential fp32 FMAs** in element order; take
+`correction = sum_sq / sum_cross` (falling back to 1.0 when `sum_cross` is zero
+or the ratio is not finite); multiply the scale by it; stochastically round that
+to E4M3. The block-scale ceiling is 256 rather than 448 precisely so the
+correction, which can only raise the scale, has headroom before it saturates.
+
+**Both G lanes rotate**, and they rotate along different axes with *different*
+sign vectors. G's identity lane is the DGRAD GEMM and its transpose lane is the
+WGRAD GEMM (`get_gemm_types_for_tensor`), and 100483 enables the transform on
+both, so `--variant G` is RHT-128 rotated too. Under 9004 no identity lane was
+ever rotated, which is why the recipe table now keys on the GEMM a lane feeds
+rather than on "is this the transpose lane".
+
+**Sign lifetime is a recipe property, not a CLI preference.** 9004 leaves
+`enable_online_randomization` off and 100483 turns it on, so `--vary-rht-sign`
+now defaults to *per recipe* rather than to a single global choice. This is
+load-bearing rather than cosmetic: MS-EDEN's FP4 codes are deterministic, so with
+the sign frozen the only random quantity left is the block scale, and a trial
+mean converges on the *corrected reconstruction* rather than on the input. On a
+2048x2048 Gaussian, `G.T`:
+
+| sign | 9004 slope | 100483 slope | 100483 MSE @ T=64 |
+| --- | ---: | ---: | ---: |
+| forced fixed | -0.90 | **-0.04** | 1.21e-02 |
+| forced varying | -0.99 | -1.00 | 2.47e-04 |
+
+Frozen signs make 100483 look like it has no averaging benefit at all. Passing
+`--vary-rht-sign` or `--no-vary-rht-sign` still forces one choice on every recipe
+in the run, which is what you want to isolate the sign lifetime and *not* what
+you want for a faithful 9004-vs-100483 comparison.
+
+## Sparsity: what NVFP4 actually discards
+
+`analyze_sparsity.py` is deliberately a separate script. `analyze_rank_bias.py`
+is a *trials* sweep — the T loop, the MSE-vs-T curves and the RNG are its whole
+shape — whereas sparsity is a static property of the tensor: no trials, no
+averaging, no recipe at all for the raw numbers. They share the leaf quantizers,
+`dsv3_dumps` discovery and the recipe table, and no control flow.
+
+Three numbers that are routinely conflated:
+
+| | what it is |
+| --- | --- |
+| `exact_zero` | exactly 0 in the dump. A property of the **model**: ReLU families produce them, SiLU/GELU families essentially never do, MoE routing produces them in whole rows. Costs nothing — FP4 represents zero exactly. |
+| `flush` | **nonzero in, FP4 code 0 out**. This is information the format destroys, and it is *block relative*: an element flushes when it is small against the amax of its own 16-element block, not when it is small absolutely. |
+| `dead_block` | the E4M3 block scale itself underflows, so the whole block reconstructs as zero. |
+
+The distributional statistic behind `flush` is `p50_rel`, the median of
+`|x| / block_amax`. An element rounds to FP4 zero at about `|x| < block_amax/24`
+(the E2M1 RNE threshold 0.25 against the 6.0 ceiling), so `p50_rel` says how much
+headroom a typical element has, and it is recipe-independent — which is what
+makes it comparable across models. `test_sparsity.py` checks the measured
+`flush` against that analytic threshold by two independent routes.
+
+**The RHT is a sparsity-destroying transform.** It mixes 16 (9004) or 128
+(100483) elements per output, so a rotated lane has essentially no exact zeros
+and a much tighter `|x|/block_amax` spread. Sparsity is therefore reported per
+lane with the rotation that lane actually gets, and the raw pre-rotation
+exact-zero fraction is carried alongside so the model property stays visible.
+
+### Running it on real dumps
+
+Discovery, filtering and tensor preparation are the same path
+`plot_bias_heatmaps.py` used to produce E21, so the flags carry over:
+
+```bash
+python3 -m $RB.analyze_sparsity --base-dir /path/to/dumps --tensor-type G \
+    --variants G G.T --recipe 9004 --csv sparsity.csv
+# same subsetting flags as plot_bias_heatmaps.py
+#   --layer-types ... --skip-layer-numbers ... --exclude-experts
+#   --rank N --step N
+```
+
+Dumps are handed to the quantizer at their own dtype (both quantizers accept
+fp32; nothing is silently rounded to bf16 first) and `flatten_to_2d` collapses a
+`[seq, batch, hidden]` dump the same way the sweep does. Ragged MoE expert row
+counts are fine: the quantizer pads to `(32,16)` / `(128,64)` and the RHT to a
+multiple of its dimension, and the padding is masked out of every statistic —
+`test_sparsity.py` pins that with shapes like `1373 x 1408` (`1373 % 128 == 93`)
+on both lanes, rotated and not.
+
+### Exact zeros in the DSV3 dumps are negligible
+
+From the committed E21 summaries (345 G tensors, `n_elements` in the zeros
+bucket), median exact-zero fraction by module:
+
+| module | zeros % |
+| --- | ---: |
+| `qkv` | 0.057 |
+| `proj` | 0.041 |
+| `fc2` (routed / shared / dense) | 0.037 |
+| `fc1`, `fc3`, `kv_a`, `kv_b` | **0.000** |
+
+So structural sparsity is not what matters for these dumps; `flush` is.
+
+### GLU vs non-GLU
+
+`--synthetic` builds fc1/fc2/fc3 gradients for one MLP block with the shapes,
+input distribution and init held fixed, so the only thing varying is the
+nonlinearity. `G_fc2` is the incoming `dy` and is untouched by the activation,
+which makes it the control — its ~6.8% flush is the **Gaussian floor** for 1x16
+NVFP4 blocks, and anything above that is excess dynamic range the activation
+introduced.
+
+Recipe 9004, `--variant G` (the dgrad lane, which 9004 leaves **unrotated**):
+
+| activation / layer | raw zeros % | flush % | total FP4 zeros % | p50_rel |
+| --- | ---: | ---: | ---: | ---: |
+| `swiglu/fc1` | 0.0 | **36.1** | 36.1 | 0.087 |
+| `swiglu/fc3` | 0.0 | 27.0 | 27.0 | 0.113 |
+| `gelu/fc1` | 0.0 | 26.2 | 26.2 | 0.137 |
+| `relu2/fc1` | **50.0** | **8.8** | 58.8 | 0.216 |
+| any `fc2` (control) | 0.0 | 6.8 | 6.8 | 0.333 |
+
+The naive reading of that table is backwards. `relu2` has the *most* zeros
+(58.8%) but discards the *least* information (8.8%), because half its gradient
+is exactly zero by construction — `d(relu²)/dh = 2·relu(h)` vanishes on half its
+domain — and an exact zero is free. SwiGLU has no exact zeros at all but flushes
+36% of fc1, because gating spreads the gradient over a much wider within-block
+dynamic range. A non-GLU MLP is therefore **easier** for NVFP4 on this lane, not
+harder.
+
+Under recipe 100483 every lane is rotated at dim 128 and the whole table
+collapses to 6.44–6.83% flush regardless of activation: RHT-128 Gaussianizes the
+operand and erases the difference. The activation choice is a V1-dgrad-lane
+concern, not a V2 concern.
+
 ## Equivalence: what is proven, and what is not
 
 Proven by `test_nvfp4_qdq.py` (no kitchen needed):
@@ -106,6 +260,13 @@ Proven by `test_nvfp4_qdq.py` (no kitchen needed):
 3. **The oracle == kitchen's own reference math** — `test_reference_matches_kitchen_source`
    re-derives the result from a verbatim transcription of `nvfp_utils` and
    `cast_utils` and compares bits.
+
+Also proven by `test_nvfp4_qdq.py` for the MS-EDEN path: CuTe DSL == oracle bit
+for bit on both lanes, padded and unpadded, SR and RNE, plus the degenerate
+blocks; the correction is exactly 1.0 on a block already on the FP4 grid and
+falls back to 1.0 rather than dividing by zero when every code is zero; the data
+codes are identical across seeds while the block scales are not (the structural
+difference from 9004); and `emulate_sr_e4m3` is unbiased over 4096 draws.
 
 Proven by `test_kitchen_equivalence.py`, against a real kitchen build
 (`KITCHEN_CUDA_ARCHS=100a pip install --no-build-isolation -e .`):
@@ -131,6 +292,31 @@ Proven by `test_kitchen_equivalence.py`, against a real kitchen build
    separately against `get_rht_settings_for_tensor`; G's lanes cannot be compared
    bitwise because `use_sr` makes both of them stochastic, so the rotated G.T
    tensor is checked with the SR bracket technique instead.
+
+Proven by `test_kitchen_equivalence.py` for recipe **100483** specifically:
+
+10. **The MS-EDEN leaf == kitchen's Eden kernel, bit for bit, stochastic
+    rounding included** — both lanes, three shapes, through
+    `QuantizeOpEdenFP4Emulation.quantize()` / `.dequantize()`. This is the claim
+    the 9004 SR path can never make, and it needs no monkeypatching: 100483's
+    data is RNE and its one random step is `emulate_sr_e4m3`, a **software** bit
+    twiddle on a Philox word whose seed is a plain kernel argument, so both sides
+    can be made to round on identical bits by pinning `rng_seed` and switching
+    off `iterate_rng_seed` / `mix_rank_in_seed`. The deterministic
+    (`stochastic_round_scale=False`) branch is checked separately, so a
+    correction bug and a compensating RNG bug cannot cancel.
+11. **The dim-128 rotation == kitchen's, bit for bit, on both lanes**, forward
+    and inverse, including the fused `diag(s) @ H` matrices. The identity
+    (dgrad) lane — the `x @ H` form, mixing 128 columns — is new here; 9004 never
+    rotated one.
+12. **The whole 100483 leaf == kitchen's, bit for bit** — rotate, quantize,
+    inverse-rotate, crop — for G and G.T, both backends, through the real
+    `perform_random_hadamard_transform_ref` and the real Eden op.
+13. **The recipe table is pinned against the config**: which GEMMs rotate and at
+    what dimension (`get_rht_settings_for_tensor`, `hadamard_dim_*`), that G's
+    two lanes draw different checked-in sign vectors, that `dynamic_signs`
+    tracks `enable_online_randomization`, and that G uses the Eden quantizer
+    while X and W keep the psx NVFP4 one.
 
 Proven by `test_psx_clippy_equivalence.py`, which needs only a built
 `psx_formats` (kitchen's `third_party/psx-formats`):
@@ -174,6 +360,23 @@ Not proven, and worth knowing:
 
   The last two need a tensor with roughly 2e5:1 dynamic range or an amax near
   the fp32 ceiling, so a bf16 gradient dump does not reach them.
+* **Nothing about 100483 has been run against a real DSV3 dump.** The
+  9004-vs-100483 numbers quoted above are on a Gaussian tensor, because no dump
+  is present in the environment this was developed in. The bitwise equivalences
+  are dump-independent; the *curves* are not, and E21's finding (a flat amax
+  bucket on real gradients where a Gaussian shows slope -0.9) is exactly the
+  reason not to generalize from the Gaussian.
+* **100483's real sign vectors are re-drawn from kitchen's ambient generator.**
+  The `["128"]` vectors checked into `hadamard_random_sign_vec.json` are what
+  this port draws when the sign is frozen, and freezing is the only setting that
+  reproduces kitchen bitwise — but 100483 itself never freezes, so the bitwise
+  tests pin a configuration the recipe does not run in. `--vary-rht-sign` (the
+  default for 100483) matches the recipe's *distribution*, never its bits, which
+  is the same situation SR is in for 9004.
+* **`--variant G` is not comparable across 9004 and 100483.** Under 9004 the
+  identity lane is unrotated, so `G` was bit-identical to 6302; under 100483 it
+  carries RHT-128. E21's `g_9004` "dgrad, no RHT" column therefore has no 100483
+  counterpart, and only `G.T` compares like for like.
 * **A re-drawn RHT sign vector cannot be compared bitwise.** `--vary-rht-sign`
   draws from an explicit per-trial generator; kitchen's online randomization
   draws from the ambient one. Same distribution, different stream — the same
@@ -192,8 +395,10 @@ Not proven, and worth knowing:
   third thing again (reciprocal-multiply, 1 ULP from a true divide on ~25% of
   inputs). Both are spelled out explicitly in `nvfp4_reference.quantize`.
   Getting the first one wrong moved 2 elements in 6240 by one FP4 step.
-* **EDEN, subchannel (2-level block) scaling, UE5M3 scales, 1x32 tiles and the
-  2D-block tile shapes are not modelled.** That leaves `--variant W` / `W.T`
+* **Subchannel (2-level block) scaling, UE5M3 scales, 1x32 tiles and the
+  2D-block tile shapes are not modelled.** (EDEN now is, for 1x16 blocks with
+  `correction_dim == 16`, which is the configuration 100483 uses; the pooled
+  `correction_dim != 16` and E0M3 Eden kernels are not.) That leaves `--variant W` / `W.T`
   unavailable under 9004 (16x16 `PER_2D_BLOCK`), and recipes 6305 and the EDEN
   grid out of scope entirely. The psx 2D clipper is the same two-level NVFP4
   scaling with a 16x16 amax, minus the 1D path's two `isinf` guards, if W is ever

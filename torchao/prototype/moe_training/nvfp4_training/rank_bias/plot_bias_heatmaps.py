@@ -48,6 +48,7 @@ import torch
 
 from .analyze_rank_bias import (
     BACKENDS,
+    GEMM_TYPES,
     RECIPE_ALIASES,
     RECIPES,
     VARIANTS,
@@ -66,6 +67,8 @@ from .dsv3_dumps import discover_dsv3_tensors, load_dump_tensor
 DEFAULT_RECIPES = ["9004"]
 DEFAULT_RECIPE_LABELS = {
     "9004": "RHT-16 (wgrad), cast to FP4 with SR",
+    # kitchen's own plot_bias_heatmaps.py labels 100483 the same way.
+    "100483": "RHT-128 (wgrad+dgrad), cast to FP4, MS-EDEN",
     "6302": "Cast to FP4 with SR",
     "nvfp4": "RNE baseline, no SR",
 }
@@ -452,7 +455,8 @@ def load_reusable_rank_bias_results(
 
 def run_rank_bias_batch(args) -> str:
     tensor_type, transpose = VARIANTS[args.variant]
-    backend = BACKENDS[args.backend]
+    backends = BACKENDS[args.backend]
+    gemm = GEMM_TYPES[(tensor_type, transpose)]
     recipe_ids = [RECIPE_ALIASES.get(r, r) for r in args.recipes]
     for recipe_id in recipe_ids:
         reason = RECIPES[recipe_id].unsupported.get(args.variant)
@@ -474,22 +478,35 @@ def run_rank_bias_batch(args) -> str:
     summary_csv = args.summary_csv or os.path.join(args.out_dir, "_flatness_summary.csv")
     print(f"Discovered {len(infos)} tensors in {args.base_dir}")
 
-    # RHT only ever touches a transpose lane, and only for the tensor types the
-    # recipe rotates (never W).
+    # A lane rotates when the GEMM it feeds is one the recipe transforms; see
+    # analyze_rank_bias.RECIPES. 9004 sets wgrad only, 100483 sets wgrad and
+    # dgrad, so under 100483 the identity lane rotates too.
     settings = {
         recipe_id: (
             RECIPES[recipe_id].use_sr[tensor_type],
-            transpose and tensor_type in RECIPES[recipe_id].rht_transpose,
+            gemm in RECIPES[recipe_id].rht_gemms,
+            RECIPES[recipe_id].rht_dim,
+            backends[RECIPES[recipe_id].quantizer[tensor_type]],
+            (
+                RECIPES[recipe_id].dynamic_signs
+                if args.vary_rht_sign is None
+                else args.vary_rht_sign
+            ),
         )
         for recipe_id in recipe_ids
     }
     if not args.skip_stochastic_check:
-        for use_sr, use_rht in settings.values():
+        for use_sr, use_rht, rht_dim, backend, _ in settings.values():
             assert_stochastic(
                 backend,
                 use_sr,
                 transpose,
-                rht_matrices(torch.device("cuda"), None) if use_rht else None,
+                (
+                    rht_matrices(torch.device("cuda"), None, rht_dim, gemm)
+                    if use_rht
+                    else None
+                ),
+                rht_dim,
             )
 
     all_summary_rows: List[Dict[str, object]] = []
@@ -535,7 +552,7 @@ def run_rank_bias_batch(args) -> str:
             labels = labels_cpu.cuda()
             counts = counts_cpu.cuda().double()
         for recipe_id in missing_recipes:
-            use_sr, use_rht = settings[recipe_id]
+            use_sr, use_rht, rht_dim, backend, vary = settings[recipe_id]
             results[recipe_id] = sweep_recipe(
                 tensor,
                 labels,
@@ -547,7 +564,9 @@ def run_rank_bias_batch(args) -> str:
                 backend,
                 args.seed,
                 use_rht,
-                args.vary_rht_sign,
+                vary,
+                rht_dim,
+                gemm,
             )
             torch.cuda.empty_cache()
 
@@ -689,8 +708,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--vary-rht-sign",
         dest="vary_rht_sign",
         action="store_true",
-        default=False,
-        help="Re-draw the RHT sign vector every trial (see analyze_rank_bias.py).",
+        default=None,
+        help="Re-draw the RHT sign vector every trial. The default follows each "
+        "recipe's enable_online_randomization (frozen for 9004, re-drawn for "
+        "100483); this flag forces one choice on all of them. See "
+        "analyze_rank_bias.py.",
     )
     p.add_argument(
         "--no-vary-rht-sign", dest="vary_rht_sign", action="store_false"
@@ -730,11 +752,15 @@ def main() -> None:
     _, _transpose = VARIANTS[args.variant]
     for _rid in list(recipe_labels):
         _base = RECIPE_ALIASES.get(_rid, _rid)
-        _rotates = _base in RECIPES and bool(RECIPES[_base].rht_transpose)
-        if _rotates and not _transpose:
-            recipe_labels[_rid] = recipe_labels[_rid].replace(
-                "RHT-16 (wgrad), ", ""
-            ) + " (identity lane: no RHT)"
+        _tt, _tr = VARIANTS[args.variant]
+        _rotates = _base in RECIPES and (
+            GEMM_TYPES[(_tt, _tr)] in RECIPES[_base].rht_gemms
+        )
+        _claims_rht = "RHT-" in recipe_labels[_rid]
+        if _claims_rht and not _rotates:
+            recipe_labels[_rid] = (
+                recipe_labels[_rid].split(", ", 1)[-1] + " (this lane: no RHT)"
+            )
     make_summary_heatmap(
         slope_csv,
         args.out_dir,
