@@ -7,6 +7,8 @@ construction, and against the independent analytic threshold.
 
 from __future__ import annotations
 
+import re
+
 import pytest
 import torch
 
@@ -233,3 +235,135 @@ def test_three_dimensional_dumps_are_flattened_like_the_sweep_does():
     flat = flatten_to_2d(x3)
     assert flat.shape == (8 * 512, 256)
     assert _stats(flat).numel == 8 * 512 * 256
+
+
+# ---------------------------------------------------------------------------
+# Greppable CI scalars
+# ---------------------------------------------------------------------------
+
+# What a JET stdout_regex metric has to match. Anchored on both ends so a stray
+# formatted-table line cannot satisfy it.
+METRIC_RE = re.compile(r"^([a-z0-9_]+): (-?\d+(?:\.\d+)?)$")
+
+
+def _rows(**overrides):
+    """Two lanes x two modules of plausible rows, enough to exercise grouping."""
+    base = []
+    for variant in ("G", "G.T"):
+        for module, flush in (("moe/routed/fc1", 12.0), ("moe/routed/fc2", 6.0)):
+            row = {
+                "tensor": f"layer0_{module}",
+                "family": module,
+                "module": module.rsplit("/", 1)[-1],
+                "recipe_id": "100483",
+                "variant": variant,
+                "rht": "128/dgrad",
+                "numel": 1024,
+                "raw_exact_zero_pct": 0.5,
+                "exact_zero_pct": 0.5,
+                "flush_pct": flush,
+                "fp4_zero_pct": flush + 0.5,
+                "dead_block_pct": 0.0,
+                "p50_rel": 0.33,
+                "p05_rel": 0.03,
+                "below_1_24_pct": flush,
+            }
+            row.update(overrides)
+            base.append(row)
+    return base
+
+
+@pytest.mark.parametrize(
+    "label,expected",
+    [
+        ("G", "g"),
+        ("G.T", "gt"),  # matches the g_/gt_ naming the E21 output dirs already use
+        ("moe/routed/fc1", "moe_routed_fc1"),
+        ("swiglu/fc1", "swiglu_fc1"),
+        ("100483", "100483"),
+    ],
+)
+def test_slug_is_regex_safe(label, expected):
+    assert sp._slug(label) == expected
+
+
+def test_every_emitted_line_is_a_parseable_metric(capsys):
+    """The whole point is that a scraper can regex this, so check the shape of
+    every line rather than spot-checking one."""
+    sp.report_sparsity_metrics(_rows(), group_by="family")
+    lines = [l for l in capsys.readouterr().out.splitlines() if l.strip()]
+    assert lines
+    for line in lines:
+        assert METRIC_RE.match(line), line
+
+
+def test_metric_names_are_unique(capsys):
+    """A collision would make one lane silently overwrite the other's value."""
+    sp.report_sparsity_metrics(_rows(), group_by="family")
+    names = [
+        METRIC_RE.match(l).group(1)
+        for l in capsys.readouterr().out.splitlines()
+        if l.strip()
+    ]
+    assert len(names) == len(set(names))
+
+
+def test_lane_and_recipe_are_in_the_name(capsys):
+    """A stdout_regex metric cannot associate two lines, so every scalar has to
+    carry its own lane and recipe."""
+    sp.report_sparsity_metrics(_rows(), group_by="family")
+    names = capsys.readouterr().out
+    assert "sparsity_100483_g_flush_median_pct:" in names
+    assert "sparsity_100483_gt_flush_median_pct:" in names
+    assert "sparsity_100483_g_moe_routed_fc1_flush_median_pct:" in names
+    assert "sparsity_100483_gt_moe_routed_fc2_flush_median_pct:" in names
+
+
+def test_emitted_values_are_the_medians_they_claim(capsys):
+    """Format tests cannot catch a wrong reduction; this pins the arithmetic.
+
+    fc1 is 12.0 and fc2 is 6.0, so the lane median is 9.0 and the per-module
+    medians are the values themselves.
+    """
+    sp.report_sparsity_metrics(_rows(), group_by="family")
+    got = dict(
+        METRIC_RE.match(l).groups()
+        for l in capsys.readouterr().out.splitlines()
+        if l.strip()
+    )
+    assert float(got["sparsity_100483_g_flush_median_pct"]) == 9.0
+    assert float(got["sparsity_100483_g_flush_max_pct"]) == 12.0
+    assert float(got["sparsity_100483_g_moe_routed_fc1_flush_median_pct"]) == 12.0
+    assert float(got["sparsity_100483_g_moe_routed_fc2_flush_median_pct"]) == 6.0
+    assert int(got["sparsity_100483_g_tensors"]) == 2
+
+
+def test_dead_block_is_reported_as_the_worst_not_the_median(capsys):
+    """One dead block in one tensor is a red flag; a median over many tensors
+    would hide it."""
+    rows = _rows()
+    rows[0]["dead_block_pct"] = 3.0
+    sp.report_sparsity_metrics(rows, group_by="family")
+    got = dict(
+        METRIC_RE.match(l).groups()
+        for l in capsys.readouterr().out.splitlines()
+        if l.strip()
+    )
+    assert float(got["sparsity_100483_g_dead_block_max_pct"]) == 3.0
+
+
+def test_emitter_is_not_gated_and_survives_a_hand_run(capsys):
+    """No flag turns this on: a hand run must print the same scalars CI reads."""
+    import subprocess
+    import sys
+
+    proc = subprocess.run(
+        [sys.executable, "analyze_sparsity.py", "--synthetic",
+         "--activation", "relu2", "--tokens", "256", "--hidden", "128",
+         "--ffn", "256"],
+        capture_output=True, text=True, timeout=600,
+    )
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    metrics = [l for l in proc.stdout.splitlines() if METRIC_RE.match(l)]
+    assert any(m.startswith("sparsity_9004_g_flush_median_pct:") for m in metrics)
+    assert len(metrics) >= 8

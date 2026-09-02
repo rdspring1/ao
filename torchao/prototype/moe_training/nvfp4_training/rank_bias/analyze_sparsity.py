@@ -393,6 +393,80 @@ def print_table(rows: List[Dict[str, object]], group_by: str) -> None:
         )
 
 
+def _slug(value: str) -> str:
+    """Reduce a label to ``[a-z0-9_]`` so it is safe inside a metric name.
+
+    Dots are dropped rather than replaced, so the variants come out as ``g`` and
+    ``gt`` -- matching how the E21 output directories already name the two lanes
+    -- while separators in a group label (``moe/routed/fc1``) become
+    underscores.
+    """
+    text = str(value).lower().replace(".", "")
+    out = "".join(c if c.isalnum() else "_" for c in text)
+    while "__" in out:
+        out = out.replace("__", "_")
+    return out.strip("_")
+
+
+def report_sparsity_metrics(
+    rows: List[Dict[str, object]], *, group_by: str
+) -> None:
+    """Print flat, greppable ``name: value`` scalars for a CI metric scraper.
+
+    A run produces one row per (tensor, lane), which no ``stdout_regex`` metric
+    can reduce, and the formatted table is aligned for humans rather than for a
+    regex. These lines are the reduction.
+
+    Metric definition belongs here rather than in the CI recipe: this script is
+    what knows what its own columns mean, it is covered by the repo's tests, and
+    emitting unconditionally means a hand run gets the same scalars a CI run
+    does. The same reasoning put ``report_sweep_metrics`` in
+    ``plot_bias_heatmaps.py``.
+
+    Recipe and lane are in the *name* because one run can sweep several lanes
+    and a ``stdout_regex`` metric cannot associate two lines with each other.
+    ``flush`` is the headline -- nonzero in, FP4 zero out, i.e. what the format
+    actually destroys -- and ``p50_rel`` is reported alongside because it is
+    recipe-independent and so comparable across models.
+    """
+    if not rows:
+        return
+    med = lambda key, rs: statistics.median([float(r[key]) for r in rs])
+
+    lanes: Dict[Tuple[str, str], List[Dict[str, object]]] = defaultdict(list)
+    for row in rows:
+        lanes[(str(row["recipe_id"]), str(row["variant"]))].append(row)
+
+    for (recipe_id, variant), lane_rows in sorted(lanes.items()):
+        stem = f"sparsity_{_slug(recipe_id)}_{_slug(variant)}"
+        print(f"{stem}_tensors: {len(lane_rows)}")
+        print(f"{stem}_flush_median_pct: {med('flush_pct', lane_rows):.6f}")
+        print(
+            f"{stem}_flush_max_pct: "
+            f"{max(float(r['flush_pct']) for r in lane_rows):.6f}"
+        )
+        print(
+            f"{stem}_exact_zero_median_pct: "
+            f"{med('raw_exact_zero_pct', lane_rows):.6f}"
+        )
+        print(f"{stem}_fp4_zero_median_pct: {med('fp4_zero_pct', lane_rows):.6f}")
+        # A nonzero dead-block fraction anywhere means a whole block
+        # reconstructed as zero, so report the worst rather than the median.
+        print(
+            f"{stem}_dead_block_max_pct: "
+            f"{max(float(r['dead_block_pct']) for r in lane_rows):.6f}"
+        )
+        print(f"{stem}_p50_rel_median: {med('p50_rel', lane_rows):.6f}")
+
+        groups: Dict[str, List[Dict[str, object]]] = defaultdict(list)
+        for row in lane_rows:
+            groups[str(row[group_by])].append(row)
+        for group, group_rows in sorted(groups.items()):
+            gstem = f"{stem}_{_slug(group)}"
+            print(f"{gstem}_flush_median_pct: {med('flush_pct', group_rows):.6f}")
+            print(f"{gstem}_p50_rel_median: {med('p50_rel', group_rows):.6f}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Exact-zero and FP4 flush-to-zero sparsity of NVFP4 operands."
@@ -544,6 +618,9 @@ def main() -> None:
         "FP4 zero out\nfp4_0% = all FP4 zeros · p50_rel = median |x| / block_amax "
         f"(flush threshold {FP4_ZERO_RATIO:.4f})"
     )
+
+    print()
+    report_sparsity_metrics(rows, group_by=args.group_by)
 
     if args.csv:
         with open(args.csv, "w", newline="") as f:

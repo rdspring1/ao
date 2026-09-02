@@ -200,6 +200,25 @@ multiple of its dimension, and the padding is masked out of every statistic —
 `test_sparsity.py` pins that with shapes like `1373 x 1408` (`1373 % 128 == 93`)
 on both lanes, rotated and not.
 
+Both scripts print flat `name: value` scalars on stdout for a CI metric
+scraper, unconditionally — `report_sweep_metrics` in `plot_bias_heatmaps.py`
+and `report_sparsity_metrics` here:
+
+```
+sparsity_100483_g_flush_median_pct: 6.662868
+sparsity_100483_g_dead_block_max_pct: 0.000000
+sparsity_100483_g_moe_routed_fc1_flush_median_pct: 6.496546
+sparsity_100483_gt_p50_rel_median: 0.340071
+```
+
+Recipe and lane are in the *name* because one run sweeps several lanes and a
+`stdout_regex` metric cannot associate two lines with each other; group labels
+are slugged (`moe/routed/fc1` -> `moe_routed_fc1`, `G.T` -> `gt`). `dead_block`
+is reported as the worst rather than the median, because one dead block in one
+tensor is a red flag a median over 345 of them would hide. Defining the metrics
+in the script rather than in the CI recipe keeps them under the repo's tests and
+means a hand run emits exactly what CI reads.
+
 ### Exact zeros in the DSV3 dumps are negligible
 
 From the committed E21 summaries (345 G tensors, `n_elements` in the zeros
