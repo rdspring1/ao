@@ -557,12 +557,12 @@ def main() -> None:
                     (f"{activation}_{module}", f"{activation}/{module}", module, tensor)
                 )
     elif args.tensor_path:
-        from dsv3_dumps import load_dump_tensor
+        from .dsv3_dumps import load_dump_tensor
 
         name = os.path.splitext(os.path.basename(args.tensor_path))[0]
         tensors.append((name, "dump", name, load_dump_tensor(args.tensor_path)))
     else:
-        from dsv3_dumps import classify, discover_dsv3_tensors, load_dump_tensor
+        from .dsv3_dumps import classify, discover_dsv3_tensors, load_dump_tensor
 
         infos = discover_dsv3_tensors(
             args.base_dir,

@@ -107,7 +107,7 @@ def test_rotation_destroys_structural_sparsity():
     unrotated lane and ~0% on a rotated one, and quoting one number for both
     would be wrong for whichever lane was not measured.
     """
-    import rht
+    from torchao.prototype.moe_training.nvfp4_training.rank_bias import rht
 
     g = torch.Generator(device="cuda").manual_seed(2)
     x = (torch.randn(256, 256, generator=g, device="cuda")).to(torch.bfloat16)
@@ -180,7 +180,7 @@ def test_ragged_shapes_count_only_real_elements(shape, transpose, rotate):
     would show up as exact zeros and drag ``flush`` toward nonsense, so checking
     ``numel`` and ``exact_zero`` together pins the mask from both sides.
     """
-    import rht
+    from torchao.prototype.moe_training.nvfp4_training.rank_bias import rht
 
     rows, cols = shape
     g = torch.Generator(device="cuda").manual_seed(0)
@@ -228,7 +228,7 @@ def test_dump_dtypes_are_accepted_without_a_downcast(dtype):
 def test_three_dimensional_dumps_are_flattened_like_the_sweep_does():
     """A [seq, batch, hidden] dump collapses to 2-D on the last axis, which is
     what analyze_rank_bias.flatten_to_2d does and what the block axis assumes."""
-    from analyze_rank_bias import flatten_to_2d
+    from torchao.prototype.moe_training.nvfp4_training.rank_bias.analyze_rank_bias import flatten_to_2d
 
     g = torch.Generator(device="cuda").manual_seed(0)
     x3 = (torch.randn(8, 512, 256, generator=g, device="cuda")).to(torch.bfloat16)

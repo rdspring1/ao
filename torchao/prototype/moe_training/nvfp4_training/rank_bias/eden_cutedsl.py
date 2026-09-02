@@ -318,7 +318,7 @@ def quant_dequant(
 
     ``use_sr`` names the *scale* rounding, matching ``eden_reference``.
     """
-    from nvfp4_cutedsl import dequantize
+    from .nvfp4_cutedsl import dequantize
 
     q = quantize(x, transpose=transpose, seed=seed, stochastic_round_scale=use_sr)
     dq = dequantize(q)
