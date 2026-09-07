@@ -192,6 +192,35 @@ def flatten_to_2d(t: torch.Tensor) -> torch.Tensor:
     return t
 
 
+def pad_rows_to_block(
+    tensor: torch.Tensor, block_size: int, *, transpose: bool
+) -> torch.Tensor:
+    """Zero-pad rows to a multiple of ``block_size`` on the transpose lane.
+
+    A transpose-path block covers ``block_size`` ROWS, so a tensor whose first
+    dimension is ragged cannot be blocked at all -- ``make_rank_labels`` raises.
+    That never happens under forced load balance, where every expert receives an
+    identical token count, and it happens on most routed-expert tensors under a
+    real router: E25's dumps carry counts like 4169.
+
+    PADDING, NOT TRUNCATION, and it matches both kitchen and the kernel. ``leaf_qdq``
+    already zero-pads rows to ``rht_dim`` before rotating and crops only after the
+    inverse, quoting kitchen's own ordering; the grouped NVFP4 kernels likewise pad
+    the capacity buffer and mask rather than discard the ragged tail. Truncating
+    would instead drop the final partial block outright -- the one block whose amax
+    is taken over fewer elements.
+
+    The padded entries cannot reach the reported statistics. ``make_rank_labels``
+    ends with ``masked_fill_(blocks == 0, 0)``, so an exact zero is labelled 0 and
+    lands in the zeros bucket, never in ranks 1..block_size -- and every headline
+    metric here (amax worst/median slope, flat count) is an AMAX-bucket statistic.
+    A zero cannot be a block's amax. The only quantity padding touches is the zeros
+    bucket's own count, by ``pad * cols`` entries out of ``rows * cols``: at most
+    15 of ~4169 rows, under 0.4%.
+    """
+    return rht.pad_rows(tensor, block_size) if transpose else tensor
+
+
 def make_rank_labels(
     tensor: torch.Tensor, block_size: int, *, transpose: bool = False
 ) -> torch.Tensor:
@@ -742,6 +771,7 @@ def main() -> None:
         if reason:
             parser.error(f"--variant {args.variant} with --recipes {recipe_id}: {reason}")
     tensor_cpu = flatten_to_2d(load_tensor(args))
+    tensor_cpu = pad_rows_to_block(tensor_cpu, args.block_size, transpose=transpose)
     labels_cpu = make_rank_labels(tensor_cpu, args.block_size, transpose=transpose)
     counts_cpu = torch.bincount(
         labels_cpu.reshape(-1).long(), minlength=args.block_size + 1

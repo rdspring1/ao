@@ -57,6 +57,7 @@ from .analyze_rank_bias import (
     export_csv,
     flatten_to_2d,
     make_rank_labels,
+    pad_rows_to_block,
     plot_results,
     rht_matrices,
     sweep_recipe,
@@ -514,6 +515,9 @@ def run_rank_bias_batch(args) -> str:
         tensor_name = tensor_summary_name(info, args.variant)
         print(f"[{i}/{len(infos)}] {tensor_name}")
         tensor_cpu = flatten_to_2d(load_dump_tensor(info.filepath))
+        tensor_cpu = pad_rows_to_block(
+            tensor_cpu, args.block_size, transpose=transpose
+        )
         labels_cpu = make_rank_labels(tensor_cpu, args.block_size, transpose=transpose)
         counts_cpu = torch.bincount(
             labels_cpu.reshape(-1).long(), minlength=args.block_size + 1
