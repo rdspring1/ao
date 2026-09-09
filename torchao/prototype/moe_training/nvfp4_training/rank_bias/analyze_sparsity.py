@@ -29,11 +29,18 @@ Three numbers, which are not the same thing and are routinely conflated:
     reconstructs as zero regardless of its contents.
 
 ``block_nnz``
-    Nonzero elements per 16-element quantization block, as a percentage. FP4
-    represents zero exactly, so this is how much of each block carries any
-    information at all -- and it is the one statistic reported per *block*
-    rather than per element, which is what makes a sparse *pattern* visible.
-    MoE routing zeroes whole rows, so the p05 matters more than the median.
+    Nonzero FP4 codes per 16-element quantization block, **after** quantization,
+    as a percentage. This is the one statistic reported per *block* rather than
+    per element, and it is what makes a sparse *pattern* visible: ``flush`` and
+    ``fp4_zero`` are means over elements and cannot distinguish 21% of every
+    block being discarded from 21% of blocks being annihilated outright.
+    ``dead_block`` is this distribution's extreme tail (blocks at exactly zero),
+    so mean / spread / tail are ``fp4_zero`` / ``block_nnz`` / ``dead_block``.
+    The p05 is the informative half.
+
+    Measured on the OUTPUT, deliberately. An input-side count is 100% by
+    construction on any SiLU/GELU model -- those activations produce essentially
+    no exact zeros -- and would merely restate ``exact_zero``.
 
 ``abs_lt``
     Elements whose magnitude is below a fixed absolute threshold (1e-5, 1e-6,
@@ -253,12 +260,24 @@ def sparsity_stats(
     rel = torch.where(block_amax > 0, blocked.abs() / block_amax, torch.zeros_like(blocked))
     rel_valid = rel[block_mask & (blocked != 0)]
 
-    # Nonzero density per block, over blocks that are fully valid. Padding
-    # columns are zeros and would drag every partial block's count down, so a
-    # partial block is dropped rather than corrected -- at BLOCK_SIZE 16 against
-    # tensors thousands wide there is at most one per row.
+    # Nonzero density per block, measured on the QUANTIZER OUTPUT -- how many of
+    # the 16 codes survive as nonzero. Measuring the input instead is worthless
+    # on this model: SiLU produces essentially no exact zeros, so an input-side
+    # count is 100% by construction and merely restates ``exact_zero``.
+    #
+    # This is not a restatement of ``fp4_zero`` either. That is the MEAN over
+    # elements; this is the DISTRIBUTION over blocks, which is what says whether
+    # the loss is spread evenly (every block gives up a few codes) or
+    # concentrated (most blocks intact, some annihilated). ``dead_block`` is the
+    # extreme tail of this same distribution -- the blocks at exactly 0 -- so the
+    # three interpolate: mean, spread, tail.
+    #
+    # Partial blocks are dropped rather than mask-corrected: their zero-filled
+    # tail would read as genuine loss. At BLOCK_SIZE 16 against tensors thousands
+    # wide there is at most one per row.
     full_blocks = block_mask.all(dim=-1)
-    per_block_nnz = ((blocked != 0) & block_mask).sum(dim=-1).float() / BLOCK_SIZE
+    coded = codes.reshape(n_rows, n_cols // BLOCK_SIZE, BLOCK_SIZE)
+    per_block_nnz = ((coded != 0) & block_mask).sum(dim=-1).float() / BLOCK_SIZE
     nnz_valid = per_block_nnz[full_blocks]
 
     live_blocks = (block_amax.squeeze(-1) > 0) & block_mask.any(dim=-1)

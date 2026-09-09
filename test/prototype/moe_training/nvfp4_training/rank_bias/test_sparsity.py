@@ -46,6 +46,12 @@ def test_flush_is_exact_on_a_hand_built_block(backend):
     assert stats.exact_zero == 0.0
     assert stats.flush == pytest.approx(15 / 16)
     assert stats.fp4_zero == pytest.approx(15 / 16)
+    # block_nnz is measured on the OUTPUT, so exactly one code per block
+    # survives. Every block here is identical, so both percentiles pin to it.
+    # This is the assertion that would have caught measuring the INPUT, where
+    # the answer is 1.0 because nothing here is exactly zero going in.
+    assert stats.block_nnz_p50 == pytest.approx(1 / 16)
+    assert stats.block_nnz_p05 == pytest.approx(1 / 16)
 
 
 @pytest.mark.parametrize("backend", BACKENDS)
@@ -216,12 +222,14 @@ def test_ragged_shapes_count_only_real_elements(shape, transpose, rotate):
         assert stats.exact_zero == stats.raw_exact_zero
     assert 0.0 < stats.flush < 0.5
     # block_nnz is the one statistic computed per BLOCK, so it needs its own
-    # padding check: a partial block is dropped rather than mask-corrected,
-    # and if it were not, its zero-filled tail would report as genuine
-    # sparsity. A Gaussian has no exact zeros, so every surviving block must
-    # come out 100% dense on both percentiles.
-    assert stats.block_nnz_p50 == 1.0
-    assert stats.block_nnz_p05 == 1.0
+    # padding check: a partial block is dropped rather than mask-corrected, and
+    # if it were not, its zero-filled tail would read as genuine loss and drag
+    # the median down. Pin it against fp4_zero -- the same quantity averaged
+    # over elements rather than distributed over blocks. On a Gaussian the loss
+    # is spread evenly, so the median block sits near the mean; a leaked padding
+    # block would break this from below.
+    assert stats.block_nnz_p50 == pytest.approx(1 - stats.fp4_zero, abs=0.1)
+    assert 0.0 < stats.block_nnz_p05 <= stats.block_nnz_p50
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
