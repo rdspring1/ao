@@ -121,6 +121,14 @@ def test_rotation_destroys_structural_sparsity():
     assert plain.exact_zero > 0.4
     assert rotated.raw_exact_zero == plain.exact_zero  # the model property is kept
     assert rotated.exact_zero < 0.01  # but the quantizer no longer sees it
+    # abs_lt is deliberately pre-rotation for the same reason raw_exact_zero
+    # is: it reports the model's gradient scale, not the rotated basis's. Half
+    # this tensor is exactly zero, so every threshold must be at least 0.5 and
+    # must be identical on both lanes.
+    assert rotated.abs_lt == plain.abs_lt
+    assert all(v >= 0.5 for v in plain.abs_lt)
+    # Monotone in the threshold, by construction.
+    assert list(plain.abs_lt) == sorted(plain.abs_lt, reverse=True)
 
 
 @pytest.mark.parametrize("activation", ["swiglu", "relu2", "gelu", "geglu", "silu"])
@@ -207,6 +215,13 @@ def test_ragged_shapes_count_only_real_elements(shape, transpose, rotate):
         # report it.
         assert stats.exact_zero == stats.raw_exact_zero
     assert 0.0 < stats.flush < 0.5
+    # block_nnz is the one statistic computed per BLOCK, so it needs its own
+    # padding check: a partial block is dropped rather than mask-corrected,
+    # and if it were not, its zero-filled tail would report as genuine
+    # sparsity. A Gaussian has no exact zeros, so every surviving block must
+    # come out 100% dense on both percentiles.
+    assert stats.block_nnz_p50 == 1.0
+    assert stats.block_nnz_p05 == 1.0
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])

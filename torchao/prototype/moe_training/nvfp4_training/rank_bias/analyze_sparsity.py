@@ -28,6 +28,22 @@ Three numbers, which are not the same thing and are routinely conflated:
     Blocks whose E4M3 block scale itself underflows to zero, so the entire block
     reconstructs as zero regardless of its contents.
 
+``block_nnz``
+    Nonzero elements per 16-element quantization block, as a percentage. FP4
+    represents zero exactly, so this is how much of each block carries any
+    information at all -- and it is the one statistic reported per *block*
+    rather than per element, which is what makes a sparse *pattern* visible.
+    MoE routing zeroes whole rows, so the p05 matters more than the median.
+
+``abs_lt``
+    Elements whose magnitude is below a fixed absolute threshold (1e-5, 1e-6,
+    1e-7), measured on the tensor as dumped. Unlike ``flush`` this is NOT block
+    relative and NOT recipe dependent: it is a property of the model's gradient
+    scale. Read the two together -- a tensor can be absolutely tiny everywhere
+    and flush nothing (a uniformly small block has a small amax and full
+    headroom), or absolutely large everywhere and flush heavily (one outlier
+    sets the block amax and buries the rest).
+
 The distributional statistic behind ``flush`` is ``|x| / block_amax``. An
 element rounds to FP4 zero at roughly ``|x| < block_amax / 24`` (the E2M1 RNE
 threshold 0.25 against the 6.0 grid ceiling), so ``p50_rel`` -- the median of
@@ -84,6 +100,20 @@ from .nvfp4_reference import BLOCK_SIZE
 # the limit of an unrounded block scale; ``flush`` measures the real thing.
 FP4_ZERO_RATIO = 0.25 / 6.0
 
+# Absolute-magnitude cuts for ``abs_lt``, chosen to bracket bf16's useful range
+# rather than its representable one: bf16 reaches ~1e-38, so these are about
+# where a gradient stops mattering, not where it stops existing.
+ABS_THRESHOLDS = (1e-5, 1e-6, 1e-7)
+
+
+def _abs_field(threshold: float) -> str:
+    """CSV/metric column name for one ``abs_lt`` cut, e.g. ``raw_abs_lt_1e5_pct``.
+
+    No minus sign: these names are emitted as greppable ``name: value`` metric
+    lines as well as CSV headers, and a hyphen there reads as a range.
+    """
+    return f"raw_abs_lt_{threshold:.0e}_pct".replace("e-0", "e").replace("e-", "e")
+
 
 def _sr_kwarg(backend) -> str:
     """Which keyword this quantizer spells stochastic rounding with.
@@ -121,9 +151,17 @@ class SparsityStats:
     p50_rel: float             # median |x| / block_amax
     p05_rel: float
     below_threshold: float     # analytic |x| / block_amax < 1/24
+    block_nnz_p50: float       # median nonzero FRACTION within a block
+    block_nnz_p05: float
+    abs_lt: Tuple[float, ...]  # |x| < ABS_THRESHOLDS, on the tensor as dumped
 
     def row(self) -> Dict[str, object]:
+        thresholds = {
+            _abs_field(t): 100.0 * v
+            for t, v in zip(ABS_THRESHOLDS, self.abs_lt)
+        }
         return {
+            **thresholds,
             "numel": self.numel,
             "raw_exact_zero_pct": 100.0 * self.raw_exact_zero,
             "exact_zero_pct": 100.0 * self.exact_zero,
@@ -133,6 +171,8 @@ class SparsityStats:
             "p50_rel": self.p50_rel,
             "p05_rel": self.p05_rel,
             "below_1_24_pct": 100.0 * self.below_threshold,
+            "block_nnz_p50_pct": 100.0 * self.block_nnz_p50,
+            "block_nnz_p05_pct": 100.0 * self.block_nnz_p05,
         }
 
 
@@ -161,6 +201,15 @@ def sparsity_stats(
     # ``exact_zero`` below, which is also an integer ratio. A float mean over a
     # multi-million-element tensor loses low bits to the reduction.
     raw_exact_zero = int((tensor == 0).sum()) / tensor.numel()
+    # On the tensor AS DUMPED, deliberately: absolute magnitude is a property of
+    # the model's gradient scale, and the RHT is a mixing transform that would
+    # replace it with the rotated basis's. Integer counts for the same reason
+    # raw_exact_zero uses one.
+    raw_abs = tensor.abs()
+    abs_lt = tuple(
+        int((raw_abs < t).sum()) / tensor.numel() for t in ABS_THRESHOLDS
+    )
+    del raw_abs
 
     if matrices is None:
         q_input = tensor
@@ -204,6 +253,14 @@ def sparsity_stats(
     rel = torch.where(block_amax > 0, blocked.abs() / block_amax, torch.zeros_like(blocked))
     rel_valid = rel[block_mask & (blocked != 0)]
 
+    # Nonzero density per block, over blocks that are fully valid. Padding
+    # columns are zeros and would drag every partial block's count down, so a
+    # partial block is dropped rather than corrected -- at BLOCK_SIZE 16 against
+    # tensors thousands wide there is at most one per row.
+    full_blocks = block_mask.all(dim=-1)
+    per_block_nnz = ((blocked != 0) & block_mask).sum(dim=-1).float() / BLOCK_SIZE
+    nnz_valid = per_block_nnz[full_blocks]
+
     live_blocks = (block_amax.squeeze(-1) > 0) & block_mask.any(dim=-1)
     n_live = int(live_blocks.sum())
     dead = (
@@ -223,6 +280,9 @@ def sparsity_stats(
         below_threshold=(
             float((rel_valid < FP4_ZERO_RATIO).sum()) / total if total else 0.0
         ),
+        block_nnz_p50=_percentile(nnz_valid, 0.50),
+        block_nnz_p05=_percentile(nnz_valid, 0.05),
+        abs_lt=abs_lt,
     )
 
 
@@ -324,6 +384,10 @@ FIELDS = [
     "p50_rel",
     "p05_rel",
     "below_1_24_pct",
+    "block_nnz_p50_pct",
+    "block_nnz_p05_pct",
+] + [
+    _abs_field(t) for t in ABS_THRESHOLDS
 ]
 
 
@@ -377,7 +441,7 @@ def print_table(rows: List[Dict[str, object]], group_by: str) -> None:
     header = (
         f"{'group':>22} {'variant':>7} {'rht':>10} {'n':>4} "
         f"{'raw0%':>8} {'flush%':>8} {'fp4_0%':>8} {'dead%':>7} "
-        f"{'p50_rel':>8} {'p05_rel':>8}"
+        f"{'p50_rel':>8} {'p05_rel':>8} {'nnz50%':>7} {'nnz05%':>7}"
     )
     print(header)
     print("-" * len(header))
@@ -389,7 +453,8 @@ def print_table(rows: List[Dict[str, object]], group_by: str) -> None:
             f"{group:>22} {variant:>7} {str(rs[0]['rht']):>10} {len(rs):>4} "
             f"{med('raw_exact_zero_pct', rs):8.3f} {med('flush_pct', rs):8.3f} "
             f"{med('fp4_zero_pct', rs):8.3f} {med('dead_block_pct', rs):7.3f} "
-            f"{med('p50_rel', rs):8.4f} {med('p05_rel', rs):8.4f}"
+            f"{med('p50_rel', rs):8.4f} {med('p05_rel', rs):8.4f} "
+            f"{med('block_nnz_p50_pct', rs):7.2f} {med('block_nnz_p05_pct', rs):7.2f}"
         )
 
 
@@ -457,6 +522,24 @@ def report_sparsity_metrics(
             f"{max(float(r['dead_block_pct']) for r in lane_rows):.6f}"
         )
         print(f"{stem}_p50_rel_median: {med('p50_rel', lane_rows):.6f}")
+        # Per-BLOCK rather than per-element, which is what makes a sparse
+        # pattern visible at all. The p05 is the informative one: MoE routing
+        # zeroes whole rows, so a low p05 against a healthy median means the
+        # sparsity is structured, not diffuse.
+        print(
+            f"{stem}_block_nnz_p50_median_pct: "
+            f"{med('block_nnz_p50_pct', lane_rows):.6f}"
+        )
+        print(
+            f"{stem}_block_nnz_p05_min_pct: "
+            f"{min(float(r['block_nnz_p05_pct']) for r in lane_rows):.6f}"
+        )
+        # Absolute, not block-relative, and so recipe-independent: the gradient
+        # scale itself. Divergence between these and flush is the interesting
+        # case -- see the module docstring.
+        for threshold in ABS_THRESHOLDS:
+            field = _abs_field(threshold)
+            print(f"{stem}_{field[:-4]}_median: {med(field, lane_rows):.6f}")
 
         groups: Dict[str, List[Dict[str, object]]] = defaultdict(list)
         for row in lane_rows:
@@ -465,6 +548,13 @@ def report_sparsity_metrics(
             gstem = f"{stem}_{_slug(group)}"
             print(f"{gstem}_flush_median_pct: {med('flush_pct', group_rows):.6f}")
             print(f"{gstem}_p50_rel_median: {med('p50_rel', group_rows):.6f}")
+            # Per group as well as per lane: "which projections are sparse" is
+            # the question, and at 671B this axis separates the MLA q_a / q_b
+            # and wkv pair from the FFN and the routed experts.
+            print(
+                f"{gstem}_block_nnz_p50_median_pct: "
+                f"{med('block_nnz_p50_pct', group_rows):.6f}"
+            )
 
 
 def main() -> None:
@@ -617,6 +707,8 @@ def main() -> None:
         "\nraw0% = exact zeros as dumped (pre-rotation) · flush% = nonzero in, "
         "FP4 zero out\nfp4_0% = all FP4 zeros · p50_rel = median |x| / block_amax "
         f"(flush threshold {FP4_ZERO_RATIO:.4f})"
+        "\nnnz50%/nnz05% = median / 5th-pct nonzero fraction within a 16-element "
+        "block; the p05 is where routing-zeroed rows show up"
     )
 
     print()
