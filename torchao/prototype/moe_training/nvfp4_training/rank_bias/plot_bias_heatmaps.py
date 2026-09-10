@@ -15,7 +15,7 @@ each tensor, upsert ``_flatness_summary.csv``, then render the heatmap.
 Example full workflow:
     python plot_bias_heatmaps.py \\
         --run-rank-bias \\
-        --base-dir dsv3_16b_f0l0_mxfp8_attn_1500steps_layer26_fc2 \\
+        --base-dir titan_16b/dsv3_16b_f0l0_mxfp8_attn_1500steps_layer26_fc2 \\
         --variant G.T --rank 0 --step 0 --recipes 9004 \\
         --trials 2 4 8 16 32 64 128 \\
         --out-dir ./bias_plots --tag dsv3_9004
@@ -511,10 +511,23 @@ def run_rank_bias_batch(args) -> str:
             )
 
     all_summary_rows: List[Dict[str, object]] = []
+    empty: List[str] = []
     for i, info in enumerate(infos, 1):
         tensor_name = tensor_summary_name(info, args.variant)
         print(f"[{i}/{len(infos)}] {tensor_name}")
         tensor_cpu = flatten_to_2d(load_dump_tensor(info.filepath))
+        # An expert that received NO tokens still has its G file written, with
+        # zero rows -- that is the documented signal for an empty expert under
+        # real routing, not a missing file. There is nothing to sweep, and
+        # launching a CuTe kernel on it fails with an unrecoverable
+        # `DSLCudaRuntimeError: <unknown CUDA error code 9>` reported as
+        # "Target SM ARCH: not set", which is what an empty grid looks like from
+        # inside the DSL rather than anything to do with the architecture.
+        # Forced-balance dumps never hit this, which is why it survived E26.
+        if tensor_cpu.numel() == 0:
+            print(f"  skipping: 0 elements (expert received no tokens)")
+            empty.append(tensor_name)
+            continue
         tensor_cpu = pad_rows_to_block(
             tensor_cpu, args.block_size, transpose=transpose
         )
@@ -608,6 +621,14 @@ def run_rank_bias_batch(args) -> str:
 
     upsert_summary_rows(summary_csv, all_summary_rows)
     report_sweep_metrics(all_summary_rows, recipe_ids)
+    # Emitted here rather than inside report_sweep_metrics, which does not see
+    # the discovery loop. Without it a `tensors_swept` short of the discovered
+    # count is ambiguous between "some experts were empty" and "discovery
+    # silently failed", and the second is the whole reason that metric exists.
+    for recipe_id in recipe_ids:
+        print(f"heatmap_{recipe_id}_tensors_empty: {len(empty)}")
+    if empty:
+        print(f"empty experts skipped ({len(empty)}): {', '.join(empty)}")
     return summary_csv
 
 

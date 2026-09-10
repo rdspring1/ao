@@ -693,7 +693,16 @@ def main() -> None:
             )
 
     rows: List[Dict[str, object]] = []
+    empty: List[str] = []
     for name, family, module, tensor in tensors:
+        # Empty expert: G is written with zero rows when an expert receives no
+        # tokens under real routing. Nothing to measure, and the CuTe kernels
+        # fail on the empty grid with an unrecoverable CUDA error 9 rather than
+        # returning. See the same guard in plot_bias_heatmaps.
+        if tensor.numel() == 0:
+            print(f"skipping {name}: 0 elements (expert received no tokens)")
+            empty.append(name)
+            continue
         # flatten_to_2d then .cuda(), at the dump's own dtype -- the same
         # preparation plot_bias_heatmaps.py does. Deliberately no cast to
         # bfloat16: both quantizers accept fp32, and rounding an fp32 dump down
@@ -732,6 +741,10 @@ def main() -> None:
 
     print()
     report_sparsity_metrics(rows, group_by=args.group_by)
+    for recipe in {r["recipe_id"] for r in rows}:
+        print(f"sparsity_{_slug(recipe)}_tensors_empty: {len(empty)}")
+    if empty:
+        print(f"empty experts skipped ({len(empty)}): {', '.join(empty)}")
 
     if args.csv:
         with open(args.csv, "w", newline="") as f:
