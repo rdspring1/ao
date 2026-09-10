@@ -660,6 +660,17 @@ def report_sweep_metrics(
         n_flat = sum(1 for r in amax if str(r.get("flat")).lower() in ("true", "1"))
         print(f"heatmap_{recipe_id}_tensors_swept: {len(amax)}")
         print(f"heatmap_{recipe_id}_amax_flat_count: {n_flat}")
+        # The count alone is not comparable across cells, and stopped being so
+        # the moment empty experts began to be skipped: a dump where one expert
+        # received no tokens sweeps 1879 tensors, not 1880, so "505 flat" means
+        # a different thing in each. The fraction is the comparable number and
+        # is what belongs in a write-up; the count is kept because it is what
+        # you grep the CSV for.
+        if amax:
+            print(
+                f"heatmap_{recipe_id}_amax_flat_pct: "
+                f"{100.0 * n_flat / len(amax):.4f}"
+            )
         if not slopes:
             continue
         mid = len(slopes) // 2
