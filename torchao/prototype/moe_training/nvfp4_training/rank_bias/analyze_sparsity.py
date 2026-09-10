@@ -11,22 +11,40 @@ table; they share no control flow.
 
 Three numbers, which are not the same thing and are routinely conflated:
 
+PROVENANCE. ``flush`` and ``dead_block`` are kitchen's metrics under different
+names, and the predicates are kitchen's, not new here:
+
+    flush       kitchen ``Metric.FTZ``              metrics_utils.py:27
+                predicate ``logical_and(quant == 0, ref != 0)``
+                gemm_utils.py:224, metrics_utils.py:340
+    dead_block  kitchen ``Metric.BLOCK_SCALE_FTZ``  metrics_utils.py:30
+                via ``stats.block_scale_flush_fraction``
+    ftz_thresh  kitchen ``Metric.FTZ_THRESHOLD``    metrics_utils.py:28
+                predicate ``ftz_threshold()``, metrics_utils.py:332
+
+Kitchen also already sweeps FTZ per recipe and per lane over W.T / X.T / G / G.T
+(``analyze_recipe_sweep.py``), which is the same axis structure. What is new here
+is ``block_nnz``, ``p50_rel``, the DSV3 dump driver with per-module grouping, and
+the framing of fp4_zero / block_nnz / dead_block as mean / spread / tail of one
+distribution. The leaf quantizers, ``VARIANTS``, ``RECIPES`` and ``flatten_to_2d``
+arrive transitively from kitchen through :mod:`analyze_rank_bias`.
+
 ``exact_zero``
     Elements that are exactly 0 in the dump. A property of the *model*: ReLU
     families produce them, SiLU/GELU families essentially never do, and MoE
     routing produces them in whole rows.
 
 ``flush``
-    Elements that are nonzero in the dump but quantize to FP4 code 0. This is
-    what NVFP4 actually discards, and unlike ``exact_zero`` it is *block
-    relative*: an element flushes when it is small compared to the amax of its
-    own 16-element block, not when it is small in absolute terms. An element at
-    1e-30 in a block whose amax is 1e-30 survives; an element at 1.0 in a block
-    whose amax is 100 does not.
+    Elements that are nonzero in the dump but quantize to FP4 code 0 -- kitchen's
+    FTZ. This is what NVFP4 actually discards, and unlike ``exact_zero`` it is
+    *block relative*: an element flushes when it is small compared to the amax of
+    its own 16-element block, not when it is small in absolute terms. An element
+    at 1e-30 in a block whose amax is 1e-30 survives; an element at 1.0 in a
+    block whose amax is 100 does not.
 
 ``dead_block``
     Blocks whose E4M3 block scale itself underflows to zero, so the entire block
-    reconstructs as zero regardless of its contents.
+    reconstructs as zero regardless of its contents -- kitchen's BLOCK_SCALE_FTZ.
 
 ``block_nnz``
     Nonzero FP4 codes per 16-element quantization block, **after** quantization,
@@ -44,12 +62,26 @@ Three numbers, which are not the same thing and are routinely conflated:
 
 ``abs_lt``
     Elements whose magnitude is below a fixed absolute threshold (1e-5, 1e-6,
-    1e-7), measured on the tensor as dumped. Unlike ``flush`` this is NOT block
-    relative and NOT recipe dependent: it is a property of the model's gradient
-    scale. Read the two together -- a tensor can be absolutely tiny everywhere
-    and flush nothing (a uniformly small block has a small amax and full
-    headroom), or absolutely large everywhere and flush heavily (one outlier
-    sets the block amax and buries the rest).
+    1e-7), measured on the tensor as dumped. NOT block relative and NOT recipe
+    dependent: a property of the model's gradient scale alone.
+
+    **This is deliberately NOT kitchen's FTZ_THRESHOLD**, and the difference
+    matters. Kitchen counts elements that *crossed* the threshold --
+    ``|approx| < t AND |ref| > t`` -- so it is a quantization measurement.
+    ``abs_lt`` has no reference and no quantizer in it at all; it answers the
+    literal question "what fraction of this tensor is below 1e-5". On DSV3 671B
+    gradients that answer is ~100% at every cut, which is itself the finding:
+    the whole tensor lives at ~1e-7, so an absolute axis cannot discriminate
+    between modules and only the block-relative measures can.
+
+``ftz_thresh``
+    Kitchen's FTZ_THRESHOLD, restored so the saturating ``abs_lt`` is not the
+    only threshold statistic here: ``|dequantized| < t AND |original| > t``, over
+    the same three cuts. Elements that were meaningfully nonzero going in and
+    came back below the threshold. Unlike ``abs_lt`` this does not saturate, and
+    unlike ``flush`` it counts near-misses rather than exact zeros -- kitchen
+    describes it as a superset of FTZ, though strictly the ``|ref| > t`` clause
+    also excludes some exact flushes whose input was already tiny.
 
 The distributional statistic behind ``flush`` is ``|x| / block_amax``. An
 element rounds to FP4 zero at roughly ``|x| < block_amax / 24`` (the E2M1 RNE
@@ -122,6 +154,11 @@ def _abs_field(threshold: float) -> str:
     return f"raw_abs_lt_{threshold:.0e}_pct".replace("e-0", "e").replace("e-", "e")
 
 
+def _ftz_field(threshold: float) -> str:
+    """Column name for one ``ftz_thresh`` cut, e.g. ``ftz_thresh_1e5_pct``."""
+    return f"ftz_thresh_{threshold:.0e}_pct".replace("e-0", "e").replace("e-", "e")
+
+
 def _sr_kwarg(backend) -> str:
     """Which keyword this quantizer spells stochastic rounding with.
 
@@ -161,12 +198,19 @@ class SparsityStats:
     block_nnz_p50: float       # median nonzero FRACTION within a block
     block_nnz_p05: float
     abs_lt: Tuple[float, ...]  # |x| < ABS_THRESHOLDS, on the tensor as dumped
+    ftz_thresh: Tuple[float, ...]  # kitchen FTZ_THRESHOLD: |dq| < t and |ref| > t
 
     def row(self) -> Dict[str, object]:
         thresholds = {
             _abs_field(t): 100.0 * v
             for t, v in zip(ABS_THRESHOLDS, self.abs_lt)
         }
+        thresholds.update(
+            {
+                _ftz_field(t): 100.0 * v
+                for t, v in zip(ABS_THRESHOLDS, self.ftz_thresh)
+            }
+        )
         return {
             **thresholds,
             "numel": self.numel,
@@ -280,6 +324,26 @@ def sparsity_stats(
     per_block_nnz = ((coded != 0) & block_mask).sum(dim=-1).float() / BLOCK_SIZE
     nnz_valid = per_block_nnz[full_blocks]
 
+    # kitchen's FTZ_THRESHOLD (metrics_utils.py:332), on the same operand the
+    # quantizer saw so approx and ref share a basis. Costs a second quantize
+    # pass: `dequantize` is not a uniform module-level export across the four
+    # backends -- eden_cutedsl imports nvfp4_cutedsl's -- so the public
+    # quant_dequant is the portable call, and reaching into internals to save
+    # the pass is not worth coupling to them.
+    dq = backend.quant_dequant(
+        q_input, transpose=transpose, seed=seed, **{_sr_kwarg(backend): use_sr}
+    )
+    dq_view = _logical(dq, transpose)
+    padded_dq = torch.zeros_like(padded_view)
+    padded_dq[: dq_view.shape[0], : dq_view.shape[1]] = dq_view.float()
+    ftz_thresh = tuple(
+        float(
+            ((padded_dq.abs() < t) & (padded_view.abs() > t) & mask).sum()
+        ) / total if total else 0.0
+        for t in ABS_THRESHOLDS
+    )
+    del dq, dq_view, padded_dq
+
     live_blocks = (block_amax.squeeze(-1) > 0) & block_mask.any(dim=-1)
     n_live = int(live_blocks.sum())
     dead = (
@@ -302,6 +366,7 @@ def sparsity_stats(
         block_nnz_p50=_percentile(nnz_valid, 0.50),
         block_nnz_p05=_percentile(nnz_valid, 0.05),
         abs_lt=abs_lt,
+        ftz_thresh=ftz_thresh,
     )
 
 
@@ -407,6 +472,8 @@ FIELDS = [
     "block_nnz_p05_pct",
 ] + [
     _abs_field(t) for t in ABS_THRESHOLDS
+] + [
+    _ftz_field(t) for t in ABS_THRESHOLDS
 ]
 
 
@@ -558,6 +625,11 @@ def report_sparsity_metrics(
         # case -- see the module docstring.
         for threshold in ABS_THRESHOLDS:
             field = _abs_field(threshold)
+            print(f"{stem}_{field[:-4]}_median: {med(field, lane_rows):.6f}")
+        # kitchen's FTZ_THRESHOLD. Reported because abs_lt saturates on this
+        # model and so cannot separate modules; this one can.
+        for threshold in ABS_THRESHOLDS:
+            field = _ftz_field(threshold)
             print(f"{stem}_{field[:-4]}_median: {med(field, lane_rows):.6f}")
 
         groups: Dict[str, List[Dict[str, object]]] = defaultdict(list)

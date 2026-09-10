@@ -137,6 +137,29 @@ def test_rotation_destroys_structural_sparsity():
     assert list(plain.abs_lt) == sorted(plain.abs_lt, reverse=True)
 
 
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_ftz_thresh_is_kitchens_metric_not_a_second_abs_lt(backend):
+    """ftz_thresh must measure QUANTIZATION, abs_lt must not.
+
+    The failure mode this guards is reimplementing abs_lt under a second name.
+    Kitchen's FTZ_THRESHOLD is |dq| < t AND |ref| > t, so it needs both sides;
+    abs_lt reads the input only. Build a tensor whose elements are all far ABOVE
+    every threshold: abs_lt must then be 0 everywhere, while ftz_thresh can
+    still be nonzero because quantization pushes sub-threshold elements down.
+    """
+    block = torch.full((1, 16), 1e-3, device="cuda", dtype=torch.bfloat16)
+    block[0, 0] = 1.0
+    x = block.repeat(32, 1)
+    stats = _stats(x, backend)
+    # Every element is >= 1e-3, so no absolute cut at 1e-5 or below can fire.
+    assert all(v == 0.0 for v in stats.abs_lt)
+    # But 15/16 flush to exactly 0, and 0 < 1e-5 while the input 1e-3 > 1e-5,
+    # so kitchen's predicate fires on precisely those elements.
+    assert stats.ftz_thresh[0] == pytest.approx(15 / 16)
+    # Monotone non-increasing in a decreasing threshold, as abs_lt is.
+    assert list(stats.ftz_thresh) == sorted(stats.ftz_thresh, reverse=True)
+
+
 @pytest.mark.parametrize("activation", ["swiglu", "relu2", "gelu", "geglu", "silu"])
 def test_synthetic_grads_have_the_expected_layers_and_zero_structure(activation):
     """Gated activations produce an fc3 and no exact zeros; ReLU-family
