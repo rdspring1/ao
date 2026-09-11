@@ -123,6 +123,12 @@ def _draw(ax, counts: torch.Tensor, limit: float, color: str) -> None:
     ax.fill_between(centers, frac, color=color, alpha=0.25)
     ax.plot(centers, frac, color=color, linewidth=1.4)
     ax.set_xlim(-limit, limit)
+    # Headroom for the annotation box, which sits top-left and would otherwise
+    # cover the peak on any distribution that is centred at zero -- i.e. all of
+    # them.
+    peak = float(frac.max()) if len(frac) else 0.0
+    if peak > 0:
+        ax.set_ylim(0, peak * 1.45)
     ax.grid(alpha=0.3, linewidth=0.5)
     ax.tick_params(labelsize=7)
 
@@ -205,9 +211,11 @@ def build_figure(
         if col == 0:
             top.set_ylabel(f"{raw_label}\nfraction per bin", fontsize=8)
             bottom.set_ylabel(f"{quant_label}\nfraction per bin", fontsize=8)
-    fig.suptitle(title, fontsize=12, fontweight="bold", y=1.02)
-    fig.text(0.5, 0.985, subtitle, ha="center", fontsize=7.5, color="0.35")
+    # tight_layout first, then the two header lines above the axes: placing them
+    # first lets tight_layout reclaim their space and stack them on each other.
     fig.tight_layout()
+    fig.suptitle(title, fontsize=12, fontweight="bold", y=1.07)
+    fig.text(0.5, 1.015, subtitle, ha="center", fontsize=7.5, color="0.35")
     fig.savefig(out_path, dpi=160, bbox_inches="tight")
     plt.close(fig)
     print(f"wrote {out_path}")
