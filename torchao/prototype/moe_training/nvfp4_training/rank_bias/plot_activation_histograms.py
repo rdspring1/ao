@@ -15,15 +15,21 @@ WHAT IT DELIBERATELY DOES NOT DO. It computes no sparsity statistic of its own.
 this reads its CSV via ``--sparsity-csv`` to annotate the panels. Two scripts,
 one quantization pass each, no second definition of the same number.
 
-TWO PASSES OVER THE DUMP, ON PURPOSE. Pass 1 reads ``abs().max()`` per tensor
-and nothing else; pass 2 bins. A histogram range cannot be chosen before the
-data is seen, and the alternative -- a fixed a-priori range with overflow bins --
-is wrong for exactly the tensors that matter, whose mass sits within a few ulp
-of zero under a long tail. Pass 1 is I/O and one reduction, no quantizer.
+THE X AXIS IS ``log10(|x| / block_amax)``, NOT THE VALUE. A signed linear axis
+cannot draw this distribution: excess kurtosis runs from 91 (routed experts) to
+1.8e4 (dense), so over ``[-amax, +amax]`` every element lands in the one or two
+bins astride zero and the quantized row is visually identical to the raw one --
+NVFP4 moves each element by a fraction of its own block amax, far below one bin
+width. Block-relative magnitude is also the quantity the format actually acts
+on: an element rounds to FP4 zero at ``|x| / block_amax < 1/24``, drawn as a
+dashed line on every panel. Flushed elements have ``|x| == 0`` and pile into the
+leftmost bin, so FTZ reads off the figure as mass rather than out of a caption.
+A log y axis then keeps the tail -- the part the format destroys -- visible
+against a peak three decades above it.
 
-The per-tensor panels each carry their own x-range, matching the reference
-figure; the pooled panels share one range per family so the three families are
-directly comparable.
+The axis is therefore FIXED at ``[-6, 0]`` for every panel, which makes all
+tensors and both rows directly comparable and needs no range-finding pass over
+the dump.
 """
 from __future__ import annotations
 
@@ -51,6 +57,11 @@ from .analyze_rank_bias import (
 )
 from .analyze_sparsity import FP4_ZERO_RATIO, _slug, _sr_kwarg
 from .dsv3_dumps import classify, discover_dsv3_tensors, load_dump_tensor
+from .nvfp4_reference import BLOCK_SIZE
+
+# Fixed x-range, in decades of |x| / block_amax. 0 is the block amax itself; -6
+# collects everything below a millionth of it, including every flushed element.
+LOG_MIN, LOG_MAX = -6.0, 0.0
 
 # Row order of the pooled figure's columns. Anything classify() returns that is
 # not listed is appended after these, so a new family shows up rather than
@@ -106,37 +117,71 @@ def _quant_dequant(tensor: torch.Tensor, *, recipe_id: str, variant: str,
     )
 
 
-def _hist(x: torch.Tensor, bins: int, limit: float) -> torch.Tensor:
-    """Counts of ``x`` over ``bins`` equal bins spanning ``[-limit, +limit]``."""
-    return torch.histc(x.float().flatten(), bins=bins, min=-limit, max=limit).cpu()
+def block_amax(x: torch.Tensor) -> torch.Tensor:
+    """Per-1x16-block amax of a 2D tensor, in the blocked layout ``_blocks`` returns."""
+    return _blocks(x).abs().amax(dim=-1, keepdim=True)
 
 
-def _bin_centers(bins: int, limit: float) -> torch.Tensor:
-    edges = torch.linspace(-limit, limit, bins + 1)
+def _blocks(x: torch.Tensor) -> torch.Tensor:
+    """``[rows, cols] -> [rows, cols // 16, 16]``, the NVFP4 scaling layout along K."""
+    rows, cols = x.shape
+    if cols % BLOCK_SIZE:
+        raise SystemExit(
+            f"last dim {cols} is not a multiple of the NVFP4 block size {BLOCK_SIZE}; "
+            "this figure assumes the unrotated fprop layout, where it always is"
+        )
+    return x.float().reshape(rows, cols // BLOCK_SIZE, BLOCK_SIZE)
+
+
+def relative_log(x: torch.Tensor, amax: torch.Tensor) -> torch.Tensor:
+    """``log10(|x| / amax)`` per element, clamped into ``[LOG_MIN, LOG_MAX]``.
+
+    ``x`` is blocked; ``amax`` is the RAW tensor's per-block amax, used for both
+    rows so the two are on one scale. An element the quantizer flushed is exactly
+    0, so its log is -inf and it clamps into the leftmost bin -- that pile-up is
+    the FTZ mass. An all-zero block has no amax to divide by and contributes there
+    too.
+    """
+    rel = torch.where(amax > 0, x.abs() / amax, torch.zeros_like(x))
+    return rel.log10().clamp_(LOG_MIN, LOG_MAX).flatten()
+
+
+def _hist(x: torch.Tensor, bins: int) -> torch.Tensor:
+    """Counts of ``x`` over ``bins`` equal bins spanning ``[LOG_MIN, LOG_MAX]``."""
+    return torch.histc(x.float(), bins=bins, min=LOG_MIN, max=LOG_MAX).cpu()
+
+
+def _bin_centers(bins: int) -> torch.Tensor:
+    edges = torch.linspace(LOG_MIN, LOG_MAX, bins + 1)
     return 0.5 * (edges[:-1] + edges[1:])
 
 
-def _draw(ax, counts: torch.Tensor, limit: float, color: str) -> None:
+def _draw(ax, counts: torch.Tensor, color: str) -> None:
     total = float(counts.sum())
     frac = counts / total if total else counts
-    centers = _bin_centers(len(counts), limit)
-    ax.fill_between(centers, frac, color=color, alpha=0.25)
+    centers = _bin_centers(len(counts))
+    ax.fill_between(centers, frac, 1e-9, color=color, alpha=0.25)
     ax.plot(centers, frac, color=color, linewidth=1.4)
-    ax.set_xlim(-limit, limit)
-    # Headroom for the annotation box, which sits top-left and would otherwise
-    # cover the peak on any distribution that is centred at zero -- i.e. all of
-    # them.
+    ax.axvline(math.log10(FP4_ZERO_RATIO), color="0.25", linestyle="--", linewidth=0.9)
+    # A hair wider than the data, so the two edge bins -- the flushed pile-up at
+    # LOG_MIN and the block amax itself at 0 -- do not render on the spines.
+    ax.set_xlim(LOG_MIN - 0.15, LOG_MAX + 0.15)
+    ax.set_yscale("log")
+    # Log y, so headroom for the top-left annotation box is decades, not a
+    # fraction. The floor is fixed: a bin holding one element in 1e7 is noise.
     peak = float(frac.max()) if len(frac) else 0.0
     if peak > 0:
-        ax.set_ylim(0, peak * 1.45)
+        ax.set_ylim(1e-7, peak * 60)
     ax.grid(alpha=0.3, linewidth=0.5)
     ax.tick_params(labelsize=7)
 
 
 def _annotate(ax, lines: Sequence[str]) -> None:
+    # Bottom-left, not top-left: on a log y axis the top-left corner is where the
+    # flushed mass piles up, which is the one thing the box must not cover.
     ax.text(
-        0.02, 0.97, "\n".join(lines), transform=ax.transAxes,
-        va="top", ha="left", fontsize=6.5,
+        0.02, 0.03, "\n".join(lines), transform=ax.transAxes,
+        va="bottom", ha="left", fontsize=6.5,
         bbox=dict(boxstyle="square,pad=0.25", facecolor="white", edgecolor="0.7", linewidth=0.5),
     )
 
@@ -184,7 +229,7 @@ def _fmt(row: Optional[Dict[str, str]], key: str, unit: str = "%") -> Optional[s
 
 
 def build_figure(
-    columns: Sequence[Tuple[str, str, torch.Tensor, torch.Tensor, float, Dict[str, object]]],
+    columns: Sequence[Tuple[str, str, torch.Tensor, torch.Tensor, Dict[str, object]]],
     *,
     title: str,
     subtitle: str,
@@ -194,20 +239,19 @@ def build_figure(
 ) -> None:
     """Two rows -- raw on top, dequantized below -- one column per entry.
 
-    ``columns`` entries are ``(title, subtitle, raw_counts, dq_counts, limit,
-    stats)``. Shape and conventions follow ``plot_bias_heatmaps.make_summary_heatmap``:
+    ``columns`` entries are ``(title, subtitle, raw_counts, dq_counts, stats)``. Shape and conventions follow ``plot_bias_heatmaps.make_summary_heatmap``:
     Agg, ``dpi=160``, ``bbox_inches="tight"``.
     """
     n = len(columns)
     fig, axes = plt.subplots(2, n, figsize=(3.1 * n, 5.6), squeeze=False)
-    for col, (col_title, col_sub, raw_counts, dq_counts, limit, stats) in enumerate(columns):
+    for col, (col_title, col_sub, raw_counts, dq_counts, stats) in enumerate(columns):
         top, bottom = axes[0][col], axes[1][col]
         top.set_title(f"{col_title}\n{col_sub}", fontsize=8.5, fontweight="bold")
-        _draw(top, raw_counts, limit, "tab:red")
-        _draw(bottom, dq_counts, limit, "tab:blue")
+        _draw(top, raw_counts, "tab:red")
+        _draw(bottom, dq_counts, "tab:blue")
         _annotate(top, stats["raw_lines"])
         _annotate(bottom, stats["quant_lines"])
-        bottom.set_xlabel("value", fontsize=7.5)
+        bottom.set_xlabel("log10( |x| / block amax )", fontsize=7.5)
         if col == 0:
             top.set_ylabel(f"{raw_label}\nfraction per bin", fontsize=8)
             bottom.set_ylabel(f"{quant_label}\nfraction per bin", fontsize=8)
@@ -271,7 +315,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="analyze_sparsity.py --csv export, used for the panel annotations.",
     )
     parser.add_argument(
-        "--examples", nargs="+", default=None,
+        "--samples", nargs="+", default=None,
         help="Tensor names for the per-tensor figure, e.g. layer3_shared_fc2. "
              "The selection belongs on the command line, not in the code.",
     )
@@ -305,33 +349,16 @@ def main() -> None:
         name = f"layer{info.layer_num}_{info.module_name}"
         return name if info.expert_num is None else f"{name}_expert{info.expert_num}"
 
-    # Pass 1: ranges only. See the module docstring for why this is not folded
-    # into pass 2. amax rather than a high percentile: exact, no size limit, and
-    # it keeps the tail that is the whole point of the figure on the axis.
-    limits: Dict[str, float] = {}
-    family_limit: Dict[str, float] = defaultdict(float)
-    for info in infos:
-        tensor = load_dump_tensor(info.filepath)
-        if tensor.numel() == 0:
-            continue
-        name = tensor_name(info)
-        amax = float(tensor.abs().max())
-        limits[name] = amax
-        family = classify(info.module_name)
-        family_limit[family] = max(family_limit[family], amax)
-    print(f"pass 1 done: {len(limits)} non-empty tensors, "
-          f"{len(family_limit)} families")
-
     sparsity = read_sparsity_csv(args.sparsity_csv)
     pooled_raw: Dict[str, torch.Tensor] = {}
     pooled_dq: Dict[str, torch.Tensor] = {}
     pooled_n: Dict[str, int] = defaultdict(int)
-    examples: Dict[str, Tuple[torch.Tensor, torch.Tensor, float, str]] = {}
+    samples: Dict[str, Tuple[torch.Tensor, torch.Tensor, str]] = {}
     per_tensor: List[Dict[str, object]] = []
-    wanted = set(args.examples or ())
+    wanted = set(args.samples or ())
     empty: List[str] = []
 
-    # Pass 2: bin, quantize, bin again.
+    # One pass: quantize, then bin both rows against the raw tensor's block amax.
     for info in infos:
         name = tensor_name(info)
         family = classify(info.module_name)
@@ -348,9 +375,9 @@ def main() -> None:
             tensor, recipe_id=recipe_id, variant=args.variant,
             tensor_type=args.tensor_type, backends=backends, seed=args.seed,
         )
-        flimit = family_limit[family]
-        raw_counts = _hist(tensor, args.bins, flimit)
-        dq_counts = _hist(dq, args.bins, flimit)
+        amax = block_amax(tensor)
+        raw_counts = _hist(relative_log(_blocks(tensor), amax), args.bins)
+        dq_counts = _hist(relative_log(_blocks(dq), amax), args.bins)
         if family not in pooled_raw:
             pooled_raw[family] = torch.zeros(args.bins)
             pooled_dq[family] = torch.zeros(args.bins)
@@ -364,24 +391,22 @@ def main() -> None:
             "module": info.module_name,
             "rows": tensor.shape[0],
             "cols": tensor.shape[1],
-            "amax": limits[name],
+            "amax": float(tensor.abs().max()),
             "excess_kurtosis": excess_kurtosis(tensor),
             "qsnr_db": qsnr_db(tensor, dq),
         }
         per_tensor.append(entry)
 
         if name in wanted:
-            # Own range for the per-tensor panels, matching the reference figure.
-            own = limits[name]
-            examples[name] = (
-                _hist(tensor, args.bins, own), _hist(dq, args.bins, own), own, family,
-            )
+            # Same fixed axis as the pooled figure -- these panels differ by which
+            # tensor they hold, not by scale, so they can be read against it.
+            samples[name] = (raw_counts, dq_counts, family)
         del tensor, dq
         torch.cuda.empty_cache()
 
-    missing = wanted - set(examples)
+    missing = wanted - set(samples)
     if missing:
-        print(f"WARNING: --examples not found in the dump: {', '.join(sorted(missing))}")
+        print(f"WARNING: --samples not found in the dump: {', '.join(sorted(missing))}")
 
     def stats_for(name: str, entry: Dict[str, object]) -> Dict[str, object]:
         row = sparsity.get(name)
@@ -390,7 +415,7 @@ def main() -> None:
                      f"amax {float(entry['amax']):.3g}"]
         below = _fmt(row, "below_1_24_pct")
         if below:
-            raw_lines.append(f"|x|/amax < 1/24  {below}")
+            raw_lines.append(f"|x|/block_amax < 1/24  {below}")
         quant_lines = [f"QSNR {float(entry['qsnr_db']):.2f} dB"]
         for key, label in (
             ("flush_pct", "flush"),
@@ -420,7 +445,7 @@ def main() -> None:
                     f"{len(members)} tensors, {sum(int(e['rows']) for e in members)}"
                     f"x{int(members[0]['cols'])} total",
                     f"median excess kurtosis {_median(members, 'excess_kurtosis'):.3g}",
-                    f"amax {family_limit[family]:.3g}",
+                    f"amax {max(float(e['amax']) for e in members):.3g}",
                 ],
                 "quant_lines": [
                     f"median QSNR {_median(members, 'qsnr_db'):.2f} dB",
@@ -428,7 +453,7 @@ def main() -> None:
             }
             below = _median_csv(csv_rows, "below_1_24_pct")
             if below is not None:
-                stats["raw_lines"].append(f"median |x|/amax < 1/24  {below:.2f}%")
+                stats["raw_lines"].append(f"median |x|/block_amax < 1/24  {below:.2f}%")
             for key, label in (
                 ("flush_pct", "median flush"),
                 ("block_nnz_p50_pct", "median block_nnz p50"),
@@ -444,14 +469,15 @@ def main() -> None:
                     stats["quant_lines"].append(f"{label} {value:.2f}%")
             columns.append((
                 family, f"pooled over {pooled_n[family]} tensors",
-                pooled_raw[family], pooled_dq[family], family_limit[family], stats,
+                pooled_raw[family], pooled_dq[family], stats,
             ))
         build_figure(
             columns,
             title=f"{args.tensor_type} value histograms before and after NVFP4",
             subtitle=(
                 f"recipe {recipe_id} · variant {args.variant} · rank {args.rank} · "
-                f"step {args.step} · {args.bins} bins over [-amax, +amax] per family · "
+                f"step {args.step} · {args.bins} bins over log10(|x| / block amax) · "
+                f"dashed line = FP4 flush threshold 1/24 · log y · "
                 "every element of every tensor included"
             ),
             raw_label="raw values",
@@ -459,26 +485,27 @@ def main() -> None:
             out_path=os.path.join(args.out_dir, f"value_histograms_pooled{suffix}.png"),
         )
 
-    if examples:
-        ordered = [n for n in (args.examples or ()) if n in examples]
+    if samples:
+        ordered = [n for n in (args.samples or ()) if n in samples]
         columns = []
         for name in ordered:
-            raw_counts, dq_counts, limit, family = examples[name]
+            raw_counts, dq_counts, family = samples[name]
             columns.append((
-                name, family, raw_counts, dq_counts, limit,
+                name, family, raw_counts, dq_counts,
                 stats_for(name, by_name[name]),
             ))
         build_figure(
             columns,
-            title=f"{args.tensor_type} value histograms before and after NVFP4 — examples",
+            title=f"{args.tensor_type} value histograms before and after NVFP4 — samples",
             subtitle=(
                 f"recipe {recipe_id} · variant {args.variant} · rank {args.rank} · "
-                f"step {args.step} · {args.bins} bins over each tensor's own "
-                "[-amax, +amax] · every tensor element included"
+                f"step {args.step} · {args.bins} bins over log10(|x| / block amax) · "
+                f"dashed line = FP4 flush threshold 1/24 · log y · "
+                "one named tensor per column"
             ),
             raw_label="raw values",
             quant_label=f"after NVFP4 ({recipe_id})",
-            out_path=os.path.join(args.out_dir, f"value_histograms_examples{suffix}.png"),
+            out_path=os.path.join(args.out_dir, f"value_histograms_samples{suffix}.png"),
         )
 
     print()
