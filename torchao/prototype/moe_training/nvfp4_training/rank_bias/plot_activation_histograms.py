@@ -186,6 +186,104 @@ def _annotate(ax, lines: Sequence[str]) -> None:
     )
 
 
+def _fractions(counts: torch.Tensor) -> torch.Tensor:
+    total = float(counts.sum())
+    return counts / total if total else counts
+
+
+def build_overlay_figure(
+    series: Sequence[Tuple[str, torch.Tensor]], *, title: str, subtitle: str, out_path: str
+) -> None:
+    """One axes per question, every family drawn on BOTH -- the comparison figure.
+
+    THE FACETED FIGURES CANNOT ANSWER A COMPARISON. build_figure gives each family
+    its own panel with identical axes, which forces the reader to compare curve
+    shapes across panels. On the s48 dump that hid an excess-kurtosis range of
+    0.187 to 10162 and a flush range of 6.8% to 23.0%: every panel looked the
+    same. Overlaying is the fix, and it is a layout change, not a scale change.
+
+    LEFT, log y: density. Log is correct here and linear would be wrong --
+    kurtosis is a TAIL property, and a linear y axis shows only the peak, which
+    is the part that does not differ between families.
+
+    RIGHT, linear y: the CDF, which is the one thing log-y density cannot show.
+    Visual area under a log axis is not probability mass, so a 3.4x difference in
+    flushed mass is invisible on the left panel. On a CDF it is a height: the
+    curve's value where it crosses the 1/24 threshold IS the flushed fraction,
+    marked and labelled per family.
+    """
+    fig, (dens, cum) = plt.subplots(1, 2, figsize=(13.5, 5.2))
+    centers = _bin_centers(len(series[0][1]))
+    thresh = math.log10(FP4_ZERO_RATIO)
+    below = int((centers <= thresh).sum()) - 1
+    cmap = plt.get_cmap("tab10")
+
+    for i, (label, counts) in enumerate(series):
+        color = cmap(i % 10)
+        frac = _fractions(counts)
+        cdf = torch.cumsum(frac, dim=0)
+        dens.plot(centers, frac, color=color, linewidth=1.5, label=label)
+        cum.plot(centers, cdf, color=color, linewidth=1.5, label=label)
+        if 0 <= below < len(cdf):
+            y = float(cdf[below])
+            cum.plot([thresh], [y], marker="o", markersize=4.5, color=color)
+            cum.annotate(
+                f"{y * 100:.1f}%", xy=(thresh, y), xytext=(6, 0),
+                textcoords="offset points", fontsize=7, color=color, va="center",
+            )
+
+    for ax in (dens, cum):
+        ax.axvline(thresh, color="0.25", linestyle="--", linewidth=0.9)
+        ax.set_xlim(LOG_MIN - 0.15, LOG_MAX + 0.15)
+        ax.set_xlabel("log10( |x| / block amax )", fontsize=8)
+        ax.grid(alpha=0.3, linewidth=0.5)
+        ax.tick_params(labelsize=8)
+
+    dens.set_yscale("log")
+    dens.set_ylim(1e-7, 1.0)
+    dens.set_ylabel("fraction per bin", fontsize=9)
+    dens.set_title("density, log y - shape and tails", fontsize=9.5, fontweight="bold")
+    dens.legend(fontsize=7, loc="upper left")
+    cum.set_ylim(0.0, 1.0)
+    cum.set_ylabel("cumulative fraction of elements", fontsize=9)
+    cum.set_title(
+        "CDF, linear y - height at the dashed line is the flushed mass",
+        fontsize=9.5, fontweight="bold",
+    )
+
+    fig.tight_layout()
+    fig.suptitle(title, fontsize=12, fontweight="bold", y=1.06)
+    fig.text(0.5, 1.012, subtitle, ha="center", fontsize=7.5, color="0.35")
+    fig.savefig(out_path, dpi=160, bbox_inches="tight")
+    plt.close(fig)
+    print(f"wrote {out_path}")
+
+
+def write_bins_csv(path: str, series: Sequence[Tuple[str, str, torch.Tensor]]) -> None:
+    """The binned counts themselves, so replotting never needs a GPU again.
+
+    Everything else this script writes is a per-tensor SUMMARY -- amax, kurtosis,
+    qsnr -- from which no histogram can be reconstructed. The bins existed only
+    inside this process, so every change to the figure meant an ao commit, a pin
+    bump and a cluster job. One CSV of a few thousand rows removes that entirely:
+    the pooled and sampled series here are exactly what the figures draw.
+
+    Long form -- one row per (series, kind, bin) -- because it is the shape that
+    pivots without knowing the bin count in advance.
+    """
+    centers = _bin_centers(len(series[0][2])) if series else []
+    with open(path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["series", "kind", "bin", "bin_center_log10", "count", "fraction"])
+        for label, kind, counts in series:
+            frac = _fractions(counts)
+            for i, c in enumerate(counts.tolist()):
+                writer.writerow([
+                    label, kind, i, f"{float(centers[i]):.5f}", f"{c:.0f}", f"{float(frac[i]):.8e}",
+                ])
+    print(f"wrote {path}")
+
+
 def read_sparsity_csv(path: Optional[str]) -> Dict[str, Dict[str, str]]:
     """``tensor`` -> row, from an ``analyze_sparsity.py --csv`` export.
 
@@ -321,6 +419,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--tag", default=None, help="Suffix for the output filenames.")
     parser.add_argument("--csv", default=None, help="Write the per-tensor distribution stats here.")
+    parser.add_argument(
+        "--bins-csv", default=None,
+        help="Write the binned counts behind the figures here. Per-family pooled "
+             "series plus any --samples, raw and dequantized. This is what makes "
+             "replotting a laptop operation instead of a cluster job.",
+    )
     return parser
 
 
@@ -484,6 +588,20 @@ def main() -> None:
             quant_label=f"after NVFP4 ({recipe_id})",
             out_path=os.path.join(args.out_dir, f"value_histograms_pooled{suffix}.png"),
         )
+        # The comparison figure. Same pooled series, overlaid rather than
+        # faceted, because the faceted one cannot show a difference between
+        # families -- see build_overlay_figure.
+        build_overlay_figure(
+            [(f, pooled_raw[f]) for f in families],
+            title=f"{args.tensor_type} raw value distributions by family, before NVFP4",
+            subtitle=(
+                f"recipe {recipe_id} · variant {args.variant} · rank {args.rank} · "
+                f"step {args.step} · {args.bins} bins over log10(|x| / block amax) · "
+                f"dashed line = FP4 flush threshold 1/24 · "
+                "left: density on log y · right: CDF on linear y"
+            ),
+            out_path=os.path.join(args.out_dir, f"value_histograms_overlay{suffix}.png"),
+        )
 
     if samples:
         ordered = [n for n in (args.samples or ()) if n in samples]
@@ -507,6 +625,19 @@ def main() -> None:
             quant_label=f"after NVFP4 ({recipe_id})",
             out_path=os.path.join(args.out_dir, f"value_histograms_samples{suffix}.png"),
         )
+
+    if args.bins_csv:
+        rows: List[Tuple[str, str, torch.Tensor]] = []
+        for family in families:
+            rows.append((family, "raw", pooled_raw[family]))
+            rows.append((family, "dq", pooled_dq[family]))
+        for name in (args.samples or ()):
+            if name in samples:
+                raw_counts, dq_counts, _ = samples[name]
+                rows.append((name, "raw", raw_counts))
+                rows.append((name, "dq", dq_counts))
+        if rows:
+            write_bins_csv(args.bins_csv, rows)
 
     print()
     report_histogram_metrics(per_tensor, recipe_id=recipe_id)
