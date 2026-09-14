@@ -160,8 +160,13 @@ def main() -> None:
         torch.cuda.empty_cache()
 
     npair = len(args.fc1)
+    # Column labels name the FAMILY, not the row. Deriving them from args.fc1
+    # and reusing them on the FC2 row titled every bottom panel "...fc1" while
+    # the data under it was fc2 -- the figure lied about itself. The family
+    # suffix is stripped for the same reason: "moe/shared" is the column,
+    # fc1-vs-fc2 is the row, and the exact tensor is named in the panel box.
     labels = args.labels if args.labels and len(args.labels) == npair else [
-        panels[n]["family"] for n in args.fc1
+        str(panels[n]["family"]).rsplit("/", 1)[0] for n in args.fc1
     ]
     fig, axes = plt.subplots(2, 2 * npair, figsize=(3.05 * 2 * npair, 6.4), squeeze=False)
     for ri, (row_names, row_title) in enumerate(
@@ -174,6 +179,7 @@ def main() -> None:
             ):
                 ax = axes[ri][2 * ci + k]
                 lines = [
+                    name,
                     f"shape {p['shape'][0]}x{p['shape'][1]}",
                     f"excess kurtosis {p['kurt_raw' if kind == 'raw' else 'kurt_dq']:.3g}",
                 ]
