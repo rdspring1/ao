@@ -232,19 +232,41 @@ def build_overlay_figure(
                 textcoords="offset points", fontsize=7, color=color, va="center",
             )
 
+    # DATA-DRIVEN LIMITS, and they are the difference between this figure working
+    # and not. Drawn over the full [LOG_MIN, LOG_MAX] the families are visually
+    # indistinguishable: on the s48 dump two thirds of the x axis covers the
+    # region below -4, which holds under 1% of the mass, and three quarters of
+    # the CDF's y axis sits above the band where every crossing happens. The
+    # separation is a horizontal shift of 0.3-1.0 dex -- real, but a few percent
+    # of a 6-dex axis. Clip to where the mass actually is.
+    #
+    # x floor: the lowest 1st-percentile across series, so the most heavy-tailed
+    # family keeps its tail and nothing else wastes axis. y ceiling on the CDF:
+    # headroom over the largest crossing, so the labelled band fills the panel.
+    p01 = LOG_MIN
+    cross_max = 0.0
+    for _, counts in series:
+        cdf = torch.cumsum(_fractions(counts), dim=0)
+        idx = (cdf >= 0.01).nonzero()
+        if len(idx):
+            p01 = min(p01, float(centers[int(idx[0])])) if p01 != LOG_MIN else float(centers[int(idx[0])])
+        if 0 <= below < len(cdf):
+            cross_max = max(cross_max, float(cdf[below]))
+    x_lo = max(LOG_MIN, min(p01, thresh) - 1.0)
+
     for ax in (dens, cum):
         ax.axvline(thresh, color="0.25", linestyle="--", linewidth=0.9)
-        ax.set_xlim(LOG_MIN - 0.15, LOG_MAX + 0.15)
+        ax.set_xlim(x_lo, LOG_MAX + 0.15)
         ax.set_xlabel("log10( |x| / block amax )", fontsize=8)
         ax.grid(alpha=0.3, linewidth=0.5)
         ax.tick_params(labelsize=8)
 
     dens.set_yscale("log")
-    dens.set_ylim(1e-7, 1.0)
+    dens.set_ylim(1e-5, 1.0)
     dens.set_ylabel("fraction per bin", fontsize=9)
     dens.set_title("density, log y - shape and tails", fontsize=9.5, fontweight="bold")
     dens.legend(fontsize=7, loc="upper left")
-    cum.set_ylim(0.0, 1.0)
+    cum.set_ylim(0.0, min(1.0, max(0.1, cross_max * 1.45)))
     cum.set_ylabel("cumulative fraction of elements", fontsize=9)
     cum.set_title(
         "CDF, linear y - height at the dashed line is the flushed mass",
