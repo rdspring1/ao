@@ -311,6 +311,8 @@ class _NVFP4GroupedMM(torch.autograd.Function):
 
         packed_sequence_length = input_act.shape[0]
         logical_packed_length = padded_group_end_offsets[-1:]
+        if use_cutedsl_rht:
+            logical_packed_length = logical_packed_length.clone()
         group_rht_amax = (
             cutedsl_group_rht_amax if use_cutedsl_rht else triton_group_rht_amax
         )
@@ -424,6 +426,8 @@ class _NVFP4GroupedMM(torch.autograd.Function):
         num_experts = padded_group_end_offsets.numel()
         packed_sequence_length, N = grad_output.shape
         logical_packed_length = padded_group_end_offsets[-1:]
+        if ctx.use_cutedsl_rht:
+            logical_packed_length = logical_packed_length.clone()
         sign_vector_list = list(ctx.sign_vector)
         group_rht_amax = (
             cutedsl_group_rht_amax if ctx.use_cutedsl_rht else triton_group_rht_amax

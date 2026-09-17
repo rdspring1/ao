@@ -405,7 +405,7 @@ class _Tcgen05GroupRowColFused(_GroupRhtMainloop):
             hidden,
             num_tensors,
             tile_sched_params,
-        ).launch(grid=grid, block=(TPB, 1, 1), stream=stream)
+        ).launch(grid=grid, block=(TPB, 1, 1), stream=stream, use_pdl=True)
 
     @cute.kernel
     def kernel(
@@ -572,6 +572,23 @@ class _Tcgen05GroupRowColFused(_GroupRhtMainloop):
 
         pipeline_init_wait(cluster_shape_mn=cluster_layout_vmnk)
 
+        # The RHT matrix is launch-independent, so preload it while the
+        # predecessor grid is still running. All dependent global accesses
+        # remain below the PDL wait.
+        if warp_idx == TMA_WARP:
+            with cute.arch.elect_one():
+                cute.arch.mbarrier_arrive_and_expect_tx(
+                    storage.b_mbar.ptr, num_b_load_bytes
+                )
+            cute.copy(
+                tma_atom_b,
+                tBgB[(None, 0)],
+                tBsB[(None, 0)],
+                tma_bar_ptr=storage.b_mbar.ptr,
+            )
+
+        cute.arch.griddepcontrol_wait()
+
         tile_sched = utils.ClcDynamicPersistentTileScheduler.create(
             tile_sched_params,
             cute.arch.block_idx(),
@@ -598,19 +615,6 @@ class _Tcgen05GroupRowColFused(_GroupRhtMainloop):
         # ==================== TMA warp (mainloop producer) ====================
         if warp_idx == TMA_WARP:
             cute.arch.warpgroup_reg_dealloc(REG_DEALLOC)
-
-            # One-shot Hadamard load: 16x16 bf16, never re-armed (TE :546-553).
-            with cute.arch.elect_one():
-                cute.arch.mbarrier_arrive_and_expect_tx(
-                    storage.b_mbar.ptr, num_b_load_bytes
-                )
-            cute.copy(
-                tma_atom_b,
-                tBgB[(None, 0)],
-                tBsB[(None, 0)],
-                tma_bar_ptr=storage.b_mbar.ptr,
-            )
-
             ab_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, MAINLOOP_STAGES
             )
@@ -635,6 +639,7 @@ class _Tcgen05GroupRowColFused(_GroupRhtMainloop):
                 work_tile = tile_sched.get_current_work()
                 clc_pipeline.consumer_release(clc_consumer_state)
                 clc_consumer_state.advance()
+            cute.arch.griddepcontrol_launch_dependents()
             ab_pipeline.producer_tail(ab_producer_state)
 
         # ==================== Scheduler warp ====================
@@ -1060,7 +1065,8 @@ def _cutedsl_group_rht_quantize_row_col_impl(
     # The CuteDSL entry point requires byte_offset==0, and offsets[-1:] is a
     # nonzero-offset view for every multi-group launch. Cloning is device-side
     # and stays capturable.
-    logical_packed_length = logical_packed_length.clone()
+    if logical_packed_length.storage_offset() != 0:
+        logical_packed_length = logical_packed_length.clone()
 
     stream = cuda.CUstream(int(torch.cuda.current_stream(dev).cuda_stream))
     compiled = _compile_group_fused_kernel(
@@ -1150,7 +1156,7 @@ class _Tcgen05GroupRhtAmax(_GroupRhtMainloop):
             tiles_in_n,
             num_tensors,
             tile_sched_params,
-        ).launch(grid=grid, block=(TPB, 1, 1), stream=stream)
+        ).launch(grid=grid, block=(TPB, 1, 1), stream=stream, use_pdl=True)
 
     @cute.kernel
     def kernel(
@@ -1294,6 +1300,23 @@ class _Tcgen05GroupRhtAmax(_GroupRhtMainloop):
 
         pipeline_init_wait(cluster_shape_mn=cluster_layout_vmnk)
 
+        # The RHT matrix is launch-independent, so preload it while the
+        # predecessor grid is still running. All dependent global accesses
+        # remain below the PDL wait.
+        if warp_idx == TMA_WARP:
+            with cute.arch.elect_one():
+                cute.arch.mbarrier_arrive_and_expect_tx(
+                    storage.b_mbar.ptr, num_b_load_bytes
+                )
+            cute.copy(
+                tma_atom_b,
+                tBgB[(None, 0)],
+                tBsB[(None, 0)],
+                tma_bar_ptr=storage.b_mbar.ptr,
+            )
+
+        cute.arch.griddepcontrol_wait()
+
         tile_sched = utils.ClcDynamicPersistentTileScheduler.create(
             tile_sched_params,
             cute.arch.block_idx(),
@@ -1309,16 +1332,6 @@ class _Tcgen05GroupRhtAmax(_GroupRhtMainloop):
         # ==================== TMA warp ====================
         if warp_idx == TMA_WARP:
             cute.arch.warpgroup_reg_dealloc(REG_DEALLOC)
-            with cute.arch.elect_one():
-                cute.arch.mbarrier_arrive_and_expect_tx(
-                    storage.b_mbar.ptr, num_b_load_bytes
-                )
-            cute.copy(
-                tma_atom_b,
-                tBgB[(None, 0)],
-                tBsB[(None, 0)],
-                tma_bar_ptr=storage.b_mbar.ptr,
-            )
             ab_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, MAINLOOP_STAGES
             )
@@ -1342,6 +1355,7 @@ class _Tcgen05GroupRhtAmax(_GroupRhtMainloop):
                 work_tile = tile_sched.get_current_work()
                 clc_pipeline.consumer_release(clc_consumer_state)
                 clc_consumer_state.advance()
+            cute.arch.griddepcontrol_launch_dependents()
             ab_pipeline.producer_tail(ab_producer_state)
 
         # ==================== Scheduler warp ====================
@@ -1620,7 +1634,8 @@ def _cutedsl_group_rht_amax_impl(
     if logical_packed_length is None:
         logical_packed_length = offsets[-1:]
     # See the fused kernel: the entry point requires byte_offset==0.
-    logical_packed_length = logical_packed_length.clone()
+    if logical_packed_length.storage_offset() != 0:
+        logical_packed_length = logical_packed_length.clone()
 
     stream = cuda.CUstream(int(torch.cuda.current_stream(dev).cuda_stream))
     _compile_group_amax_kernel(dev.index)(

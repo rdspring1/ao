@@ -1,3 +1,9 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD 3-Clause license found in the
+# LICENSE file in the root directory of this source tree.
+
 """CuteDSL RHT + NVFP4 E2M1 columnwise/rowwise quantization kernels for SM100.
 
 Private impl for the torchao:: ops. Imported lazily by the op wrappers so the top-level
@@ -1075,13 +1081,16 @@ class _Tcgen05RowColFused:
         ).launch(
             grid=(GRID, 1, 1),
             block=(
-                self.fused_tpb
-                if cutlass.const_expr(self.apply_rht)
-                else self.fused_tpb_w,
+                (
+                    self.fused_tpb
+                    if cutlass.const_expr(self.apply_rht)
+                    else self.fused_tpb_w
+                ),
                 1,
                 1,
             ),
             stream=stream,
+            use_pdl=True,
         )
 
     @cute.kernel
@@ -1326,6 +1335,9 @@ class _Tcgen05RowColFused:
         tCrA = tiled_mma.make_fragment_A(sA)  # (MMA, M, col_groups, STAGE)
         tCrB = tiled_mma.make_fragment_B(sB)
 
+        pipeline_init_wait(cluster_shape_mn=cluster_layout_vmnk)
+        cute.arch.griddepcontrol_wait()
+
         def _global_scale(amax):
             is_zero = amax == cutlass.Float32(0.0)
             safe = cutlass.Float32(cutlass.select_(is_zero, cutlass.Float32(1.0), amax))
@@ -1366,8 +1378,6 @@ class _Tcgen05RowColFused:
         # grouped name is moot here, since sr and grouped are never compiled together.
         tri_tiles_hid = col_tiles_per_expert
 
-        pipeline_init_wait(cluster_shape_mn=cluster_layout_vmnk)
-
         rem = num_super - start_pid
         num_iters = cutlass.select_(
             rem > cutlass.Int32(0),
@@ -1397,6 +1407,7 @@ class _Tcgen05RowColFused:
                         tBsB[(None, handle.index)],
                         tma_bar_ptr=handle.barrier,
                     )
+            cute.arch.griddepcontrol_launch_dependents()
             ab_producer.tail()
 
         # ==================== MMA warp (AB consumer, acc producer) ====================
@@ -1948,7 +1959,12 @@ class _Tcgen05RhtAmax:
             num_tiles_ns,
             num_super,
             GRID,
-        ).launch(grid=(GRID, 1, 1), block=(self.fused_tpb, 1, 1), stream=stream)
+        ).launch(
+            grid=(GRID, 1, 1),
+            block=(self.fused_tpb, 1, 1),
+            stream=stream,
+            use_pdl=True,
+        )
 
     @cute.kernel
     def kernel(
@@ -2082,6 +2098,7 @@ class _Tcgen05RhtAmax:
         tCrB = tiled_mma.make_fragment_B(sB)
 
         pipeline_init_wait(cluster_shape_mn=cluster_layout_vmnk)
+        cute.arch.griddepcontrol_wait()
 
         rem = num_super - start_pid
         num_iters = cutlass.select_(
@@ -2109,6 +2126,7 @@ class _Tcgen05RhtAmax:
                     tBsB[(None, handle.index)],
                     tma_bar_ptr=handle.barrier,
                 )
+            cute.arch.griddepcontrol_launch_dependents()
             ab_producer.tail()
 
         # ==================== MMA warp (AB consumer, acc producer) ====================
