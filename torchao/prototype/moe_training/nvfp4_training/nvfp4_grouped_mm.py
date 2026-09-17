@@ -6,7 +6,7 @@
 
 """Differentiable NVFP4 grouped GEMM for MoE training."""
 
-from typing import Optional
+from typing import NamedTuple, Optional
 
 import torch
 import torch.nn.functional as F
@@ -53,6 +53,16 @@ from torchao.utils import is_sm_at_least_100
 _ALIGNMENT = 128
 _SCALE_RECIPE = [F.ScalingType.BlockWise1x16, F.ScalingType.TensorWise]
 _SWIZZLE = [F.SwizzleType.SWIZZLE_32_4_4, F.SwizzleType.NO_SWIZZLE]
+
+
+class NVFP4GroupedWeight(NamedTuple):
+    """Quantized layouts shared by grouped forward and input-gradient GEMMs."""
+
+    codes: torch.Tensor
+    scale_factors: torch.Tensor
+    transposed_codes: torch.Tensor
+    transposed_scale_factors: torch.Tensor
+    amax: torch.Tensor
 
 
 def _resolve_backends(
@@ -104,6 +114,43 @@ def _resolve_backends(
     return use_cutedsl_rht, True
 
 
+def quantize_nvfp4_grouped_weight(
+    weight: torch.Tensor,
+    *,
+    kernel_preference: KernelPreference = KernelPreference.AUTO,
+) -> NVFP4GroupedWeight:
+    """Quantize an ``(E, N, K)`` grouped weight for forward and dgrad."""
+    if weight.ndim != 3:
+        raise ValueError(f"weight must be 3D, got {weight.ndim}D")
+    if not weight.is_cuda:
+        raise ValueError("weight must be a CUDA tensor")
+    if not is_sm_at_least_100():
+        raise NotImplementedError("NVFP4 grouped weight quantization requires SM100+")
+
+    num_experts, N, K = weight.shape
+    if K % _ALIGNMENT != 0 or N % _ALIGNMENT != 0:
+        raise ValueError(f"K and N must be divisible by {_ALIGNMENT}; got K={K}, N={N}")
+
+    _, use_cutedsl_weight = _resolve_backends(kernel_preference, num_experts)
+    weight = weight.to(torch.bfloat16).contiguous()
+    weight_amax = triton_group_weight_amax(weight, num_experts)
+    group_weight_quantize_2d = (
+        cutedsl_group_weight_quantize_2d
+        if use_cutedsl_weight
+        else triton_group_weight_quantize_2d
+    )
+    weight_codes, weight_sf, weight_t_codes, weight_t_sf = group_weight_quantize_2d(
+        weight, weight_amax, num_experts
+    )
+    return NVFP4GroupedWeight(
+        weight_codes,
+        weight_sf,
+        weight_t_codes,
+        weight_t_sf,
+        weight_amax,
+    )
+
+
 @conditional_nostrict_trace
 def _to_nvfp4_rht_rs_then_scaled_grouped_mm(
     A: torch.Tensor,
@@ -115,6 +162,7 @@ def _to_nvfp4_rht_rs_then_scaled_grouped_mm(
     pad_token_groups_for_grouped_mm: bool = False,
     kernel_preference: KernelPreference = KernelPreference.AUTO,
     use_fast_math: bool = True,
+    quantized_weight: Optional[NVFP4GroupedWeight] = None,
 ) -> torch.Tensor:
     """Quantize and multiply grouped activations and expert weights.
 
@@ -153,6 +201,7 @@ def _to_nvfp4_rht_rs_then_scaled_grouped_mm(
         pad_token_groups_for_grouped_mm,
         kernel_preference,
         use_fast_math,
+        quantized_weight,
     )
     if bias is not None:
         output = output + bias.to(output.dtype)
@@ -173,6 +222,7 @@ class _NVFP4GroupedMM(torch.autograd.Function):
         pad_token_groups_for_grouped_mm: bool,
         kernel_preference: KernelPreference,
         use_fast_math: bool,
+        quantized_weight: Optional[NVFP4GroupedWeight],
     ) -> torch.Tensor:
         if input_act.ndim != 2:
             raise ValueError(f"input_act must be 2D, got {input_act.ndim}D")
@@ -238,9 +288,7 @@ class _NVFP4GroupedMM(torch.autograd.Function):
                     "every token group must be 128-row aligned when padding is disabled",
                 )
 
-        use_cutedsl_rht, use_cutedsl_weight = _resolve_backends(
-            kernel_preference, num_experts
-        )
+        use_cutedsl_rht, _ = _resolve_backends(kernel_preference, num_experts)
 
         input_act = input_act.to(torch.bfloat16).contiguous()
         # The 2D quantizer consumes logical W (E, N, K), then produces rowwise W
@@ -297,15 +345,17 @@ class _NVFP4GroupedMM(torch.autograd.Function):
             use_fast_math=use_fast_math,
         )
 
-        weight_amax = triton_group_weight_amax(weight, num_experts)
-        group_weight_quantize_2d = (
-            cutedsl_group_weight_quantize_2d
-            if use_cutedsl_weight
-            else triton_group_weight_quantize_2d
-        )
-        weight_codes, weight_sf, weight_t_codes, weight_t_sf = group_weight_quantize_2d(
-            weight, weight_amax, num_experts
-        )
+        if quantized_weight is None:
+            quantized_weight = quantize_nvfp4_grouped_weight(
+                weight, kernel_preference=kernel_preference
+            )
+        (
+            weight_codes,
+            weight_sf,
+            weight_t_codes,
+            weight_t_sf,
+            weight_amax,
+        ) = quantized_weight
         output = F.scaled_grouped_mm(
             x_row_codes.view(torch.float4_e2m1fn_x2),
             # Transpose rowwise W codes to the grouped-GEMM RHS layout (E, K, N).
@@ -462,5 +512,5 @@ class _NVFP4GroupedMM(torch.autograd.Function):
 
         # One gradient per forward input: input_act, weight, sign_vector, sr_seed,
         # group_end_offsets, pad_token_groups_for_grouped_mm, kernel_preference,
-        # use_fast_math.
-        return grad_input, grad_weight, None, None, None, None, None, None
+        # use_fast_math, quantized_weight.
+        return grad_input, grad_weight, None, None, None, None, None, None, None

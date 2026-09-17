@@ -44,6 +44,7 @@ if has_triton() and is_sm_at_least_100() and torch_version_at_least("2.10.0"):
     from torchao.prototype.moe_training.nvfp4_training.nvfp4_grouped_mm import (
         _resolve_backends,
         _to_nvfp4_rht_rs_then_scaled_grouped_mm,
+        quantize_nvfp4_grouped_weight,
     )
 
 BLOCK_SIZE = 16
@@ -226,9 +227,9 @@ def test_nvfp4_grouped_gemm_fwd_bwd(M, K, N, num_experts, kernel_preference):
     # noise). Single-expert shapes run ~15.5 dB.
     min_weight_grad_sqnr = 12.0
     weight_grad_sqnr = compute_error(weight_ref.grad, weight.grad)
-    assert weight_grad_sqnr >= min_weight_grad_sqnr, (
-        f"Weight grad SQNR {weight_grad_sqnr} is below {min_weight_grad_sqnr}"
-    )
+    assert (
+        weight_grad_sqnr >= min_weight_grad_sqnr
+    ), f"Weight grad SQNR {weight_grad_sqnr} is below {min_weight_grad_sqnr}"
 
 
 @skip_if_rocm("ROCm not supported")
@@ -238,7 +239,100 @@ def test_nvfp4_grouped_gemm_fwd_bwd(M, K, N, num_experts, kernel_preference):
     not torch_version_at_least("2.10.0"), reason="requires PyTorch 2.10+"
 )
 @pytest.mark.parametrize("kernel_preference", _KERNEL_PREFERENCES)
-def test_nvfp4_grouped_gemm_compile_fwd_bwd(kernel_preference):
+def test_nvfp4_grouped_weight_cache_is_bitwise_equivalent(kernel_preference):
+    torch.manual_seed(42)
+    M = K = N = 256
+    num_experts = 2
+    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda", requires_grad=True)
+    weight = torch.randn(
+        num_experts, N, K, dtype=torch.bfloat16, device="cuda", requires_grad=True
+    )
+    offs = torch.tensor([128, 256], dtype=torch.int32, device="cuda")
+    sign_vector = tuple(1 if i % 2 == 0 else -1 for i in range(16))
+    sr_seed = torch.tensor([1234], dtype=torch.int64, device="cuda")
+    cached_weight = quantize_nvfp4_grouped_weight(
+        weight, kernel_preference=kernel_preference
+    )
+
+    out_dynamic = _to_nvfp4_rht_rs_then_scaled_grouped_mm(
+        x,
+        weight,
+        sign_vector,
+        sr_seed,
+        offs=offs,
+        kernel_preference=kernel_preference,
+    )
+    backward_rng_state = torch.cuda.get_rng_state()
+    out_dynamic.sum().backward()
+    dynamic_input_grad = x.grad.clone()
+    dynamic_weight_grad = weight.grad.clone()
+
+    x.grad = None
+    weight.grad = None
+    torch.cuda.set_rng_state(backward_rng_state)
+    out_cached = _to_nvfp4_rht_rs_then_scaled_grouped_mm(
+        x,
+        weight,
+        sign_vector,
+        sr_seed,
+        offs=offs,
+        kernel_preference=kernel_preference,
+        quantized_weight=cached_weight,
+    )
+    out_cached.sum().backward()
+
+    assert torch.equal(out_cached, out_dynamic)
+    assert torch.equal(x.grad, dynamic_input_grad)
+    assert torch.equal(weight.grad, dynamic_weight_grad)
+
+
+@skip_if_rocm("ROCm not supported")
+@pytest.mark.skipif(not has_triton(), reason="unsupported without triton")
+@pytest.mark.skipif(not is_sm_at_least_100(), reason="Requires SM100+")
+@pytest.mark.skipif(
+    not torch_version_at_least("2.10.0"), reason="requires PyTorch 2.10+"
+)
+def test_nvfp4_grouped_weight_cache_bypasses_weight_quantization(monkeypatch):
+    M = K = N = 128
+    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda", requires_grad=True)
+    weight = torch.randn(
+        1, N, K, dtype=torch.bfloat16, device="cuda", requires_grad=True
+    )
+    offs = torch.tensor([M], dtype=torch.int32, device="cuda")
+    sign_vector = (1,) * 16
+    sr_seed = torch.tensor([1234], dtype=torch.int64, device="cuda")
+    cached_weight = quantize_nvfp4_grouped_weight(
+        weight, kernel_preference=KernelPreference.TRITON
+    )
+
+    def unexpected_weight_amax(*args, **kwargs):
+        raise AssertionError("cached path recomputed the grouped weight amax")
+
+    monkeypatch.setattr(
+        nvfp4_grouped_mm, "triton_group_weight_amax", unexpected_weight_amax
+    )
+    out = _to_nvfp4_rht_rs_then_scaled_grouped_mm(
+        x,
+        weight,
+        sign_vector,
+        sr_seed,
+        offs=offs,
+        kernel_preference=KernelPreference.TRITON,
+        quantized_weight=cached_weight,
+    )
+    out.sum().backward()
+    assert weight.grad is not None
+
+
+@skip_if_rocm("ROCm not supported")
+@pytest.mark.skipif(not has_triton(), reason="unsupported without triton")
+@pytest.mark.skipif(not is_sm_at_least_100(), reason="Requires SM100+")
+@pytest.mark.skipif(
+    not torch_version_at_least("2.10.0"), reason="requires PyTorch 2.10+"
+)
+@pytest.mark.parametrize("kernel_preference", _KERNEL_PREFERENCES)
+@pytest.mark.parametrize("cache_weight", (False, True), ids=("dynamic", "cached"))
+def test_nvfp4_grouped_gemm_compile_fwd_bwd(kernel_preference, cache_weight):
     """Compiles once under fullgraph=True and keeps eager numerics across jagged routings.
 
     The invariant worth pinning is the frame count. Routing changes every step in
@@ -273,8 +367,23 @@ def test_nvfp4_grouped_gemm_compile_fwd_bwd(kernel_preference):
     )
     x_ref = x.detach().clone().requires_grad_(True)
     weight_ref = weight.detach().clone().requires_grad_(True)
+    quantized_weight = (
+        quantize_nvfp4_grouped_weight(weight, kernel_preference=kernel_preference)
+        if cache_weight
+        else None
+    )
 
     def grouped_mm(a, b, o):
+        if quantized_weight is None:
+            return _to_nvfp4_rht_rs_then_scaled_grouped_mm(
+                a,
+                b,
+                sign_vector,
+                sr_seed,
+                offs=o,
+                pad_token_groups_for_grouped_mm=False,
+                kernel_preference=kernel_preference,
+            )
         return _to_nvfp4_rht_rs_then_scaled_grouped_mm(
             a,
             b,
@@ -283,6 +392,7 @@ def test_nvfp4_grouped_gemm_compile_fwd_bwd(kernel_preference):
             offs=o,
             pad_token_groups_for_grouped_mm=False,
             kernel_preference=kernel_preference,
+            quantized_weight=quantized_weight,
         )
 
     # reset() so the frame count below reflects this parametrization alone -- Dynamo's
@@ -292,6 +402,10 @@ def test_nvfp4_grouped_gemm_compile_fwd_bwd(kernel_preference):
     compiled = torch.compile(grouped_mm, fullgraph=True, backend=counter)
 
     for step in range(5):
+        if cache_weight and step > 0:
+            quantized_weight = quantize_nvfp4_grouped_weight(
+                weight, kernel_preference=kernel_preference
+            )
         offs = generate_jagged_offs(num_experts, M, multiple_of=128, dtype=torch.int32)
         for t in (x, weight, x_ref, weight_ref):
             t.grad = None
@@ -307,9 +421,9 @@ def test_nvfp4_grouped_gemm_compile_fwd_bwd(kernel_preference):
         assert out.shape == out_ref.shape == (M, N)
         assert torch.isfinite(out).all()
         output_sqnr = compute_error(out_ref, out)
-        assert output_sqnr >= 15.0, (
-            f"step {step} offs {offs.tolist()}: output SQNR {output_sqnr} is below 15.0"
-        )
+        assert (
+            output_sqnr >= 15.0
+        ), f"step {step} offs {offs.tolist()}: output SQNR {output_sqnr} is below 15.0"
 
         labels = torch.ones_like(out_ref)
         F.mse_loss(out_ref, labels).backward()
@@ -326,9 +440,9 @@ def test_nvfp4_grouped_gemm_compile_fwd_bwd(kernel_preference):
             "is below 12.0"
         )
 
-    assert counter.frame_count == 1, (
-        f"expected one compiled graph across 5 routings, got {counter.frame_count}"
-    )
+    assert (
+        counter.frame_count == 1
+    ), f"expected one compiled graph across 5 routings, got {counter.frame_count}"
 
 
 @pytest.mark.skipif(not has_triton(), reason="unsupported without triton")
@@ -516,6 +630,6 @@ def test_nvfp4_dequant_roundtrip_with_per_tensor_scale():
     # Roundtrip only quantizes one tensor (vs GEMM quantizing both),
     # so accuracy is higher. Profiled min=20.0 across 3,200 runs.
     min_sqnr = 19.0
-    assert sqnr >= min_sqnr, (
-        f"Roundtrip sqnr with per_tensor_scale {sqnr} is too low, must be >= {min_sqnr}"
-    )
+    assert (
+        sqnr >= min_sqnr
+    ), f"Roundtrip sqnr with per_tensor_scale {sqnr} is too low, must be >= {min_sqnr}"
