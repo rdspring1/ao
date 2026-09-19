@@ -304,6 +304,14 @@ class _MXFP8GroupedMM(torch.autograd.Function):
             kernel_preference,
         )
 
+        # The grouped GEMM skips M=0 token groups, leaving those experts'
+        # wgrad tiles uninitialized. Zero them explicitly.
+        _group_sizes = torch.diff(
+            original_group_end_offsets,
+            prepend=original_group_end_offsets.new_zeros(1),
+        )
+        grad_weight_t[_group_sizes == 0] = 0
+
         # Unpad grad_input if padding was used
         if pad_token_groups_for_grouped_mm:
             grad_input = unpad_token_groups(
