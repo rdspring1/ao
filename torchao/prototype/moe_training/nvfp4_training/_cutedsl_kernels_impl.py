@@ -780,45 +780,24 @@ def _cvt_rn_e2m1x8_f32(
 def _cvt_e2m1x8_to_f32(word: cutlass.Uint32, *, loc=None, ip=None):
     """Exact decode of one packed-FP4 word to eight f32, element k = nibble k.
 
-    The multi-output form the DSL itself uses (``cute.arch.cvt_f4e2m1x8_to_f16x8``): one
-    ``inline_asm`` returning a literal struct, one ``extractvalue`` per element.
+    Decode the E2M1 bits directly: CUTLASS DSL 4.5.2 misdecodes the packed
+    ``cvt.rn.f16x2.e2m1x2`` path used in the MS-EDEN scale correction.
     """
-    rst = llvm.inline_asm(
-        llvm.StructType.get_literal([T.f32()] * 8),
-        [word.ir_value(loc=loc, ip=ip)],
-        (
-            "{\n"
-            ".reg .b8 b0, b1, b2, b3;\n"
-            ".reg .b32 p0, p1, p2, p3;\n"
-            ".reg .b16 l0, h0, l1, h1, l2, h2, l3, h3;\n"
-            "mov.b32 {b0, b1, b2, b3}, $8;\n"
-            "cvt.rn.f16x2.e2m1x2 p0, b0;\n"
-            "cvt.rn.f16x2.e2m1x2 p1, b1;\n"
-            "cvt.rn.f16x2.e2m1x2 p2, b2;\n"
-            "cvt.rn.f16x2.e2m1x2 p3, b3;\n"
-            "mov.b32 {l0, h0}, p0;\n"
-            "mov.b32 {l1, h1}, p1;\n"
-            "mov.b32 {l2, h2}, p2;\n"
-            "mov.b32 {l3, h3}, p3;\n"
-            "cvt.f32.f16 $0, l0;\n"
-            "cvt.f32.f16 $1, h0;\n"
-            "cvt.f32.f16 $2, l1;\n"
-            "cvt.f32.f16 $3, h1;\n"
-            "cvt.f32.f16 $4, l2;\n"
-            "cvt.f32.f16 $5, h2;\n"
-            "cvt.f32.f16 $6, l3;\n"
-            "cvt.f32.f16 $7, h3;\n"
-            "}"
-        ),
-        "=f,=f,=f,=f,=f,=f,=f,=f,r",
-        has_side_effects=False,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-    )
-    return tuple(
-        cutlass.Float32(llvm.extractvalue(T.f32(), rst, [k], loc=loc, ip=ip))
-        for k in range(8)
-    )
+    out = []
+    for k in range(8):
+        nibble = (word >> cutlass.Uint32(4 * k)) & cutlass.Uint32(15)
+        mag = nibble & cutlass.Uint32(7)
+        bits = ((mag >> cutlass.Uint32(1)) + cutlass.Uint32(126)) << cutlass.Uint32(23)
+        bits = bits | ((mag & cutlass.Uint32(1)) << cutlass.Uint32(22))
+        bits = cutlass.Uint32(
+            cutlass.select_(mag == cutlass.Uint32(1), cutlass.Uint32(0x3F000000), bits)
+        )
+        bits = cutlass.Uint32(
+            cutlass.select_(mag == cutlass.Uint32(0), cutlass.Uint32(0), bits)
+        )
+        bits = bits | ((nibble & cutlass.Uint32(8)) << cutlass.Uint32(28))
+        out.append(bits.bitcast(cutlass.Float32))
+    return tuple(out)
 
 
 @dsl_user_op

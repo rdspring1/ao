@@ -2535,21 +2535,49 @@ RHT128_MSEDEN_BLOCKS_PER_WARP = (RHT128_DIM // 16) // 2  # 4 of a lane's 8 block
 RHT128_MSEDEN_SIGN_BAR = 3  # both chains' sign bytes staged in shared memory
 
 
+@dsl_user_op
+def _mul_rn_f32(a: cutlass.Float32, b: cutlass.Float32, *, loc=None, ip=None):
+    return cutlass.Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [a.ir_value(loc=loc, ip=ip), b.ir_value(loc=loc, ip=ip)],
+            "mul.rn.f32 $0, $1, $2;",
+            "=f,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def _add_rn_f32(a: cutlass.Float32, b: cutlass.Float32, *, loc=None, ip=None):
+    return cutlass.Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [a.ir_value(loc=loc, ip=ip), b.ir_value(loc=loc, ip=ip)],
+            "add.rn.f32 $0, $1, $2;",
+            "=f,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
 def _dot16_tree_rn(a, b):
     """sum a_i * b_i over 16 values in Triton's order (read off the op's PTX):
     scalar RN products, pairs added lane-wise as ((p0+p2)+(p4+p6))+((p8+p10)+(p12+p14))
     and its odd twin in the two f32x2 lanes, then even + odd. Every op rounds to
-    nearest and none is fused, so the bits equal Triton's tl.sum; a fused multiply-add
-    anywhere here would move the last ulp of the ratio and flip stochastic roundings."""
-    p = [
-        cute.arch.mul_packed_f32x2((a[2 * j], a[2 * j + 1]), (b[2 * j], b[2 * j + 1]))
-        for j in range(8)
+    nearest and none is fused, so the bits equal Triton's tl.sum. Explicit PTX
+    preserves that rounding under CUTLASS DSL 4.5.2 as well as newer versions."""
+    p = [_mul_rn_f32(a[j], b[j]) for j in range(16)]
+    s = [
+        _add_rn_f32(p[4 * j + k], p[4 * j + k + 2]) for j in range(4) for k in range(2)
     ]
-    s = [cute.arch.add_packed_f32x2(p[2 * j], p[2 * j + 1]) for j in range(4)]
-    t0 = cute.arch.add_packed_f32x2(s[0], s[1])
-    t1 = cute.arch.add_packed_f32x2(s[2], s[3])
-    even, odd = cute.arch.add_packed_f32x2(t0, t1)
-    return even + odd
+    t0 = [_add_rn_f32(s[k], s[k + 2]) for k in range(2)]
+    t1 = [_add_rn_f32(s[k + 4], s[k + 6]) for k in range(2)]
+    return _add_rn_f32(_add_rn_f32(t0[0], t1[0]), _add_rn_f32(t0[1], t1[1]))
 
 
 def _dot16_chain_fast(a, b):
