@@ -4428,10 +4428,9 @@ def _cutedsl_group_col_cast_requantize_impl(
 @dsl_user_op
 def _cvt_e2m1x8_to_bf16x2x4(word: cutlass.Uint32, *, loc=None, ip=None):
     """``FAST_PATH`` decode of one packed-FP4 word to four packed bf16x2 words, word k =
-    elements ``2k`` (low half) and ``2k + 1`` (high half): one ``cvt.rn.bf16x2.e2m1x2``
-    per byte (PTX ISA 9.2; the DSL emits 9.4). Every E2M1 value is exact in bf16, so this
-    is ``_cvt_e2m1x8_to_f32`` without its eight f16 -> f32 widenings, for a consumer that
-    reads bf16 halves in place (``_dot16_e_q_bf16``). Multi-output form as that helper.
+    elements ``2k`` (low half) and ``2k + 1`` (high half): one
+    ``cvt.rn.bf16x2.e2m1x2`` per byte (PTX ISA 9.2). Every E2M1 value is exact in
+    bf16; ``_dot16_e_q_bf16`` reads those halves in place.
     """
     rst = llvm.inline_asm(
         llvm.StructType.get_literal([T.i32()] * 4),
@@ -4455,6 +4454,21 @@ def _cvt_e2m1x8_to_bf16x2x4(word: cutlass.Uint32, *, loc=None, ip=None):
         cutlass.Uint32(llvm.extractvalue(T.i32(), rst, [k], loc=loc, ip=ip))
         for k in range(4)
     )
+
+
+@dsl_user_op
+def _cvt_e2m1x8_to_bf16x2x4_compat(word: cutlass.Uint32, *, loc=None, ip=None):
+    """Exact BF16 packing for CUTLASS DSL 4.5.2, which rejects the native conversion."""
+    values = _cvt_e2m1x8_to_f32(word)
+    return tuple(
+        (values[2 * k].bitcast(cutlass.Uint32) >> cutlass.Uint32(16))
+        | (values[2 * k + 1].bitcast(cutlass.Uint32) & cutlass.Uint32(0xFFFF0000))
+        for k in range(4)
+    )
+
+
+if cutlass.__version__ == "4.5.2":
+    _cvt_e2m1x8_to_bf16x2x4 = _cvt_e2m1x8_to_bf16x2x4_compat
 
 
 @dsl_user_op
