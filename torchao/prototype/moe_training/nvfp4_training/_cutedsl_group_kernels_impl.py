@@ -1861,7 +1861,9 @@ def _rht128_tile_amax(acc, tidx):
         # exact, so the grouping does not change the result.
         m = [_max3_abs_f32(vals[i], vals[i + 1], vals[i + 2]) for i in range(0, 15, 3)]
         tile_max = _max3_abs_f32(
-            _max3_abs_f32(m[0], m[1], m[2]), _max3_abs_f32(m[3], m[4], vals[15]), tile_max
+            _max3_abs_f32(m[0], m[1], m[2]),
+            _max3_abs_f32(m[3], m[4], vals[15]),
+            tile_max,
         )
     return tile_max
 
@@ -2008,7 +2010,7 @@ def _rht128_signed_operand_row(sign_t, b_base, j, lane):
     signs = (had ^ neg0, had ^ j5 ^ neg1, had ^ j6 ^ neg2, had ^ j5 ^ j6 ^ neg3)
     # nibble bit i -> bit 15 + 16 i: the four partial products never overlap or carry.
     spread = cutlass.Uint64(0x1000200040008000)
-    sign_bits = cutlass.Uint64(0x8000800080008000)
+    sign_bits = cutlass.Int64(0x8000800080008000 - (1 << 64)).bitcast(cutlass.Uint64)
     entries = cutlass.Uint64(RHT128_ENTRY_BITS * 0x0001000100010001)
     row = cutlass.Int32(b_base) + j * cutlass.Int32(128)
     x = (row >> cutlass.Int32(7)) & cutlass.Int32(7)
