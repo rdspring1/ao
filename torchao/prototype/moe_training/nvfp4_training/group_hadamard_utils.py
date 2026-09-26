@@ -10,6 +10,11 @@ from typing import Optional
 import torch
 from torch.utils._triton import has_triton
 
+from torchao.prototype.moe_training.nvfp4_training.hadamard_utils import (
+    _device_key,
+    get_dynamic_rht_matrix,
+    get_rht_matrix,
+)
 from torchao.utils import is_sm_at_least_100, torch_version_at_least
 
 BLOCK_M = 128
@@ -50,6 +55,47 @@ if torch_version_at_least("2.10.0") and has_triton():
                 end = mid
         return start
 
+    @triton.jit
+    def _atomic_max_2d(values, output_ptr, group_idx):
+        """Reduce a 2D tile to one atomic_max into ``output_ptr[group_idx]``.
+
+        ``tl.max`` drops NaN, so a NaN activation would silently produce a finite
+        amax; it is re-injected explicitly.
+        """
+        amax = tl.max(tl.max(values, axis=1), axis=0)
+        amax_has_nan = tl.max(
+            tl.max((values != values).to(tl.int32), axis=1),
+            axis=0,
+        )
+        amax = tl.where(amax_has_nan != 0, float("nan"), amax)
+        tl.atomic_max(output_ptr + group_idx, amax.to(tl.float32))
+
+
+def _rht_matrix(
+    sign_vector,
+    sign_tensor: Optional[torch.Tensor],
+    dynamic_rht: bool,
+    device: torch.device,
+) -> torch.Tensor:
+    """Resolve the RHT matrix for a grouped op from its two mutually exclusive inputs.
+
+    ``dynamic_rht`` is an explicit flag rather than ``sign_tensor is not None`` so a
+    caller that means to resample cannot silently fall back to the memoized path if it
+    forgets the tensor -- ``get_rht_matrix`` caches by value with ``maxsize=None``, and
+    keyed on a resampled vector it would grow one entry per step for the run's lifetime.
+    ``get_dynamic_rht_matrix`` memoizes only the fixed Hadamard and forms the product
+    per launch.
+    """
+    if dynamic_rht:
+        if sign_tensor is None:
+            raise ValueError("dynamic_rht=True requires a sign_tensor")
+        return get_dynamic_rht_matrix(sign_tensor, torch.bfloat16)
+    if sign_tensor is not None:
+        raise ValueError("sign_tensor is only used when dynamic_rht=True")
+    return get_rht_matrix(
+        tuple(sign_vector), _device_key(device), torch.bfloat16, len(sign_vector)
+    )
+
 
 def _validate_grouped_hadamard_inputs(
     A: torch.Tensor,
@@ -60,6 +106,7 @@ def _validate_grouped_hadamard_inputs(
     hidden_size: int,
     shape_rep: int,
     logical_packed_length: torch.Tensor | None = None,
+    rht_size: int = 16,
 ) -> None:
     if not isinstance(A, torch.Tensor):
         raise TypeError("A must be a torch.Tensor")
@@ -75,8 +122,12 @@ def _validate_grouped_hadamard_inputs(
         raise ValueError(f"B must be 2D, got {B.ndim}D")
     if B.dtype != torch.bfloat16:
         raise ValueError("B.dtype must be torch.bfloat16")
-    if B.shape != (16, 16):
-        raise ValueError(f"B must have shape (16, 16), got {tuple(B.shape)}")
+    if rht_size not in (16, 128):
+        raise ValueError(f"rht_size must be 16 or 128, got {rht_size}")
+    if B.shape != (rht_size, rht_size):
+        raise ValueError(
+            f"B must have shape ({rht_size}, {rht_size}), got {tuple(B.shape)}"
+        )
     if A.shape[1] % BLOCK_N != 0:
         raise ValueError("A.shape[1] must be divisible by 128")
     if not A.is_cuda:
@@ -207,3 +258,79 @@ def _validate_rng_state(
             "[col_seed, col_offset, row_seed, row_offset]"
         )
     return rng_state
+
+
+def _validate_requant_weight_inputs(
+    row_fp4_w: torch.Tensor,
+    row_sf_w: torch.Tensor,
+    global_amax: torch.Tensor,
+    num_tensors: int,
+    op_name: str,
+) -> tuple[int, int, int]:
+    """Host validation shared by the four grouped weight-requantization ops.
+
+    These consume the *packed* forward weight rather than a BF16 tensor, so the
+    usual ``_validate_grouped_hadamard_inputs`` does not apply: there are no token
+    offsets (expert weights are equal-sized and contiguous) and the logical shape
+    has to be recovered from the packed one.
+
+    Returns ``(E, M, N)`` of the logical weight, where ``row_fp4_w`` is
+    ``(E, M, N//2)``.
+    """
+    if not is_sm_at_least_100():
+        raise NotImplementedError(f"{op_name} requires SM100+")
+    if row_fp4_w.dtype != torch.uint8:
+        raise ValueError(f"Expected uint8 row_fp4_w, got {row_fp4_w.dtype}")
+    if row_fp4_w.ndim != 3:
+        raise ValueError("row_fp4_w must be 3-D (E, M, N//2)")
+    if not row_fp4_w.is_contiguous():
+        raise ValueError("row_fp4_w must be contiguous")
+    if not row_fp4_w.is_cuda:
+        raise ValueError("row_fp4_w must be on CUDA")
+    if row_sf_w.dtype != torch.float8_e4m3fn:
+        raise ValueError(f"Expected float8_e4m3fn row_sf_w, got {row_sf_w.dtype}")
+    if not row_sf_w.is_contiguous():
+        raise ValueError("row_sf_w must be contiguous")
+    if row_sf_w.device != row_fp4_w.device:
+        raise ValueError("row_sf_w must be on the same device as row_fp4_w")
+
+    E, M, packed_N = row_fp4_w.shape
+    N = packed_N * 2
+    if E != num_tensors:
+        raise ValueError(f"Expected {num_tensors} experts, got {E}")
+    if M % BLOCK_M != 0 or N % BLOCK_N != 0:
+        raise ValueError(
+            f"Expected M divisible by {BLOCK_M} and N divisible by {BLOCK_N}, "
+            f"got M={M}, N={N}"
+        )
+    expected_sf = (E, M // 128, N // 64, 32, 16)
+    if tuple(row_sf_w.shape) != expected_sf:
+        raise ValueError(
+            f"row_sf_w must have shape {expected_sf}, got {tuple(row_sf_w.shape)}"
+        )
+    if global_amax.shape != (E,):
+        raise ValueError(f"global_amax must have shape ({E},)")
+    if global_amax.dtype != torch.float32:
+        raise ValueError(f"Expected float32 global_amax, got {global_amax.dtype}")
+    if not global_amax.is_cuda or global_amax.device != row_fp4_w.device:
+        raise ValueError("global_amax must be on the same device as row_fp4_w")
+    if not global_amax.is_contiguous():
+        raise ValueError("global_amax must be contiguous")
+    return E, M, N
+
+
+def _validate_requant_amax(
+    amax: torch.Tensor,
+    name: str,
+    num_experts: int,
+    device: torch.device,
+) -> None:
+    """Validate a per-expert requantization amax produced by the matching amax op."""
+    if amax.shape != (num_experts,):
+        raise ValueError(f"{name} must have shape ({num_experts},)")
+    if amax.dtype != torch.float32:
+        raise ValueError(f"Expected float32 {name}, got {amax.dtype}")
+    if not amax.is_cuda or amax.device != device:
+        raise ValueError(f"{name} must be on the same device as row_fp4_w")
+    if not amax.is_contiguous():
+        raise ValueError(f"{name} must be contiguous")

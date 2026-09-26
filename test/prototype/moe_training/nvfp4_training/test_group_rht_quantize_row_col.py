@@ -44,7 +44,9 @@ from test.prototype.moe_training.nvfp4_training._assertions import (
     assert_scales_bitwise,
 )
 from test.prototype.moe_training.nvfp4_training.nvfp4_reference import (
+    from_blocked_grouped,
     reference_group_rht_quantize_row_col,
+    reference_group_row_cast_col_rht_quantize,
     to_blocked_grouped,
 )
 from torchao.float8.float8_utils import compute_error
@@ -61,8 +63,6 @@ from torchao.prototype.mx_formats.nvfp4_tensor import (
 )
 from torchao.prototype.mx_formats.utils import from_blocked, to_blocked
 from torchao.utils import is_sm_at_least_100, torch_version_at_least
-
-_TILE_ELEMS = 32 * 16  # elements in one swizzled scale tile
 
 if has_triton() and is_sm_at_least_100() and torch_version_at_least("2.10.0"):
     from torchao.prototype.moe_training.nvfp4_training.group_hadamard_amax_triton import (
@@ -196,24 +196,6 @@ def _assert_scales_adjacent(got: torch.Tensor, ref: torch.Tensor, label: str) ->
     )
 
 
-def _from_blocked_grouped(sfd, hidden, group_sizes):
-    """De-swizzle a columnwise scale buffer, whose groups are blocked separately.
-
-    The columnwise scales put the grouped token axis on the 64-blocked inner
-    side, so each group is blocked on its own extent and the buffers are
-    concatenated flat -- one whole-extent de-swizzle would read the wrong tiles
-    for every group. The rowwise buffer needs no equivalent: there the grouped
-    axis is the outer one, where a group is already contiguous.
-    """
-    out, base = [], 0
-    for m in group_sizes:
-        span = (hidden // 128) * (m // 64) * _TILE_ELEMS
-        chunk = sfd.reshape(-1)[base : base + span].reshape(hidden, m // 16)
-        out.append(from_blocked(chunk, hidden, m // 16))
-        base += span
-    return torch.cat(out, dim=1)
-
-
 def _make_rng_state(device, values=(1, 2, 3, 4)) -> torch.Tensor:
     """[col_seed, col_offset, row_seed, row_offset] caller-owned Philox state."""
     return torch.tensor(list(values), dtype=torch.int64, device=device)
@@ -302,7 +284,7 @@ def triton_group_rht_quantize_row_col_ref(
     expected_row_sf = torch.empty(
         (psl, hs // 16), dtype=torch.float8_e4m3fn, device=A.device
     )
-    col_sf_plain = _from_blocked_grouped(sfd, hs, spec.groups)
+    col_sf_plain = from_blocked_grouped(sfd, hs, spec.groups)
     row_sf_plain = from_blocked(sfa, psl, hs // 16)
 
     row_offset = 0
@@ -456,8 +438,8 @@ def test_group_rht_fast_math_sqnr(graph_case, kernel):
     row_sqnr = compute_error(e_row, f_row)
     assert row_sqnr >= 25.0, f"Row fast-vs-exact SQNR {row_sqnr:.2f} dB < 25.0 dB"
 
-    e_col_sf = _from_blocked_grouped(e_sfd, hs, spec.groups)
-    f_col_sf = _from_blocked_grouped(f_sfd, hs, spec.groups)
+    e_col_sf = from_blocked_grouped(e_sfd, hs, spec.groups)
+    f_col_sf = from_blocked_grouped(f_sfd, hs, spec.groups)
     col_sqnr = compute_error(
         _dequantize_plain(e_qd, e_col_sf, amax_col[0]),
         _dequantize_plain(f_qd, f_col_sf, amax_col[0]),
@@ -634,7 +616,7 @@ def test_group_rht_padded_capacity_masks_spare_rows(kernel):
     actual_sfa_plain = from_blocked(actual_sfa, capacity_rows, hidden_size // 16)
     # Only the one group's extent: the capacity tail lies past every group's
     # blocked buffer, so it is not part of the columnwise scale layout at all.
-    actual_sfd_plain = _from_blocked_grouped(actual_sfd, hidden_size, (logical_rows,))
+    actual_sfd_plain = from_blocked_grouped(actual_sfd, hidden_size, (logical_rows,))
 
     assert torch.equal(actual_qa[:logical_rows], expected_qa)
     assert torch.equal(
@@ -717,6 +699,56 @@ def test_cutedsl_group_quantize_matches_triton_bitwise(graph_case, use_fast_math
     triton_out = _group_quantize("triton", *args, use_fast_math=use_fast_math)
     for name, c, t in zip(("qa", "sfa", "qd", "sfd"), cutedsl, triton_out):
         assert torch.equal(c, t), f"{name} differs between backends"
+
+
+def _finite_amax(x):
+    """``max|x|`` over the finite elements: the global amax a NaN block is tested under,
+    since the kernels' own NaN-propagating amax would hide the block."""
+    return torch.nan_to_num(x.float(), 0.0, 0.0, 0.0).abs().amax()
+
+
+@_maybe_sm100
+@_skip_no_cutedsl
+@pytest.mark.parametrize("use_fast_math", [False, True], ids=["exact", "fast"])
+@torch.no_grad()
+def test_cutedsl_group_quantize_matches_triton_bitwise_on_nan_blocks(
+    graph_case, use_fast_math
+):
+    """A NaN in ``A`` is dropped from its rowwise block's amax on both backends (Triton's
+    ``tl.max`` is IEEE maxNum), so the 15 finite neighbours keep their scale; the RHT-16
+    spreads it over its whole columnwise block, which stays NaN on both."""
+    spec, A, B, offsets, _, _, _, _ = graph_case
+    psl, hs = A.shape
+    num_groups = len(spec.groups)
+    _skip_if_unsupported_groups("cutedsl", num_groups)
+    A = A.clone()
+    A[0, 0] = float("nan")
+    A[1, hs - 1] = float("nan")
+    A[psl - 1, 16:32] = float("nan")
+    A[2, 40] = float("inf")
+    groups = A.split(list(spec.groups))
+    amax_row = torch.stack([_finite_amax(A_g) for A_g in groups])
+    amax_col = torch.stack([_finite_amax(_rht_reference(A_g, B)) for A_g in groups])
+
+    args = (
+        A,
+        list(_HARDCODED_SIGN_VECTOR),
+        offsets,
+        num_groups,
+        psl,
+        hs,
+        spec.shape_rep,
+        amax_row,
+        amax_col,
+        None,
+        False,
+    )
+    cutedsl = _group_quantize("cutedsl", *args, use_fast_math=use_fast_math)
+    triton_out = _group_quantize("triton", *args, use_fast_math=use_fast_math)
+    for name, c, t in zip(("qa", "sfa", "qd", "sfd"), cutedsl, triton_out):
+        assert torch.equal(c.view(torch.uint8), t.view(torch.uint8)), (
+            f"{name} differs between backends"
+        )
 
 
 def _run_sr(graph_case, rng_state, kernel="triton", use_fast_math=False):
@@ -955,3 +987,304 @@ def test_group_rht_amax_storage_validation(graph_case, invalid_amax, error, kern
             None,
             False,
         )
+
+
+# --- dynamic_rht: RHT-128 with a resampled sign buffer ----------------------
+
+
+def _dynamic_signs(seed, n=128):
+    generator = torch.Generator().manual_seed(seed)
+    bits = torch.randint(0, 2, (n,), generator=generator, dtype=torch.int8)
+    return (bits * 2 - 1).cuda()
+
+
+def _dynamic_quantize(
+    A, signs, offsets, num_groups, kernel="triton", use_fast_math=False
+):
+    """Run the amax then the quantize op over ``A`` on the dynamic RHT-128 path."""
+    psl, hidden = A.shape
+    amax_op = triton_group_rht_amax if kernel == "triton" else cutedsl_group_rht_amax
+    col_amax, row_amax = amax_op(
+        A,
+        [],
+        offsets,
+        num_groups,
+        psl,
+        hidden,
+        1,
+        sign_tensor=signs,
+        dynamic_rht=True,
+    )
+    return (
+        row_amax,
+        col_amax,
+        _group_quantize(
+            kernel,
+            A,
+            [],
+            offsets,
+            num_groups,
+            psl,
+            hidden,
+            1,
+            row_amax,
+            col_amax,
+            None,
+            False,
+            use_fast_math=use_fast_math,
+            sign_tensor=signs,
+            dynamic_rht=True,
+        ),
+    )
+
+
+@_maybe_sm100
+@pytest.mark.parametrize("kernel", _KERNELS)
+@pytest.mark.parametrize("group_sizes", [[256], [128, 128], [256, 128, 384]])
+@torch.no_grad()
+def test_group_rht_quantize_dynamic_matches_the_reference(kernel, group_sizes):
+    device = torch.device("cuda", 0)
+    hidden = 512
+    torch.manual_seed(97)
+    A = torch.randn((sum(group_sizes), hidden), dtype=torch.bfloat16, device=device)
+    offsets = torch.cumsum(
+        torch.tensor(group_sizes, dtype=torch.int32, device=device),
+        0,
+        dtype=torch.int32,
+    )
+    signs = _dynamic_signs(0)
+
+    row_amax, col_amax, (qa, sfa, qd, sfd) = _dynamic_quantize(
+        A, signs, offsets, len(group_sizes), kernel=kernel
+    )
+    ref_qa, ref_sfa, ref_qd, ref_sfd = reference_group_row_cast_col_rht_quantize(
+        A, row_amax, col_amax, signs, offsets, len(group_sizes)
+    )
+    assert_codes_bitwise(qa, ref_qa, "row codes")
+    assert_scales_bitwise(sfa, ref_sfa, "row sf")
+    assert_codes_bitwise(qd, ref_qd, "col codes")
+    # The columnwise scales are what this test exists for: their swizzle tiling
+    # restarts at every group boundary, so a whole-extent blocking puts every group
+    # but the first at the wrong offset, which the GEMM reads without complaint.
+    assert_scales_bitwise(sfd, ref_sfd, "col sf")
+
+
+@_maybe_sm100
+@pytest.mark.parametrize("kernel", _KERNELS)
+@torch.no_grad()
+def test_group_rht_quantize_dynamic_follows_an_in_place_resample(kernel):
+    """Only the columnwise operand is rotated, and it must track the live buffer.
+
+    The cadence manager resamples with ``copy_`` so the buffer's address (and id)
+    never changes -- the case a by-value cache would silently serve stale.
+    """
+    device = torch.device("cuda", 0)
+    torch.manual_seed(31)
+    A = torch.randn((256, 512), dtype=torch.bfloat16, device=device)
+    offsets = torch.tensor([256], dtype=torch.int32, device=device)
+    signs = _dynamic_signs(0)
+
+    _, _, before = _dynamic_quantize(A, signs, offsets, 1, kernel=kernel)
+    before = [t.clone() for t in before]
+    signs.copy_(_dynamic_signs(1))
+    _, _, after = _dynamic_quantize(A, signs, offsets, 1, kernel=kernel)
+
+    assert_codes_bitwise(after[0], before[0], "row codes")
+    assert_scales_bitwise(after[1], before[1], "row sf")
+    assert not torch.equal(after[2], before[2]), "columnwise codes ignored the resample"
+
+
+def _dynamic_bitwise_case(name):
+    """``(A, offsets, groups, hidden, shape_rep, signs)`` for one cross-backend case."""
+    device = torch.device("cuda", 0)
+    hidden, shape_rep, spare_rows = 512, 1, 0
+    groups = {
+        "single": (256,),
+        "pair": (128, 128),
+        "triple": (256, 128, 384),
+        "ragged64": (128,) * 64,
+        "same_both_dims": (256, 256),
+        "empty_group": (256, 0, 384),
+        "capacity_tail": (128, 128),
+        "zero_group_neg_signs": (256, 128, 384),
+        "hidden_7168": (3072, 0, 1024, 2048, 128, 896),
+    }[name]
+    if name == "same_both_dims":
+        shape_rep = 0
+    if name == "capacity_tail":
+        spare_rows = 256
+    if name == "hidden_7168":
+        hidden, spare_rows = 7168, 512
+    torch.manual_seed(97)
+    A = torch.randn(
+        (sum(groups) + spare_rows, hidden), dtype=torch.bfloat16, device=device
+    )
+    if spare_rows:
+        A[sum(groups) :] = float("inf")
+    if name == "zero_group_neg_signs":
+        A[: groups[0]] = 0
+    offsets = torch.cumsum(
+        torch.tensor(groups, dtype=torch.int32, device=device), 0, dtype=torch.int32
+    )
+    signs = _dynamic_signs(0)
+    if name == "zero_group_neg_signs":
+        signs = -torch.ones_like(signs)
+    return A, offsets, groups, hidden, shape_rep, signs
+
+
+@_maybe_sm100
+@_skip_no_cutedsl
+@pytest.mark.parametrize("use_fast_math", [False, True], ids=["exact", "fast"])
+@pytest.mark.parametrize(
+    "case",
+    [
+        "single",
+        "pair",
+        "triple",
+        "ragged64",
+        "same_both_dims",
+        "empty_group",
+        "capacity_tail",
+        "zero_group_neg_signs",
+        "hidden_7168",
+    ],
+)
+@torch.no_grad()
+def test_cutedsl_group_quantize_dynamic_matches_triton_bitwise(case, use_fast_math):
+    """All four outputs are bitwise equal to the Triton op's on the RHT-128 dynamic path.
+
+    Both backends quantize against the SAME Triton amaxes, so an amax-twin difference
+    cannot be misattributed here. Only the logical rows are compared: the capacity tail
+    is ``torch.empty`` on both backends, and the columnwise scale buffer is the per-group
+    swizzle tiles concatenated flat, so it is unblocked per group rather than sliced.
+    """
+    A, offsets, groups, hidden, shape_rep, signs = _dynamic_bitwise_case(case)
+    psl = A.shape[0]
+    logical_rows = sum(groups)
+    col_amax, row_amax = triton_group_rht_amax(
+        A,
+        [],
+        offsets,
+        len(groups),
+        psl,
+        hidden,
+        shape_rep,
+        logical_packed_length=offsets[-1:],
+        sign_tensor=signs,
+        dynamic_rht=True,
+    )
+    args = (
+        A,
+        [],
+        offsets,
+        len(groups),
+        psl,
+        hidden,
+        shape_rep,
+        row_amax,
+        col_amax,
+        None,
+        False,
+    )
+    kwargs = dict(
+        logical_packed_length=offsets[-1:],
+        use_fast_math=use_fast_math,
+        sign_tensor=signs,
+        dynamic_rht=True,
+    )
+    outs = {k: _group_quantize(k, *args, **kwargs) for k in ("triton", "cutedsl")}
+    plain = {}
+    for k, (qa, sfa, qd, sfd) in outs.items():
+        plain[k] = (
+            qa[:logical_rows],
+            from_blocked(sfa, psl, hidden // 16)[:logical_rows],
+            qd[:, : logical_rows // 2],
+            from_blocked_grouped(sfd, hidden, groups),
+        )
+    for name, t, c in zip(
+        ("qa", "sfa", "qd", "sfd"), plain["triton"], plain["cutedsl"]
+    ):
+        assert torch.equal(c, t), f"{name} differs between backends"
+
+
+@_maybe_sm100
+@_skip_no_cutedsl
+@pytest.mark.parametrize("use_fast_math", [False, True], ids=["exact", "fast"])
+@torch.no_grad()
+def test_cutedsl_group_quantize_dynamic_matches_triton_bitwise_on_nan_blocks(
+    use_fast_math,
+):
+    """The raw rowwise half of the dynamic path drops a NaN from its block amax on both
+    backends (Triton's ``tl.max`` is IEEE maxNum), so the 15 finite neighbours keep their
+    scale; the RHT-128 columnwise half spreads it over whole blocks, which stay NaN on
+    both. The amaxes are taken over the NaN-free tensor."""
+    A, offsets, groups, hidden, shape_rep, signs = _dynamic_bitwise_case("triple")
+    A[0, 0] = float("nan")
+    A[1, hidden - 1] = float("nan")
+    A[sum(groups) - 1, 16:32] = float("nan")
+    A[2, 40] = float("inf")
+    col_amax, row_amax = triton_group_rht_amax(
+        torch.nan_to_num(A, 0.0, 0.0, 0.0),
+        [],
+        offsets,
+        len(groups),
+        A.shape[0],
+        hidden,
+        shape_rep,
+        logical_packed_length=offsets[-1:],
+        sign_tensor=signs,
+        dynamic_rht=True,
+    )
+    args = (
+        A,
+        [],
+        offsets,
+        len(groups),
+        A.shape[0],
+        hidden,
+        shape_rep,
+        row_amax,
+        col_amax,
+        None,
+        False,
+    )
+    kwargs = dict(
+        logical_packed_length=offsets[-1:],
+        use_fast_math=use_fast_math,
+        sign_tensor=signs,
+        dynamic_rht=True,
+    )
+    cutedsl = _group_quantize("cutedsl", *args, **kwargs)
+    triton_out = _group_quantize("triton", *args, **kwargs)
+    for name, c, t in zip(("qa", "sfa", "qd", "sfd"), cutedsl, triton_out):
+        assert torch.equal(c.view(torch.uint8), t.view(torch.uint8)), (
+            f"{name} differs between backends"
+        )
+
+
+@_maybe_sm100
+@_skip_no_cutedsl
+@torch.no_grad()
+def test_cutedsl_group_quantize_dynamic_rejects_stochastic_rounding():
+    """The RHT-128 dynamic path is RTNE-only on the cutedsl backend; Triton serves SR."""
+    A, offsets, groups, hidden, shape_rep, signs = _dynamic_bitwise_case("pair")
+    row_amax = A.float().abs().amax().reshape(1).repeat(len(groups))
+    args = (
+        A,
+        [],
+        offsets,
+        len(groups),
+        A.shape[0],
+        hidden,
+        shape_rep,
+        row_amax,
+        row_amax,
+        _make_rng_state(A.device),
+        True,
+    )
+    kwargs = dict(sign_tensor=signs, dynamic_rht=True)
+    with pytest.raises(
+        ValueError, match="stochastic rounding is not supported with dynamic_rht"
+    ):
+        _group_quantize("cutedsl", *args, **kwargs)
+    _group_quantize("triton", *args, **kwargs)
