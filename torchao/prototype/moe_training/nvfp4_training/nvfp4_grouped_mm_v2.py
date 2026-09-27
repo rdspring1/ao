@@ -489,6 +489,14 @@ class _NVFP4GroupedMMV2(torch.autograd.Function):
             _amax_to_scale(amax_rht_x_t, NVFP4_CAST_NUMERATOR),
             padded_group_end_offsets,
         )
+
+        # The grouped GEMM skips M=0 token groups, leaving those experts'
+        # wgrad tiles uninitialized. Zero them explicitly.
+        _group_sizes = torch.diff(
+            original_group_end_offsets,
+            prepend=original_group_end_offsets.new_zeros(1),
+        )
+        grad_weight[_group_sizes == 0] = 0
         if ctx.pad_token_groups_for_grouped_mm:
             grad_input = unpad_token_groups(
                 grad_input,
@@ -730,6 +738,14 @@ class _NVFP4GroupedMMV1Requant(torch.autograd.Function):
             _amax_to_scale(amax_rht_x_t, NVFP4_CAST_NUMERATOR),
             padded_group_end_offsets,
         )
+
+        # The grouped GEMM skips M=0 token groups, leaving those experts'
+        # wgrad tiles uninitialized. Zero them explicitly.
+        _group_sizes = torch.diff(
+            original_group_end_offsets,
+            prepend=original_group_end_offsets.new_zeros(1),
+        )
+        grad_weight[_group_sizes == 0] = 0
         if ctx.pad_token_groups_for_grouped_mm:
             grad_input = unpad_token_groups(
                 grad_input,
